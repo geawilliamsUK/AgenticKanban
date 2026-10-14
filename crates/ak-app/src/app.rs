@@ -15,6 +15,7 @@ use ak_core::config::{GlobalSettings, ProjectEntry, ProjectPolicy};
 use ak_core::ids::{ActorId, ChatId, ProjectId, RunId, ThreadId, TicketId};
 use ak_core::run::RunEvent;
 use ak_core::{Actor, NotificationState};
+use ak_runtime::snapshot::DriftEntry;
 use ak_runtime::{ClaudeCodeRunner, ClaudeProbe, HomePaths, ProjectRegistry, UtilityRunner};
 
 use crate::backend::{Backend, Request, Response, RunnerFactory};
@@ -23,6 +24,7 @@ use crate::dialogs::{AddProjectDialog, NewTicketDialog};
 use crate::markdown::Markdown;
 use crate::model::{BoardModel, ChatSummary, InboxItem, LiveRun, ThreadDetail, TicketDetail};
 use crate::settings_view::SettingsEditor;
+use crate::snapshot_view::{ExportDialog, ImportDialog};
 use crate::team_view::{AgentEditor, ProposalView, RefineStatus};
 use crate::ticket_view::TicketPanelState;
 
@@ -76,6 +78,11 @@ pub struct App {
     pub thread_detail: Option<ThreadDetail>,
     pub thread_hits: Vec<ThreadHit>,
     pub chats_ui: ChatsState,
+
+    /// How the home directory and the repository snapshot differ.
+    pub drift: Vec<DriftEntry>,
+    pub export_dialog: Option<ExportDialog>,
+    pub import_dialog: Option<ImportDialog>,
 
     /// Permission profile names and default model from the open project's policy.
     pub profiles: Vec<String>,
@@ -156,6 +163,9 @@ impl App {
             thread_detail: None,
             thread_hits: Vec::new(),
             chats_ui: ChatsState::default(),
+            drift: Vec::new(),
+            export_dialog: None,
+            import_dialog: None,
             view: View::Board,
             profiles: Vec::new(),
             default_model: None,
@@ -263,6 +273,9 @@ impl App {
                 self.thread_detail = None;
                 self.thread_hits.clear();
                 self.chats_ui = ChatsState::default();
+                self.drift.clear();
+                self.export_dialog = None;
+                self.import_dialog = None;
                 self.ticket_panel = TicketPanelState::default();
                 if self.view != View::Settings {
                     self.view = View::Board;
@@ -557,6 +570,36 @@ impl App {
                     self.actions.push(Action::SelectThread(Some(thread)));
                 }
             }
+            Response::ExportDone { project, report } => {
+                if Some(project) == self.current {
+                    let mut msg = format!(
+                        "Exported {} agent(s) to {}",
+                        report.exported.len(),
+                        report.root.display()
+                    );
+                    if !report.removed.is_empty() {
+                        msg.push_str(&format!(", removed {}", report.removed.len()));
+                    }
+                    if report.staged {
+                        msg.push_str("; staged, commit when ready");
+                    }
+                    match report.stage_error {
+                        Some(e) => self.toast(format!("{msg}; staging failed: {e}"), true),
+                        None => self.toast(msg, false),
+                    }
+                }
+            }
+            Response::ImportReview { project, review } => {
+                if Some(project) == self.current {
+                    self.import_dialog = Some(ImportDialog::new(review));
+                    self.view = View::Team;
+                }
+            }
+            Response::Drift { project, entries } => {
+                if Some(project) == self.current {
+                    self.drift = entries;
+                }
+            }
             Response::Error(msg) => self.toast(msg, true),
             Response::Info(msg) => self.toast(msg, false),
         }
@@ -590,6 +633,11 @@ impl App {
                 }
                 Action::SwitchView(view) => {
                     self.view = view;
+                    if view == View::Team {
+                        if let Some(project) = self.current {
+                            self.send(Request::CheckDrift { project });
+                        }
+                    }
                     if view == View::Inbox {
                         if let Some(project) = self.current {
                             self.send(Request::MarkInboxSeen { project });
@@ -886,6 +934,7 @@ impl eframe::App for App {
         });
 
         crate::dialogs::draw(self, ctx);
+        crate::snapshot_view::draw(self, ctx);
         self.draw_remove_confirm(ctx);
         self.draw_toast(ctx);
         self.dispatch_actions();

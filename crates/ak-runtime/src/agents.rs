@@ -226,6 +226,17 @@ pub struct AgentWatcher {
     _debouncer: Debouncer<notify_debouncer_mini::notify::RecommendedWatcher>,
 }
 
+/// Like `watch`, but never creates the directory: `None` when it is absent.
+pub fn watch_if_exists(
+    dir: &Path,
+    tx: mpsc::UnboundedSender<()>,
+) -> Result<Option<AgentWatcher>, RuntimeError> {
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    watch(dir, tx).map(Some)
+}
+
 pub fn watch(dir: &Path, tx: mpsc::UnboundedSender<()>) -> Result<AgentWatcher, RuntimeError> {
     std::fs::create_dir_all(dir).map_err(|e| RuntimeError::io(dir, e))?;
     let mut debouncer = new_debouncer(

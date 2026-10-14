@@ -40,6 +40,9 @@ pub enum RuntimeError {
     #[error("{0}")]
     Utility(String),
 
+    #[error("{0}")]
+    Snapshot(String),
+
     #[error("daily budget of ${limit:.2} reached (${spent:.2} spent today)")]
     BudgetExceeded { limit: f64, spent: f64 },
 

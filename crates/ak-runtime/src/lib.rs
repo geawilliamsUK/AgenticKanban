@@ -9,6 +9,7 @@ pub mod config;
 pub mod error;
 pub mod paths;
 pub mod registry;
+pub mod snapshot;
 pub mod utility;
 
 pub use agents::{AgentFiles, AgentWatcher, ReconcileReport};

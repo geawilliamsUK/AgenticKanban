@@ -13,6 +13,7 @@ mod markdown;
 mod mention_edit;
 mod model;
 mod settings_view;
+mod snapshot_view;
 mod team_view;
 mod ticket_view;
 mod widgets;

@@ -300,9 +300,62 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     if ui.button("New agent").clicked() {
                         app.actions.push(Action::OpenAgent(None));
                     }
+                    if ui
+                        .small_button("Import…")
+                        .on_hover_text(
+                            "Reads .agentic/agents/ from a repository and shows each agent as new, changed or identical before anything is written.",
+                        )
+                        .clicked()
+                    {
+                        if let Some(dir) = rfd::FileDialog::new()
+                            .set_title("Repository with an .agentic/ snapshot")
+                            .pick_folder()
+                        {
+                            app.actions.push(Action::Request(Request::ReviewImport {
+                                project,
+                                source: dir,
+                            }));
+                        }
+                    }
+                    if ui
+                        .small_button("Export…")
+                        .on_hover_text(
+                            "Writes this project's agents into .agentic/ in the repository, for sharing through git.",
+                        )
+                        .clicked()
+                    {
+                        app.export_dialog = Some(crate::snapshot_view::ExportDialog::default());
+                    }
                 });
             });
             ui.add_space(4.0);
+            if !app.drift.is_empty() {
+                let n = app.drift.len();
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 190, 80),
+                        format!("{n} agent(s) differ from the repository snapshot."),
+                    );
+                    if ui
+                        .small_button("Review…")
+                        .on_hover_text("Compare with, and import from, this repository's .agentic/")
+                        .clicked()
+                    {
+                        if let Some(path) = app
+                            .projects
+                            .iter()
+                            .find(|p| p.id == project)
+                            .map(|p| p.path.clone())
+                        {
+                            app.actions.push(Action::Request(Request::ReviewImport {
+                                project,
+                                source: path,
+                            }));
+                        }
+                    }
+                });
+                ui.add_space(4.0);
+            }
             ui.horizontal(|ui| {
                 let paused = app.scheduler_paused;
                 let label = if paused { "Agents paused" } else { "Agents active" };
@@ -349,6 +402,14 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 if open > 0 {
                     text.push_str(&format!("   ({open})"));
                 }
+                let drift = app
+                    .drift
+                    .iter()
+                    .find(|d| d.handle == a.handle)
+                    .map(|d| d.status);
+                if drift.is_some() {
+                    text.push_str("  ⇄");
+                }
                 let rich = if a.is_retired() {
                     egui::RichText::new(text).weak().strikethrough()
                 } else {
@@ -368,7 +429,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 label.on_hover_text(if a.is_retired() {
                     "Retired: the definition file was removed".to_string()
                 } else {
-                    format!("{}\nState: {}", a.description, a.state.label())
+                    let mut text = format!("{}\nState: {}", a.description, a.state.label());
+                    if let Some(status) = drift {
+                        text.push_str(&format!("\nSnapshot: {}", status.label()));
+                    }
+                    text
                 });
             }
         });

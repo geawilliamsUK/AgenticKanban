@@ -34,6 +34,9 @@ use ak_core::{Actor, ActorKind, Event, NotificationState, Timestamp};
 use ak_runtime::agents::{self, AgentWatcher};
 use ak_runtime::authoring::{self, RosterEntry, TeamMember};
 use ak_runtime::claude::{self, ClaudeProbe};
+use ak_runtime::snapshot::{
+    self, DriftEntry, ExportOptions, ExportReport, ImportReview, ImportSelection,
+};
 use ak_runtime::{OpenProject, ProjectRegistry, RuntimeError, UtilityRunner};
 use ak_store::Store;
 use ak_supervisor::{RunNotice, Scheduler, Supervisor, SupervisorConfig};
@@ -44,6 +47,7 @@ use crate::model::{BoardModel, ChatSummary, InboxItem, ThreadDetail, TicketDetai
 /// supply a fake.
 pub type RunnerFactory = Box<dyn Fn(&GlobalSettings) -> Arc<dyn UtilityRunner> + Send + Sync>;
 
+#[allow(clippy::large_enum_variant)]
 pub enum Request {
     AddProject {
         path: PathBuf,
@@ -182,6 +186,24 @@ pub enum Request {
     SearchThreads {
         project: ProjectId,
         query: String,
+    },
+    // Snapshot: export to and import from a repository's .agentic/ directory.
+    ExportAgents {
+        project: ProjectId,
+        options: ExportOptions,
+    },
+    ReviewImport {
+        project: ProjectId,
+        source: PathBuf,
+    },
+    /// Applies the review the human saw, so nothing is re-read behind them.
+    ApplyImport {
+        project: ProjectId,
+        review: ImportReview,
+        selection: ImportSelection,
+    },
+    CheckDrift {
+        project: ProjectId,
     },
     SaveGlobalSettings(GlobalSettings),
     SaveProjectPolicy {
@@ -332,6 +354,18 @@ pub enum Response {
         project: ProjectId,
         thread: ThreadId,
     },
+    ExportDone {
+        project: ProjectId,
+        report: ExportReport,
+    },
+    ImportReview {
+        project: ProjectId,
+        review: ImportReview,
+    },
+    Drift {
+        project: ProjectId,
+        entries: Vec<DriftEntry>,
+    },
     RunStarted {
         project: ProjectId,
         run: AgentRun,
@@ -370,6 +404,8 @@ struct ProjectWatchers {
     events: JoinHandle<()>,
     files: JoinHandle<()>,
     _agent_watcher: AgentWatcher,
+    /// Watches the repository's `.agentic/agents`, once it exists.
+    snapshot: Option<(AgentWatcher, JoinHandle<()>)>,
     scheduler: Option<Scheduler>,
 }
 
@@ -377,6 +413,9 @@ impl ProjectWatchers {
     fn stop(self) {
         self.events.abort();
         self.files.abort();
+        if let Some((_, task)) = self.snapshot {
+            task.abort();
+        }
         if let Some(s) = self.scheduler {
             s.shutdown();
         }
@@ -520,6 +559,60 @@ impl Backend {
         }
     }
 
+    /// Saves a policy, reports it back, and keeps the project list's name
+    /// in step with the policy's.
+    fn apply_policy(&mut self, project: ProjectId, policy: ProjectPolicy) -> Result<(), String> {
+        let p = self.project(project)?;
+        let name = policy.name.trim().to_string();
+        if name.is_empty() {
+            return Err("project name cannot be empty".into());
+        }
+        self.registry
+            .save_project_policy(project, &policy)
+            .map_err(|e| e.to_string())?;
+        self.send(Response::ProjectPolicy {
+            project,
+            policy: p.policy(),
+        });
+        let renamed = self.registry.entry(project).is_some_and(|e| e.name != name);
+        if renamed {
+            self.registry
+                .rename_project(project, &name)
+                .map_err(|e| e.to_string())?;
+            self.send(Response::Projects(self.registry.projects().to_vec()));
+        }
+        Ok(())
+    }
+
+    /// Starts watching the repository's snapshot directory when it exists
+    /// and is not watched yet. Never creates it.
+    fn ensure_snapshot_watch(&mut self, id: ProjectId) {
+        let Some(p) = self.registry.opened(id) else {
+            return;
+        };
+        let Some(w) = self.watchers.get_mut(&id) else {
+            return;
+        };
+        if w.snapshot.is_some() {
+            return;
+        }
+        let dir = snapshot::SnapshotPaths::new(&p.entry.path).agents_dir();
+        let (file_tx, file_rx) = tokio::sync::mpsc::unbounded_channel();
+        match agents::watch_if_exists(&dir, file_tx) {
+            Ok(Some(watcher)) => {
+                let task = tokio::spawn(watch_snapshot(
+                    p.clone(),
+                    file_rx,
+                    self.tx.clone(),
+                    self.ctx.clone(),
+                ));
+                w.snapshot = Some((watcher, task));
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("snapshot watcher failed: {e}"),
+        }
+    }
+
     fn supervisor_config(&self) -> SupervisorConfig {
         SupervisorConfig {
             binary: claude::locate(self.settings.claude_binary.as_deref())
@@ -618,6 +711,19 @@ impl Backend {
                 self.send(Response::Projects(self.registry.projects().to_vec()));
                 self.send(Response::Info("Project added".into()));
                 self.open_project(id).await?;
+                // Onboarding: a repository that already carries a snapshot
+                // offers its agents straight away.
+                if let Some(p) = self.registry.opened(id) {
+                    if snapshot::SnapshotPaths::new(&p.entry.path).exists() {
+                        match snapshot::review_import(&p.entry.path, &p.agents, &p.policy()) {
+                            Ok(review) => self.send(Response::ImportReview {
+                                project: id,
+                                review,
+                            }),
+                            Err(e) => tracing::warn!("onboarding review failed: {e}"),
+                        }
+                    }
+                }
             }
             Request::RemoveProject { id, delete_data } => {
                 if let Some(w) = self.watchers.remove(&id) {
@@ -878,6 +984,48 @@ impl Backend {
                     hits,
                 });
             }
+            Request::ExportAgents { project, options } => {
+                let p = self.project(project)?;
+                let report = snapshot::export(&p.agents, &p.policy(), &p.entry.path, &options)
+                    .map_err(|e| e.to_string())?;
+                self.ensure_snapshot_watch(project);
+                push_drift(&p, &self.tx, &self.ctx).await?;
+                self.send(Response::ExportDone { project, report });
+            }
+            Request::ReviewImport { project, source } => {
+                let p = self.project(project)?;
+                let review = snapshot::review_import(&source, &p.agents, &p.policy())
+                    .map_err(|e| e.to_string())?;
+                self.send(Response::ImportReview { project, review });
+            }
+            Request::ApplyImport {
+                project,
+                review,
+                selection,
+            } => {
+                let p = self.project(project)?;
+                let (written, policy) = snapshot::apply_import(&review, &selection, &p.agents)
+                    .map_err(|e| e.to_string())?;
+                let report = agents::reconcile(&p.agents, p.store.as_ref())
+                    .await
+                    .map_err(|e| e.to_string())?;
+                for (handle, msg) in &report.errors {
+                    tracing::warn!(handle, "imported definition rejected: {msg}");
+                }
+                if let Some(policy) = policy {
+                    self.apply_policy(project, policy)?;
+                }
+                push_board(&p, &self.tx, &self.ctx).await?;
+                push_drift(&p, &self.tx, &self.ctx).await?;
+                self.send(Response::Info(format!(
+                    "Imported {} agent(s)",
+                    written.len()
+                )));
+            }
+            Request::CheckDrift { project } => {
+                let p = self.project(project)?;
+                push_drift(&p, &self.tx, &self.ctx).await?;
+            }
             Request::Integrate {
                 project,
                 handle,
@@ -934,25 +1082,7 @@ impl Backend {
             }
             Request::SaveGlobalSettings(settings) => self.save_global_settings(settings).await?,
             Request::SaveProjectPolicy { project, policy } => {
-                let p = self.project(project)?;
-                let name = policy.name.trim().to_string();
-                if name.is_empty() {
-                    return Err("project name cannot be empty".into());
-                }
-                self.registry
-                    .save_project_policy(project, &policy)
-                    .map_err(|e| e.to_string())?;
-                self.send(Response::ProjectPolicy {
-                    project,
-                    policy: p.policy(),
-                });
-                let renamed = self.registry.entry(project).is_some_and(|e| e.name != name);
-                if renamed {
-                    self.registry
-                        .rename_project(project, &name)
-                        .map_err(|e| e.to_string())?;
-                    self.send(Response::Projects(self.registry.projects().to_vec()));
-                }
+                self.apply_policy(project, policy)?;
                 self.send(Response::Info("Project settings saved".into()));
             }
             Request::ProbeClaude => {
@@ -1112,6 +1242,7 @@ impl Backend {
         push_inbox(&p, &self.tx, &self.ctx).await?;
         push_approvals(&p, &self.tx, &self.ctx).await?;
         push_chats(&p, &self.tx, &self.ctx).await?;
+        push_drift(&p, &self.tx, &self.ctx).await?;
         archive_idle_threads(&p).await;
         if !self.watchers.contains_key(&id) {
             let events = tokio::spawn(watch_events(p.clone(), self.tx.clone(), self.ctx.clone()));
@@ -1138,10 +1269,12 @@ impl Backend {
                     events,
                     files,
                     _agent_watcher: agent_watcher,
+                    snapshot: None,
                     scheduler,
                 },
             );
         }
+        self.ensure_snapshot_watch(id);
         let paused = self
             .watchers
             .get(&id)
@@ -1468,6 +1601,7 @@ async fn watch_agent_files(
                 if report.changed() && push_board(&p, &tx, &ctx).await.is_err() {
                     return;
                 }
+                let _ = push_drift(&p, &tx, &ctx).await;
             }
             Err(e) => tracing::warn!("agent reconciliation failed: {e}"),
         }
@@ -1597,6 +1731,37 @@ async fn push_thread(
     tx.send(Response::ThreadDetail {
         project: p.id(),
         detail,
+    })
+    .map_err(|_| "ui gone".to_string())?;
+    ctx.request_repaint();
+    Ok(())
+}
+
+/// Recomputes drift whenever the repository's snapshot changes on disk, so
+/// a pull that brings new or changed agents shows up without a restart.
+async fn watch_snapshot(
+    p: Arc<OpenProject>,
+    mut rx: tokio::sync::mpsc::UnboundedReceiver<()>,
+    tx: Sender<Response>,
+    ctx: egui::Context,
+) {
+    while rx.recv().await.is_some() {
+        while rx.try_recv().is_ok() {}
+        if push_drift(&p, &tx, &ctx).await.is_err() {
+            return;
+        }
+    }
+}
+
+async fn push_drift(
+    p: &OpenProject,
+    tx: &Sender<Response>,
+    ctx: &egui::Context,
+) -> Result<(), String> {
+    let entries = snapshot::drift(&p.agents, &p.entry.path).map_err(|e| e.to_string())?;
+    tx.send(Response::Drift {
+        project: p.id(),
+        entries,
     })
     .map_err(|_| "ui gone".to_string())?;
     ctx.request_repaint();
@@ -2230,6 +2395,78 @@ name:",
             }
             _ => unreachable!(),
         }
+
+        // Export writes the repository snapshot; editing the snapshot copy shows
+        // as drift, reviews as changed, and imports back.
+        req_tx
+            .send(Request::ExportAgents {
+                project,
+                options: ExportOptions::default(),
+            })
+            .unwrap();
+        match next(&resp_rx, |r| matches!(r, Response::ExportDone { .. })) {
+            Response::ExportDone { report, .. } => {
+                assert_eq!(report.exported, vec!["backend", "frontend"]);
+                assert!(report.policy_written);
+            }
+            _ => unreachable!(),
+        }
+        let snapshot_files = snapshot::SnapshotPaths::new(&repo).files();
+        assert!(snapshot_files.definition_path("backend").is_file());
+        assert!(!repo.join(".claude").exists());
+        let mut changed = snapshot_files.read_definition("frontend").unwrap();
+        changed.frontmatter.description = "Changed in the repository".into();
+        snapshot_files.write_definition(&changed).unwrap();
+        req_tx.send(Request::CheckDrift { project }).unwrap();
+        match next(
+            &resp_rx,
+            |r| matches!(r, Response::Drift { entries, .. } if !entries.is_empty()),
+        ) {
+            Response::Drift { entries, .. } => {
+                assert_eq!(entries.len(), 1);
+                assert_eq!(entries[0].handle, "frontend");
+            }
+            _ => unreachable!(),
+        }
+        req_tx
+            .send(Request::ReviewImport {
+                project,
+                source: repo.clone(),
+            })
+            .unwrap();
+        let review = match next(&resp_rx, |r| matches!(r, Response::ImportReview { .. })) {
+            Response::ImportReview { review, .. } => review,
+            _ => unreachable!(),
+        };
+        assert_eq!(review.same_project, Some(true));
+        let for_frontend = review
+            .candidates
+            .iter()
+            .find(|c| c.handle == "frontend")
+            .unwrap();
+        assert_eq!(
+            for_frontend.status,
+            ak_runtime::snapshot::ImportStatus::Changed
+        );
+        req_tx
+            .send(Request::ApplyImport {
+                project,
+                review: review.clone(),
+                selection: ImportSelection {
+                    handles: vec!["frontend".into()],
+                    memory_for: Vec::new(),
+                    policy: false,
+                },
+            })
+            .unwrap();
+        next(
+            &resp_rx,
+            |r| matches!(r, Response::Board { board, .. } if board.agents.iter().any(|a| a.handle == "frontend" && a.description == "Changed in the repository")),
+        );
+        next(
+            &resp_rx,
+            |r| matches!(r, Response::Drift { entries, .. } if entries.is_empty()),
+        );
 
         // Global settings: the human's handle is renamed across the open project.
         let settings = GlobalSettings {
