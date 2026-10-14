@@ -1,0 +1,20 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# sqlx offline data, if ever generated
+/.sqlx/
+
+# Local databases used during development
+*.db
+*.db-shm
+*.db-wal
+
+# Editors
+/.vscode/
+/.idea/
+*.swp
+
+# OS
+Thumbs.db
+.DS_Store

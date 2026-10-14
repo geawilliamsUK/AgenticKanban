@@ -1,0 +1,22 @@
+[package]
+name = "ak-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ak-core = { version = "0.1.0", path = "../ak-core" }
+async-trait = "0.1.92"
+chrono = { version = "0.4.45", features = ["serde"] }
+serde = "1.0.229"
+serde_json = "1.0.154"
+sqlx = { version = "0.8.6", default-features = false, features = ["runtime-tokio", "sqlite", "uuid", "chrono", "json", "migrate", "macros"] }
+thiserror = "2.0.21"
+tokio = { version = "1.53.2", features = ["rt", "sync", "macros"] }
+tracing = "0.1.44"
+uuid = { version = "1.26.1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros"] }

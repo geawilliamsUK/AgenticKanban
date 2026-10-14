@@ -1,0 +1,25 @@
+[package]
+name = "agentic-kanban"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ak-core = { version = "0.1.0", path = "../ak-core" }
+ak-runtime = { version = "0.1.0", path = "../ak-runtime" }
+ak-store = { version = "0.1.0", path = "../ak-store" }
+anyhow = "1.0.104"
+chrono = "0.4.45"
+eframe = "0.32.3"
+egui = "0.32.3"
+egui_commonmark = "0.21.1"
+egui_extras = "0.32.3"
+rfd = "0.17.2"
+similar = "3.2.0"
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "sync", "macros"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
