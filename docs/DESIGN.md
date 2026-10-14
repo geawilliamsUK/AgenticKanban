@@ -296,7 +296,7 @@ Claude Code caps consecutive stop continuations at 8. An agent that hits the cap
 
 ### Permission profiles
 
-A profile is a permission mode, allow rules, deny rules and an approval policy. Rules use Claude Code's own syntax, for example `Bash(git commit *)` or `Bash(cargo test:*)`. Two presets ship:
+A profile is a permission mode, allow rules, deny rules and an approval policy. Rules use Claude Code's own syntax, for example `Bash(git commit *)` or `Bash(cargo test:*)`. A compound shell command (`&&`, `||`, `;`, `|`) is denied when any part is denied and allowed only when every part is allowed; a part with command substitution never matches an allow rule. Anything no rule covers asks the human. Two presets ship:
 
 | Profile | Mode | Auto-allowed | Human approval | Always denied |
 |---|---|---|---|---|

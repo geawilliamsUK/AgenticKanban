@@ -318,7 +318,7 @@ impl SqliteStore {
             + Send,
     {
         let now = Utc::now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let actor = Self::load_actor(&mut tx, actor_id).await?;
         let before = Self::load_ticket(&mut tx, id).await?;
         let outcome = decide(&before, &actor, now)?;
@@ -346,7 +346,7 @@ impl Store for SqliteStore {
     }
 
     async fn bootstrap(&self, policy: &ProjectPolicy, human: &HumanIdentity) -> Result<Actor> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
 
         let system = Actor::system();
         sqlx::query(
@@ -535,7 +535,7 @@ impl Store for SqliteStore {
 
     async fn create_ticket(&self, input: NewTicket, actor_id: ActorId) -> Result<Ticket> {
         let now = Utc::now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let actor = Self::load_actor(&mut tx, actor_id).await?;
         let (key, key_number) = Self::next_key(&mut tx).await?;
         let position = Self::next_position(&mut tx, input.column_id).await?;
@@ -579,7 +579,7 @@ impl Store for SqliteStore {
     ) -> Result<Ticket> {
         // Position is allocated inside the transaction, so this one is written out.
         let now = Utc::now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let actor = Self::load_actor(&mut tx, actor_id).await?;
         let before = Self::load_ticket(&mut tx, id).await?;
         let position = Self::next_position(&mut tx, to).await?;
@@ -631,7 +631,7 @@ impl Store for SqliteStore {
         actor_id: ActorId,
     ) -> Result<Comment> {
         let now = Utc::now();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let actor = Self::load_actor(&mut tx, actor_id).await?;
         let ticket = Self::load_ticket(&mut tx, ticket_id).await?;
         let parent_comment = match parent {
@@ -755,7 +755,7 @@ impl Store for SqliteStore {
 
     async fn upsert_agent(&self, agent: &Agent) -> Result<()> {
         Actor::validate_handle(&agent.handle)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         // The handle must not belong to a different actor.
         if let Some(other) = Self::load_actor_by_handle(&mut tx, &agent.handle).await? {
             if other.id != agent.actor_id {

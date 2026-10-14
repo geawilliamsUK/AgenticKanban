@@ -119,9 +119,11 @@ impl AgentDefinition {
         Self {
             frontmatter: Frontmatter {
                 name: handle.to_string(),
-                description: format!(
-                    "{role} @{handle}. Describe what this agent owns and when to involve it."
-                ),
+                description: if role == "team member" {
+                    "Describe what this agent owns and when to involve it.".to_string()
+                } else {
+                    role.to_string()
+                },
                 model: None,
                 permission_profile: default_profile(),
                 budgets: None,

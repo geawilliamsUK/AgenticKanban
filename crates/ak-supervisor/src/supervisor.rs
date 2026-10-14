@@ -474,9 +474,12 @@ impl Driver {
             self.run.num_turns = r.get("num_turns").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
             self.run.cost_usd = r.get("total_cost_usd").and_then(|v| v.as_f64());
             if let Some(u) = r.get("usage") {
-                self.run.input_tokens = u.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                self.run.output_tokens =
-                    u.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                // Cached input is still input the model read.
+                let n = |k: &str| u.get(k).and_then(|v| v.as_u64()).unwrap_or(0);
+                self.run.input_tokens = n("input_tokens")
+                    + n("cache_creation_input_tokens")
+                    + n("cache_read_input_tokens");
+                self.run.output_tokens = n("output_tokens");
             }
         }
         self.run.ended_at = Some(Utc::now());
@@ -609,16 +612,54 @@ pub fn parse_line(line: &str) -> Vec<(RunEventKind, Value)> {
             json!({"message": truncate(line, 2000)}),
         )];
     };
+    // Rate-limit notices arrive under their own top-level type; nobody reads them.
+    if v.get("rate_limit_info").is_some() {
+        return Vec::new();
+    }
     let kind = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
     match kind {
         "system" => {
-            if v.get("subtype").and_then(|s| s.as_str()) == Some("init") {
-                vec![(RunEventKind::SystemInit, v)]
-            } else {
-                vec![(
+            let subtype = v
+                .get("subtype")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            let text = |k: &str| v.get(k).and_then(|x| x.as_str()).unwrap_or("").to_string();
+            match subtype.as_str() {
+                "init" => vec![(RunEventKind::SystemInit, v)],
+                // Bookkeeping Claude Code emits constantly; nothing a reader wants.
+                "thinking_tokens" | "rate_limit_info" | "hook_started" => Vec::new(),
+                "hook_response" => {
+                    let outcome = text("outcome");
+                    if outcome == "success" {
+                        return Vec::new();
+                    }
+                    let message =
+                        format!("hook {} {outcome}: {}", text("hook_name"), text("output"));
+                    vec![(
+                        RunEventKind::Other,
+                        json!({"message": truncate(&message, 2000)}),
+                    )]
+                }
+                "task_summary" => {
+                    let detail = text("detail");
+                    if detail.trim().is_empty() {
+                        Vec::new()
+                    } else {
+                        vec![(
+                            RunEventKind::Other,
+                            json!({"message": format!("task: {detail}")}),
+                        )]
+                    }
+                }
+                s if s.starts_with("vcs_state_change") => vec![(
+                    RunEventKind::Other,
+                    json!({"message": format!("git {} on {}", text("kind"), text("branch"))}),
+                )],
+                _ => vec![(
                     RunEventKind::Other,
                     json!({"message": truncate(&v.to_string(), 2000)}),
-                )]
+                )],
             }
         }
         "assistant" => {

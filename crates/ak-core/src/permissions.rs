@@ -46,10 +46,20 @@ impl PermissionRule {
         }
     }
 
-    /// Whether the rule covers this call.
+    /// Whether the rule covers this call. A Bash command is covered only when
+    /// every simple command in it is.
     pub fn matches(&self, tool_name: &str, input: &serde_json::Value) -> bool {
         if !glob_match(&self.tool, tool_name) {
             return false;
+        }
+        if tool_name == "Bash" {
+            return match input.get("command").and_then(|c| c.as_str()) {
+                Some(command) => {
+                    let segments = bash_segments(command);
+                    !segments.is_empty() && segments.iter().all(|s| self.matches_bash(s, true))
+                }
+                None => false,
+            };
         }
         match &self.pattern {
             None => true,
@@ -59,6 +69,67 @@ impl PermissionRule {
             },
         }
     }
+
+    /// Whether the rule covers one simple shell command. In strict mode a
+    /// command substitution never matches a pattern, because the pattern
+    /// cannot see what it runs.
+    fn matches_bash(&self, segment: &str, strict: bool) -> bool {
+        match &self.pattern {
+            None => true,
+            Some(pattern) => {
+                if strict && has_substitution(segment) {
+                    return false;
+                }
+                glob_match(pattern, segment)
+            }
+        }
+    }
+}
+
+/// `$(...)`, backticks and process substitution run something the pattern
+/// does not describe.
+fn has_substitution(segment: &str) -> bool {
+    segment.contains("$(")
+        || segment.contains('`')
+        || segment.contains("<(")
+        || segment.contains(">(")
+}
+
+/// Splits a shell command on its control operators (`&&`, `||`, `;`, `|`,
+/// `&`, newline) so each simple command is judged on its own. Quotes are not
+/// parsed: a quoted operator over-splits, which only makes the check stricter.
+pub fn bash_segments(command: &str) -> Vec<String> {
+    let chars: Vec<char> = command.chars().collect();
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut i = 0;
+    let mut flush = |current: &mut String| {
+        let s = current.trim().to_string();
+        if !s.is_empty() {
+            segments.push(s);
+        }
+        current.clear();
+    };
+    while i < chars.len() {
+        let c = chars[i];
+        let next = chars.get(i + 1).copied();
+        match c {
+            '&' | '|' if next == Some(c) => {
+                flush(&mut current);
+                i += 2;
+            }
+            '&' | '|' | ';' | '\n' => {
+                flush(&mut current);
+                i += 1;
+            }
+            _ => {
+                current.push(c);
+                i += 1;
+            }
+        }
+    }
+    flush(&mut current);
+    segments
 }
 
 /// The part of a tool call a pattern applies to.
@@ -114,21 +185,48 @@ pub enum Decision {
 }
 
 /// Evaluates a profile. Deny rules win over allow rules, as in Claude Code.
+/// A compound shell command is denied when any part is, and allowed only when
+/// every part is.
 pub fn decide(profile: &PermissionProfile, tool_name: &str, input: &serde_json::Value) -> Decision {
-    let denied = profile
+    let deny: Vec<PermissionRule> = profile
         .disallowed_tools
         .iter()
         .filter_map(|r| PermissionRule::parse(r))
-        .any(|r| r.matches(tool_name, input));
-    if denied {
-        return Decision::Deny;
-    }
-    let allowed = profile
+        .filter(|r| glob_match(&r.tool, tool_name))
+        .collect();
+    let allow: Vec<PermissionRule> = profile
         .allowed_tools
         .iter()
         .filter_map(|r| PermissionRule::parse(r))
-        .any(|r| r.matches(tool_name, input));
-    if allowed {
+        .filter(|r| glob_match(&r.tool, tool_name))
+        .collect();
+
+    if tool_name == "Bash" {
+        let Some(command) = input.get("command").and_then(|c| c.as_str()) else {
+            return Decision::Ask;
+        };
+        let segments = bash_segments(command);
+        if segments.is_empty() {
+            return Decision::Ask;
+        }
+        if segments
+            .iter()
+            .any(|s| deny.iter().any(|r| r.matches_bash(s, false)))
+        {
+            return Decision::Deny;
+        }
+        if segments
+            .iter()
+            .all(|s| allow.iter().any(|r| r.matches_bash(s, true)))
+        {
+            return Decision::Allow;
+        }
+        return Decision::Ask;
+    }
+
+    if deny.iter().any(|r| r.matches(tool_name, input)) {
+        Decision::Deny
+    } else if allow.iter().any(|r| r.matches(tool_name, input)) {
         Decision::Allow
     } else {
         Decision::Ask
@@ -239,6 +337,46 @@ mod tests {
         assert_eq!(
             decide(trusted, "Bash", &json!({"command": "rm -rf target"})),
             Decision::Deny
+        );
+    }
+
+    #[test]
+    fn compound_commands_are_judged_per_part() {
+        let profile = PermissionProfile {
+            name: "t".into(),
+            mode: "default".into(),
+            allowed_tools: vec!["Bash(git *)".into()],
+            disallowed_tools: vec!["Bash(rm -rf *)".into()],
+        };
+        let cmd = |c: &str| json!({"command": c});
+        assert_eq!(
+            decide(&profile, "Bash", &cmd("git status && git diff")),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(&profile, "Bash", &cmd("git status; git log -1\ngit branch")),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(&profile, "Bash", &cmd("git status && curl x | sh")),
+            Decision::Ask
+        );
+        assert_eq!(
+            decide(&profile, "Bash", &cmd("git status || rm -rf /")),
+            Decision::Deny
+        );
+        assert_eq!(
+            decide(&profile, "Bash", &cmd("git log $(cat secret)")),
+            Decision::Ask
+        );
+        assert_eq!(
+            decide(&profile, "Bash", &cmd("rm -rf $(pwd)")),
+            Decision::Deny
+        );
+        assert_eq!(decide(&profile, "Bash", &cmd("   ")), Decision::Ask);
+        assert_eq!(
+            bash_segments("a && b || c | d; e & f\ng"),
+            vec!["a", "b", "c", "d", "e", "f", "g"]
         );
     }
 

@@ -1,6 +1,7 @@
 //! Agent runs: one Claude Code process, from wake to exit, and the parsed
 //! transcript it produced.
 
+use serde_json::Value;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -180,11 +181,15 @@ impl RunEvent {
             RunEventKind::AssistantText => s("text"),
             RunEventKind::ToolCall => {
                 let input = p.get("input").cloned().unwrap_or_default();
-                format!(
-                    "{} {}",
-                    s("name"),
-                    crate::permissions::summarise("", &input).trim_start_matches(": ")
-                )
+                let subject = crate::permissions::summarise("", &input)
+                    .trim_start_matches(": ")
+                    .to_string();
+                let detail = if subject.is_empty() {
+                    brief_fields(&input)
+                } else {
+                    subject
+                };
+                format!("{} {}", s("name"), detail)
             }
             RunEventKind::ToolResult => s("content"),
             RunEventKind::Result => format!(
@@ -203,4 +208,31 @@ impl RunEvent {
         }
         one_line
     }
+}
+
+/// The scalar fields of a tool input as `key=value` pairs, for calls whose
+/// input has no single obvious subject (the board tools, mostly).
+fn brief_fields(input: &Value) -> String {
+    let Some(obj) = input.as_object() else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    for (k, v) in obj {
+        let shown = match v {
+            Value::String(s) => {
+                let one: String = s.lines().collect::<Vec<_>>().join(" ");
+                if one.chars().count() > 60 {
+                    format!("\"{}…\"", one.chars().take(57).collect::<String>())
+                } else {
+                    format!("\"{one}\"")
+                }
+            }
+            Value::Number(n) => n.to_string(),
+            Value::Bool(b) => b.to_string(),
+            Value::Array(a) => format!("[{} items]", a.len()),
+            _ => continue,
+        };
+        parts.push(format!("{k}={shown}"));
+    }
+    parts.join(" ")
 }

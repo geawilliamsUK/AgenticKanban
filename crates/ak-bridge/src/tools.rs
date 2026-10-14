@@ -287,7 +287,9 @@ fn store_message(e: &StoreError) -> String {
 }
 
 fn parse_args<T: for<'de> Deserialize<'de>>(args: Value) -> Result<T, ToolError> {
-    serde_json::from_value(args).map_err(|e| ToolError::Message(format!("invalid arguments: {e}")))
+    serde_json::from_value(args).map_err(|e| ToolError::Message(format!(
+        "invalid arguments: {e}. Check the tool's input schema; a ticket change needs the version from ticket_get."
+    )))
 }
 
 async fn run(ctx: &RunContext, name: &str, args: Value) -> Result<String, ToolError> {
