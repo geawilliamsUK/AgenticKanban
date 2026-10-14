@@ -8,6 +8,7 @@
 
 pub mod actor;
 pub mod agent;
+pub mod approval;
 pub mod board;
 pub mod commands;
 pub mod config;
@@ -16,10 +17,12 @@ pub mod event;
 pub mod ids;
 pub mod mentions;
 pub mod notification;
+pub mod permissions;
 pub mod utility;
 
 pub use actor::{Actor, ActorKind};
 pub use agent::{Agent, AgentDefinition, AgentState, Budgets};
+pub use approval::{Approval, ApprovalState};
 pub use board::{Column, ColumnKind, Comment, Priority, Ticket};
 pub use error::CoreError;
 pub use event::{Event, EventKind, FieldChange, MentionSource};

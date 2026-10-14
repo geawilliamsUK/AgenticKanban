@@ -8,6 +8,7 @@ use sqlx::sqlite::SqliteRow;
 use sqlx::Row;
 
 use ak_core::agent::{Agent, AgentState, Budgets};
+use ak_core::approval::{Approval, ApprovalState};
 use ak_core::board::{Column, ColumnKind, Comment, Priority, Ticket};
 use ak_core::event::EventKind;
 use ak_core::utility::{UtilityCall, UtilityKind, UtilityState};
@@ -174,5 +175,24 @@ pub fn utility_call_from_row(row: &SqliteRow) -> Result<UtilityCall, StoreError>
         proposal: row.try_get("proposal")?,
         warnings: serde_json::from_str(&warnings)?,
         error: row.try_get("error")?,
+    })
+}
+
+pub fn approval_from_row(row: &SqliteRow) -> Result<Approval, StoreError> {
+    let state: String = row.try_get("state")?;
+    let input: String = row.try_get("input")?;
+    let decided_at: Option<String> = row.try_get("decided_at")?;
+    Ok(Approval {
+        id: parse_id(&row.try_get::<String, _>("id")?, "approval")?,
+        run_id: parse_id(&row.try_get::<String, _>("run_id")?, "run")?,
+        agent_id: parse_id(&row.try_get::<String, _>("agent_actor_id")?, "actor")?,
+        tool_name: row.try_get("tool_name")?,
+        input: serde_json::from_str(&input)?,
+        summary: row.try_get("summary")?,
+        state: ApprovalState::parse(&state)
+            .ok_or_else(|| StoreError::corrupt(format!("approval state {state:?}")))?,
+        created_at: parse_ts(&row.try_get::<String, _>("created_at")?)?,
+        decided_by: parse_opt_id(row.try_get("decided_by")?, "actor")?,
+        decided_at: decided_at.as_deref().map(parse_ts).transpose()?,
     })
 }

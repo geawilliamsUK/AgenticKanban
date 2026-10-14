@@ -14,6 +14,7 @@ use sqlx::{Sqlite, SqliteConnection, Transaction};
 use tokio::sync::broadcast;
 
 use ak_core::agent::{Agent, AgentState};
+use ak_core::approval::{Approval, ApprovalState};
 use ak_core::board::{Column, Comment, Ticket};
 use ak_core::commands::{self, NewTicket, TicketPatch};
 use ak_core::config::ProjectPolicy;
@@ -911,5 +912,101 @@ impl Store for SqliteStore {
         .fetch_one(&self.pool)
         .await?;
         Ok(sqlx::Row::try_get(&row, "total")?)
+    }
+
+    async fn ticket_by_key(&self, key: &str) -> Result<Option<Ticket>> {
+        let row = sqlx::query("SELECT * FROM tickets WHERE key = ?")
+            .bind(key.trim().to_uppercase())
+            .fetch_optional(&self.pool)
+            .await?;
+        row.as_ref().map(ticket_from_row).transpose()
+    }
+
+    async fn mark_notifications_handled(
+        &self,
+        ids: &[NotificationId],
+        run: Option<RunId>,
+    ) -> Result<u64> {
+        let now = fmt_ts(&Utc::now());
+        let mut count = 0;
+        for id in ids {
+            let result = sqlx::query(
+                "UPDATE notifications SET state = 'handled', handled_at = ?, handled_in_run_id = ? \
+                 WHERE id = ? AND state IN ('pending', 'seen')",
+            )
+            .bind(&now)
+            .bind(run.map(|r| r.to_string()))
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+            count += result.rows_affected();
+        }
+        Ok(count)
+    }
+
+    async fn insert_approval(&self, approval: &Approval) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO approvals (id, run_id, agent_actor_id, tool_name, input, summary, state, \
+             created_at, decided_by, decided_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(approval.id.to_string())
+        .bind(approval.run_id.to_string())
+        .bind(approval.agent_id.to_string())
+        .bind(&approval.tool_name)
+        .bind(serde_json::to_string(&approval.input)?)
+        .bind(&approval.summary)
+        .bind(approval.state.as_str())
+        .bind(fmt_ts(&approval.created_at))
+        .bind(approval.decided_by.map(|a| a.to_string()))
+        .bind(approval.decided_at.as_ref().map(fmt_ts))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn approval(&self, id: ApprovalId) -> Result<Approval> {
+        let row = sqlx::query("SELECT * FROM approvals WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| StoreError::not_found(format!("approval {id}")))?;
+        approval_from_row(&row)
+    }
+
+    async fn pending_approvals(&self) -> Result<Vec<Approval>> {
+        let rows =
+            sqlx::query("SELECT * FROM approvals WHERE state = 'pending' ORDER BY created_at")
+                .fetch_all(&self.pool)
+                .await?;
+        rows.iter().map(approval_from_row).collect()
+    }
+
+    async fn decide_approval(
+        &self,
+        id: ApprovalId,
+        state: ApprovalState,
+        decided_by: Option<ActorId>,
+    ) -> Result<Approval> {
+        let result = sqlx::query(
+            "UPDATE approvals SET state = ?, decided_by = ?, decided_at = ? \
+             WHERE id = ? AND state = 'pending'",
+        )
+        .bind(state.as_str())
+        .bind(decided_by.map(|a| a.to_string()))
+        .bind(fmt_ts(&Utc::now()))
+        .bind(id.to_string())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            // Either unknown or already decided; report which.
+            return match self.approval(id).await {
+                Ok(a) => Err(StoreError::Core(ak_core::CoreError::validation(format!(
+                    "approval already {}",
+                    a.state.as_str()
+                )))),
+                Err(e) => Err(e),
+            };
+        }
+        self.approval(id).await
     }
 }

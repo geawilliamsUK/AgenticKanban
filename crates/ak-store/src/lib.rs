@@ -16,10 +16,13 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 
 use ak_core::agent::{Agent, AgentState};
+use ak_core::approval::{Approval, ApprovalState};
 use ak_core::board::{Column, Comment, Ticket};
 use ak_core::commands::{NewTicket, TicketPatch};
 use ak_core::config::ProjectPolicy;
-use ak_core::ids::{ActorId, CallId, ColumnId, CommentId, NotificationId, RunId, TicketId};
+use ak_core::ids::{
+    ActorId, ApprovalId, CallId, ColumnId, CommentId, NotificationId, RunId, TicketId,
+};
 use ak_core::utility::{UtilityCall, UtilityKind};
 use ak_core::{Actor, Event, Notification, NotificationState, Timestamp};
 
@@ -141,6 +144,28 @@ pub trait Store: Send + Sync {
     ) -> Result<Option<UtilityCall>>;
     /// Total recorded cost of calls started at or after `since`.
     async fn utility_cost_since(&self, since: Timestamp) -> Result<f64>;
+
+    // Used by the bridge on behalf of agent runs.
+
+    async fn ticket_by_key(&self, key: &str) -> Result<Option<Ticket>>;
+    /// Marks the given notifications Handled, recording the run. Returns the count.
+    async fn mark_notifications_handled(
+        &self,
+        ids: &[NotificationId],
+        run: Option<RunId>,
+    ) -> Result<u64>;
+
+    // Approvals raised by the PreToolUse hook.
+
+    async fn insert_approval(&self, approval: &Approval) -> Result<()>;
+    async fn approval(&self, id: ApprovalId) -> Result<Approval>;
+    async fn pending_approvals(&self) -> Result<Vec<Approval>>;
+    async fn decide_approval(
+        &self,
+        id: ApprovalId,
+        state: ApprovalState,
+        decided_by: Option<ActorId>,
+    ) -> Result<Approval>;
 }
 
 pub type SharedStore = Arc<dyn Store>;

@@ -83,6 +83,7 @@ id_type!(ChatId);
 id_type!(ThreadId);
 id_type!(MessageId);
 id_type!(CallId);
+id_type!(ApprovalId);
 
 impl ActorId {
     /// The reserved actor used for guardrail and system actions.
