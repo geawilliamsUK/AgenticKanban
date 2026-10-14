@@ -186,6 +186,14 @@ impl Scheduler {
         }
     }
 
+    /// Kills every run in progress. Agents stay wakeable.
+    pub fn stop_all(&self) {
+        let mut state = self.inner.state.lock().expect("state");
+        for a in state.active.values_mut() {
+            a.handle.stop(StopReason::Stopped);
+        }
+    }
+
     /// Kills the run if any and keeps the agent from waking until resumed.
     pub async fn halt(&self, agent: ActorId) -> Result<(), SupervisorError> {
         let store = self.inner.project.store();

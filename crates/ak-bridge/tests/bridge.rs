@@ -487,7 +487,7 @@ async fn unanswered_approvals_expire_and_deny() {
         &ctx,
         &PreToolUseInput {
             tool_name: "Bash".into(),
-            tool_input: json!({"command": "cargo build"}),
+            tool_input: json!({"command": "git push origin main"}),
         },
     )
     .await;

@@ -323,6 +323,7 @@ impl Supervisor {
             columns: &columns,
             workspace: &spec.workspace,
             push_allowed: policy.push_policy == ak_core::config::PushPolicy::Allowed,
+            integration_branch: policy.integration_branch.as_deref(),
         }))
     }
 }

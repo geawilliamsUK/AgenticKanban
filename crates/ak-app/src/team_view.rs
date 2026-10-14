@@ -395,6 +395,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         paused: !paused,
                     }));
                 }
+                if ui
+                    .small_button("Stop all runs")
+                    .on_hover_text("Kills every run in progress in this project. Agents stay wakeable; pause as well to keep them from starting again.")
+                    .clicked()
+                {
+                    app.actions.push(Action::Request(Request::StopAllAgents { project }));
+                }
             });
             ui.add_space(6.0);
             if let Some(h) = &app.human {

@@ -100,6 +100,9 @@ pub struct ProjectPolicy {
     /// Threads with no activity for this many days are archived. Posting
     /// reopens them.
     pub thread_archive_days: u32,
+    /// The branch ticket branches start from and the integrator merges into.
+    /// None means the repository's default branch.
+    pub integration_branch: Option<String>,
 }
 
 impl Default for ProjectPolicy {
@@ -119,6 +122,7 @@ impl ProjectPolicy {
             push_policy: PushPolicy::Never,
             allow_project_mcp: false,
             thread_archive_days: 7,
+            integration_branch: None,
             default_model: None,
             authoring_model: None,
             permission_profiles: PermissionProfile::defaults(),
@@ -220,58 +224,162 @@ pub struct PermissionProfile {
 impl PermissionProfile {
     pub const SUPERVISED: &'static str = "supervised";
     pub const TRUSTED: &'static str = "trusted";
+    pub const INTEGRATOR: &'static str = "integrator";
 
+    /// Three presets. Supervised reads, builds and tests but asks before it
+    /// changes anything; trusted edits and commits in its own worktree;
+    /// integrator may also merge. Every part of a compound shell command must
+    /// be covered, so the everyday shell verbs are listed too. Pushing is
+    /// never listed: it always asks, and the deny list keeps it from being
+    /// forced.
     pub fn defaults() -> Vec<Self> {
-        let destructive = vec![
-            "Bash(rm -rf *)".to_string(),
-            "Bash(git push --force*)".to_string(),
-            "Bash(git reset --hard*)".to_string(),
-        ];
+        let reads: Vec<String> = [
+            // Claude Code's own bookkeeping and read tools.
+            "Read",
+            "Glob",
+            "Grep",
+            "ToolSearch",
+            "TodoWrite",
+            "TaskCreate",
+            "TaskUpdate",
+            "TaskList",
+            "TaskGet",
+            "BashOutput",
+            "TaskOutput",
+            "KillShell",
+            "WebSearch",
+            "WebFetch",
+            "ListMcpResourcesTool",
+            "ReadMcpResourceTool",
+            // Everyday shell verbs that only read or print.
+            "Bash(cd *)",
+            "Bash(ls*)",
+            "Bash(dir*)",
+            "Bash(pwd*)",
+            "Bash(cat *)",
+            "Bash(head *)",
+            "Bash(tail *)",
+            "Bash(wc *)",
+            "Bash(sort *)",
+            "Bash(uniq *)",
+            "Bash(grep *)",
+            "Bash(rg *)",
+            "Bash(find *)",
+            "Bash(tree*)",
+            "Bash(echo *)",
+            "Bash(printf *)",
+            "Bash(which *)",
+            "Bash(where *)",
+            "Bash(type *)",
+            "Bash(env*)",
+            "Bash(date*)",
+            "Bash(true)",
+            "Bash(sleep *)",
+            // Building and testing write only to the target directory.
+            "Bash(cargo *)",
+            "Bash(rustc *)",
+            "Bash(rustup *)",
+            "Bash(npm test*)",
+            "Bash(npm run*)",
+            "Bash(npx tsc*)",
+            "Bash(npx vitest*)",
+            "Bash(npx eslint*)",
+            // Git that reads.
+            "Bash(git status*)",
+            "Bash(git diff*)",
+            "Bash(git log*)",
+            "Bash(git show*)",
+            "Bash(git rev-parse*)",
+            "Bash(git merge-base*)",
+            "Bash(git branch --list*)",
+            "Bash(git branch -a*)",
+            "Bash(git branch -r*)",
+            "Bash(git branch -v*)",
+            "Bash(git branch --show-current*)",
+            "Bash(git remote*)",
+            "Bash(git symbolic-ref*)",
+            "Bash(git ls-files*)",
+            "Bash(git ls-tree*)",
+            "Bash(git blame*)",
+            "Bash(git describe*)",
+            "Bash(git fetch*)",
+            "Bash(git worktree list*)",
+            "Bash(git config --get*)",
+            "Bash(git config --list*)",
+            "Bash(git tag -l*)",
+            "Bash(git tag --list*)",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let writes: Vec<String> = [
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "Agent",
+            "Skill",
+            "Bash(mkdir *)",
+            "Bash(touch *)",
+            "Bash(cp *)",
+            "Bash(mv *)",
+            "Bash(rm *)",
+            "Bash(sed *)",
+            "Bash(awk *)",
+            "Bash(npm install*)",
+            "Bash(npm ci*)",
+            // Git that changes this worktree's own branches.
+            "Bash(git add*)",
+            "Bash(git commit*)",
+            "Bash(git checkout*)",
+            "Bash(git switch*)",
+            "Bash(git restore*)",
+            "Bash(git stash*)",
+            "Bash(git rm*)",
+            "Bash(git mv*)",
+            "Bash(git branch*)",
+            "Bash(git tag*)",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let merges: Vec<String> = [
+            "Bash(git merge*)",
+            "Bash(git cherry-pick*)",
+            "Bash(git revert*)",
+            "Bash(git worktree prune*)",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let destructive: Vec<String> = [
+            "Bash(rm -r*)",
+            "Bash(git push --force*)",
+            "Bash(git push -f*)",
+            "Bash(git reset --hard*)",
+            "Bash(git clean*)",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let trusted: Vec<String> = reads.iter().chain(writes.iter()).cloned().collect();
+        let integrator: Vec<String> = trusted.iter().chain(merges.iter()).cloned().collect();
         vec![
             PermissionProfile {
                 name: Self::SUPERVISED.into(),
                 mode: "default".into(),
-                allowed_tools: vec![
-                    "Read".into(),
-                    "Glob".into(),
-                    "Grep".into(),
-                    "ToolSearch".into(),
-                    "TodoWrite".into(),
-                    "Bash(git status*)".into(),
-                    "Bash(git diff*)".into(),
-                    "Bash(git log*)".into(),
-                    "Bash(git show*)".into(),
-                    "Bash(git rev-parse*)".into(),
-                    "Bash(git merge-base*)".into(),
-                ],
+                allowed_tools: reads,
                 disallowed_tools: destructive.clone(),
             },
             PermissionProfile {
                 name: Self::TRUSTED.into(),
                 mode: "acceptEdits".into(),
-                allowed_tools: vec![
-                    "Read".into(),
-                    "Glob".into(),
-                    "Grep".into(),
-                    "ToolSearch".into(),
-                    "TodoWrite".into(),
-                    "Edit".into(),
-                    "Write".into(),
-                    "Bash(git status*)".into(),
-                    "Bash(git diff*)".into(),
-                    "Bash(git log*)".into(),
-                    "Bash(git show*)".into(),
-                    "Bash(git rev-parse*)".into(),
-                    "Bash(git merge-base*)".into(),
-                    "Bash(git add*)".into(),
-                    "Bash(git commit*)".into(),
-                    "Bash(git checkout*)".into(),
-                    "Bash(git switch*)".into(),
-                    "Bash(git branch*)".into(),
-                    "Bash(cargo *)".into(),
-                    "Bash(npm test*)".into(),
-                    "Bash(npm run*)".into(),
-                ],
+                allowed_tools: trusted,
+                disallowed_tools: destructive.clone(),
+            },
+            PermissionProfile {
+                name: Self::INTEGRATOR.into(),
+                mode: "acceptEdits".into(),
+                allowed_tools: integrator,
                 disallowed_tools: destructive,
             },
         ]

@@ -18,6 +18,7 @@ pub struct SettingsEditor {
     pub project: Option<ProjectPolicy>,
     pub project_authoring_model: String,
     pub project_default_model: String,
+    pub project_integration_branch: String,
     pub project_dirty: bool,
 }
 
@@ -30,6 +31,7 @@ impl SettingsEditor {
             global_dirty: false,
             project: None,
             project_authoring_model: String::new(),
+            project_integration_branch: String::new(),
             project_default_model: String::new(),
             project_dirty: false,
         };
@@ -56,6 +58,9 @@ impl SettingsEditor {
             .unwrap_or_default();
         self.project_default_model = policy
             .and_then(|p| p.default_model.clone())
+            .unwrap_or_default();
+        self.project_integration_branch = policy
+            .and_then(|p| p.integration_branch.clone())
             .unwrap_or_default();
         self.project_dirty = false;
     }
@@ -87,6 +92,7 @@ impl SettingsEditor {
         p.name = p.name.trim().to_string();
         p.authoring_model = opt_string(&self.project_authoring_model);
         p.default_model = opt_string(&self.project_default_model);
+        p.integration_branch = opt_string(&self.project_integration_branch);
         Some(p)
     }
 }
@@ -387,6 +393,24 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             ) {
                                 editor.project_dirty = true;
                             }
+                            ui.end_row();
+
+                            ui.label("Integration branch");
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(
+                                        egui::TextEdit::singleline(
+                                            &mut editor.project_integration_branch,
+                                        )
+                                        .hint_text("default branch")
+                                        .desired_width(160.0),
+                                    )
+                                    .changed()
+                                {
+                                    editor.project_dirty = true;
+                                }
+                                ui.weak("ticket branches start here and the integrator merges here");
+                            });
                             ui.end_row();
 
                             ui.label("Archive idle threads after");

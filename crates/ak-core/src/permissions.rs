@@ -80,10 +80,38 @@ impl PermissionRule {
                 if strict && has_substitution(segment) {
                     return false;
                 }
-                glob_match(pattern, segment)
+                glob_match(pattern, &normalise(segment))
             }
         }
     }
+}
+
+/// Drops the git options that change nothing about what a command does, so
+/// `git -c user.name=x commit` is judged as `git commit`. `-C <dir>` is kept:
+/// it points the command at another repository.
+fn normalise(segment: &str) -> String {
+    let mut words = segment.split_whitespace();
+    let Some(first) = words.next() else {
+        return String::new();
+    };
+    if first != "git" {
+        return segment.trim().to_string();
+    }
+    let rest: Vec<&str> = words.collect();
+    let mut i = 0;
+    while i < rest.len() {
+        let w = rest[i];
+        if w == "-c" && i + 1 < rest.len() && rest[i + 1].contains('=') {
+            i += 2;
+        } else if (w.starts_with("-c") && w.contains('=')) || w == "--no-pager" {
+            i += 1;
+        } else {
+            break;
+        }
+    }
+    let mut out = vec!["git"];
+    out.extend(&rest[i..]);
+    out.join(" ")
 }
 
 /// `$(...)`, backticks and process substitution run something the pattern
@@ -112,11 +140,18 @@ pub fn bash_segments(command: &str) -> Vec<String> {
     };
     while i < chars.len() {
         let c = chars[i];
+        let prev = if i > 0 { Some(chars[i - 1]) } else { None };
         let next = chars.get(i + 1).copied();
+        // `2>&1`, `&>out` and `<&3` are redirections, not operators.
+        let redirect = c == '&' && (matches!(prev, Some('>' | '<')) || next == Some('>'));
         match c {
             '&' | '|' if next == Some(c) => {
                 flush(&mut current);
                 i += 2;
+            }
+            '&' if redirect => {
+                current.push(c);
+                i += 1;
             }
             '&' | '|' | ';' | '\n' => {
                 flush(&mut current);
@@ -378,6 +413,76 @@ mod tests {
             bash_segments("a && b || c | d; e & f\ng"),
             vec!["a", "b", "c", "d", "e", "f", "g"]
         );
+        assert_eq!(
+            bash_segments("cargo test 2>&1 | tail -40 && cmd &>log; x <&3"),
+            vec!["cargo test 2>&1", "tail -40", "cmd &>log", "x <&3"]
+        );
+    }
+
+    #[test]
+    fn everyday_commands_pass_the_default_profiles() {
+        let profiles = PermissionProfile::defaults();
+        let supervised = &profiles[0];
+        let trusted = &profiles[1];
+        let integrator = &profiles[2];
+        let cmd = |c: &str| json!({"command": c});
+        // What agents actually type: a cd prefix, pipes, git identity options.
+        for c in [
+            "cd \"F:/dev/proj-agents/ops\" && git status && git branch -a",
+            "cd \"F:/dev/proj-agents/ops\" && cargo test --workspace 2>&1 | tail -40",
+            "ls -a \"F:/dev/proj-agents/architect\"",
+            "cargo --version && rustc --version && rustup --version 2>&1",
+            "git log --oneline --all && cat README.md",
+        ] {
+            assert_eq!(decide(supervised, "Bash", &cmd(c)), Decision::Allow, "{c}");
+        }
+        for c in [
+            "git checkout -b ticket/ATP-10 develop 2>&1 | tail -2 && mkdir -p docs",
+            "git add docs/ARCHITECTURE.md && git -c user.name=\"architect\" commit -q -m \"ATP-10\"",
+            "git -c core.autocrlf=false --no-pager commit -m x",
+        ] {
+            assert_eq!(decide(supervised, "Bash", &cmd(c)), Decision::Ask, "{c}");
+            assert_eq!(decide(trusted, "Bash", &cmd(c)), Decision::Allow, "{c}");
+        }
+        assert_eq!(decide(trusted, "TaskCreate", &json!({})), Decision::Allow);
+        assert_eq!(
+            decide(trusted, "Bash", &cmd("git merge --no-ff ticket/ATP-3")),
+            Decision::Ask
+        );
+        assert_eq!(
+            decide(integrator, "Bash", &cmd("git merge --no-ff ticket/ATP-3")),
+            Decision::Allow
+        );
+        // Still asks or denies where it should.
+        assert_eq!(
+            decide(trusted, "Bash", &cmd("git push origin develop")),
+            Decision::Ask
+        );
+        assert_eq!(
+            decide(trusted, "Bash", &cmd("git -C ../other status")),
+            Decision::Ask
+        );
+        assert_eq!(
+            decide(integrator, "Bash", &cmd("git push -f origin develop")),
+            Decision::Deny
+        );
+        assert_eq!(
+            decide(trusted, "Bash", &cmd("rm -rf target")),
+            Decision::Deny
+        );
+        assert_eq!(
+            decide(trusted, "Bash", &cmd("rm Cargo.lock")),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(trusted, "Bash", &cmd("python evil.py")),
+            Decision::Ask
+        );
+        assert_eq!(
+            normalise("git -c user.name=a -c user.email=b commit -m x"),
+            "git commit -m x"
+        );
+        assert_eq!(normalise("git -C ../x status"), "git -C ../x status");
     }
 
     #[test]

@@ -237,6 +237,9 @@ pub enum Request {
         project: ProjectId,
         paused: bool,
     },
+    StopAllAgents {
+        project: ProjectId,
+    },
     DecideApproval {
         project: ProjectId,
         id: ApprovalId,
@@ -1218,6 +1221,10 @@ impl Backend {
                 push_board(&p, &self.tx, &self.ctx).await?;
                 self.send(Response::Info(format!("Resumed @{handle}")));
             }
+            Request::StopAllAgents { project } => {
+                self.scheduler(project)?.stop_all();
+                self.send(Response::Info("Stopping every run in progress".into()));
+            }
             Request::SetSchedulerPaused { project, paused } => {
                 let scheduler = self.scheduler(project)?;
                 scheduler.set_paused(paused);
@@ -2177,7 +2184,7 @@ name:",
             } => {
                 assert_eq!(name, "Demo");
                 assert_eq!(human.handle, "me");
-                assert_eq!(policy.permission_profiles.len(), 2);
+                assert_eq!(policy.permission_profiles.len(), 3);
                 assert!(policy.authoring_model.is_none());
                 id
             }

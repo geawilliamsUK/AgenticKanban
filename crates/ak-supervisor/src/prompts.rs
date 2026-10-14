@@ -21,6 +21,8 @@ pub struct PromptContext<'a> {
     pub columns: &'a [Column],
     pub workspace: &'a Workspace,
     pub push_allowed: bool,
+    /// The branch ticket branches start from; None means the default branch.
+    pub integration_branch: Option<&'a str>,
 }
 
 /// The appended system prompt: definition body, memory, roster, conventions.
@@ -73,9 +75,10 @@ is for a question to the team. Keep messages short. The human sees every chat an
 paused thread rejects your posts; only the human unpauses it.\n\
 - Keep comments short and factual: what changed, what you need, what you decided.\n\
 - Your workspace is your own git worktree at `{path}`, currently on branch `{branch}`. \
-Work for ticket KEY happens on branch `ticket/KEY` created from the default branch. Commit \
-early, with the ticket key in the message. {push} Never touch files outside this worktree, \
-and never the human's own checkout.\n\
+Work for ticket KEY happens on branch `ticket/KEY` created from {from}. Commit early, with \
+the ticket key in the message. {push} When you finish, leave the worktree on `agent/{handle}` \
+(`git checkout agent/{handle}`) with everything committed, so the ticket branch can be merged \
+and deleted. Never touch files outside this worktree, and never the human's own checkout.\n\
 - A frozen ticket rejects your changes. Only the human unfreezes it; comment if you need them to.\n\
 - A tool call you are not allowed to make may ask the human for approval, which can take time. \
 Prefer the tools you are allowed.\n\
@@ -86,6 +89,10 @@ is unfinished); then stop. If there is nothing to do, say so in one line and sto
         columns = columns.join(", "),
         path = ctx.workspace.path.display(),
         branch = ctx.workspace.branch,
+        from = match ctx.integration_branch {
+            Some(b) => format!("`{b}`"),
+            None => "the default branch".to_string(),
+        },
         push = if ctx.push_allowed {
             "You may push your ticket branches."
         } else {
@@ -156,6 +163,7 @@ mod tests {
             columns: &columns,
             workspace: &ws,
             push_allowed: false,
+            integration_branch: Some("develop"),
         });
         for needle in [
             "**You own:**",
@@ -165,6 +173,8 @@ mod tests {
             "@me (human)",
             "To do (todo)",
             "agent/backend",
+            "created from `develop`",
+            "git checkout agent/backend",
             "Never push.",
             "memory_update",
         ] {
