@@ -260,6 +260,19 @@ impl AgentEditor {
             max_wall_clock_minutes: parse_u32(&self.wall_clock, "Max minutes per run")?,
         };
         let model = self.model.trim();
+        // A new agent's body was templated before the handle was typed.
+        let body = if self.is_new {
+            let blank = AgentDefinition::template("", "").body;
+            if self.body == blank {
+                AgentDefinition::template(&handle, &self.description).body
+            } else {
+                self.body
+                    .replace("# @ —", &format!("# @{handle} —"))
+                    .replace("**@**", &format!("**@{handle}**"))
+            }
+        } else {
+            self.body.clone()
+        };
         Ok(AgentDefinition {
             frontmatter: Frontmatter {
                 name: handle,
@@ -277,7 +290,7 @@ impl AgentEditor {
                 },
                 extra: self.extra.clone(),
             },
-            body: self.body.clone(),
+            body,
         })
     }
 }

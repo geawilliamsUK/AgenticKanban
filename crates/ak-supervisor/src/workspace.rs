@@ -33,6 +33,12 @@ pub fn default_base(repo: &Path) -> PathBuf {
 pub async fn ensure(repo: &Path, base: &Path, handle: &str) -> Result<Workspace, SupervisorError> {
     let path = base.join(handle);
     if !path.join(".git").exists() {
+        if git(repo, &["rev-parse", "--verify", "HEAD"]).await.is_err() {
+            return Err(SupervisorError::Git(format!(
+                "{} has no commits yet; make an initial commit before agents can work in it",
+                repo.display()
+            )));
+        }
         std::fs::create_dir_all(base).map_err(|e| SupervisorError::io(base, e))?;
         let branch = format!("agent/{handle}");
         let path_str = path.to_string_lossy().to_string();
