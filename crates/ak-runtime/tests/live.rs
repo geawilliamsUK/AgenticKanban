@@ -7,7 +7,7 @@
 
 use ak_core::agent::AgentDefinition;
 use ak_core::config::GlobalSettings;
-use ak_runtime::authoring::{self, RosterEntry};
+use ak_runtime::authoring::{self, RosterEntry, TeamMember};
 use ak_runtime::{ClaudeCodeRunner, HomePaths, UtilityRunner};
 
 #[tokio::test]
@@ -50,4 +50,88 @@ async fn refine_round_trip_with_real_claude_code() {
         proposal.definition.body.contains("@backend"),
         "kept the draft's mention"
     );
+}
+
+#[tokio::test]
+#[ignore = "spends a real Claude Code call"]
+async fn integrate_round_trip_with_real_claude_code() {
+    let tmp = tempfile::tempdir().unwrap();
+    let runner =
+        ClaudeCodeRunner::from_settings(&GlobalSettings::default(), &HomePaths::at(tmp.path()));
+
+    let mut changed = AgentDefinition::template("dba", "Database administrator");
+    changed.frontmatter.description = "Owns the Postgres schema, migrations, indexes and query performance. Involve for any schema change or slow query."
+        .into();
+    changed.body = "# @dba — database administrator
+
+You are **@dba**, one of the agents on this project's team.
+
+**You own:** `migrations/`, `schema.sql`, indexes and query plans.
+**You review:** any change touching a migration or a query, when @mentioned.
+**You never:** change application code outside the data layer.
+**Done means:** the migration applies and reverts cleanly, query plans are checked, @backend is told what changed.
+
+## Team
+
+- **@backend** owns the API. Hand schema changes to them with the ticket key.
+"
+        .into();
+    let mut target = AgentDefinition::template("backend", "Backend developer");
+    target.frontmatter.description = "Owns the API and application services in src/api. Involve for endpoints, business logic and integration tests."
+        .into();
+    target.body = "# @backend — backend developer
+
+You are **@backend**, one of the agents on this project's team.
+
+**You own:** `src/api/`, business logic, integration tests.
+**You review:** API changes when @mentioned.
+**You never:** push, or edit the frontend.
+**Done means:** tests pass and the ticket says what changed.
+
+## Team
+
+Integrate fills this in once other agents exist.
+
+## Background
+
+Axum service on Postgres.
+"
+    .into();
+    let team = vec![
+        TeamMember::from_definition(&changed),
+        TeamMember::from_definition(&target),
+    ];
+
+    let request = authoring::integrate_request(&changed, &target, &team, None);
+    let output = runner.call(request).await.expect("Claude Code call failed");
+    println!(
+        "cost: {:?}  duration: {:.1}s",
+        output.cost_usd,
+        output.duration.as_secs_f32()
+    );
+    println!(
+        "----- reply -----
+{}
+-----------------",
+        output.text
+    );
+    let proposal = authoring::apply_integrate(&target, &output.text)
+        .expect("reply was not a valid definition");
+    println!("warnings: {:?}", proposal.warnings);
+    println!(
+        "----- proposal -----
+{}",
+        proposal.definition.render()
+    );
+
+    assert_eq!(proposal.definition.handle(), "backend");
+    assert!(
+        proposal.definition.body.contains("@dba"),
+        "the Team section names the new agent"
+    );
+    assert!(
+        proposal.definition.body.contains("**You own:** `src/api/`"),
+        "the contract survived"
+    );
+    assert!(proposal.definition.body.contains("## Background"));
 }
