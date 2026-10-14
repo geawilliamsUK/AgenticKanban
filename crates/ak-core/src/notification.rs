@@ -22,6 +22,8 @@ pub enum NotificationKind {
     Assigned,
     Mentioned,
     Unfrozen,
+    /// A guardrail fired. Only the human receives these.
+    Guardrail,
     /// Another actor asked the scheduler to wake you.
     Activated,
 }
@@ -37,6 +39,7 @@ impl NotificationKind {
             NotificationKind::Assigned => "assigned",
             NotificationKind::Mentioned => "mentioned",
             NotificationKind::Unfrozen => "unfrozen",
+            NotificationKind::Guardrail => "guardrail",
             NotificationKind::Activated => "activated",
         }
     }
@@ -51,6 +54,7 @@ impl NotificationKind {
             "assigned" => Some(NotificationKind::Assigned),
             "mentioned" => Some(NotificationKind::Mentioned),
             "unfrozen" => Some(NotificationKind::Unfrozen),
+            "guardrail" => Some(NotificationKind::Guardrail),
             "activated" => Some(NotificationKind::Activated),
             _ => None,
         }
@@ -143,6 +147,8 @@ pub struct RoutingContext {
     pub chat: Option<ChatRouting>,
     /// A human's message in a thread wakes the agents in it.
     pub actor_is_human: bool,
+    /// Who receives guardrail trips.
+    pub human_id: Option<ActorId>,
 }
 
 /// Decide recipients for an event. Never notifies the actor who caused it,
@@ -305,6 +311,11 @@ pub fn route(event: &Event, ctx: &RoutingContext) -> Vec<NotificationDraft> {
                 for p in &c.participants {
                     push(*p, NotificationKind::Unfrozen, true);
                 }
+            }
+        }
+        EventKind::GuardrailTripped { .. } => {
+            if let Some(h) = ctx.human_id {
+                push(h, NotificationKind::Guardrail, false);
             }
         }
     }

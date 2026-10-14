@@ -80,7 +80,7 @@ impl SqliteStore {
         ids_from_rows(&rows, "actor_id")
     }
 
-    async fn load_human_id(conn: &mut SqliteConnection) -> Result<Option<ActorId>> {
+    pub(super) async fn load_human_id(conn: &mut SqliteConnection) -> Result<Option<ActorId>> {
         let row = sqlx::query("SELECT value FROM meta WHERE key = ?")
             .bind(META_HUMAN_ID)
             .fetch_optional(&mut *conn)

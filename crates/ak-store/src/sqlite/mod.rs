@@ -21,6 +21,7 @@ use ak_core::chat::{Chat, Message, Thread, ThreadHit};
 use ak_core::commands::{self, NewTicket, TicketPatch};
 use ak_core::config::ProjectPolicy;
 use ak_core::event::{EventKind, MentionSource};
+use ak_core::guardrails::Trip;
 use ak_core::ids::*;
 use ak_core::notification::{self, RoutingContext};
 use ak_core::run::{AgentRun, RunEvent};
@@ -1022,6 +1023,48 @@ impl Store for SqliteStore {
 
     async fn archive_idle_threads(&self, idle_since: Timestamp) -> Result<u64> {
         self.archive_idle_threads_impl(idle_since).await
+    }
+
+    async fn events_for_thread(&self, thread_id: ThreadId) -> Result<Vec<Event>> {
+        let rows = sqlx::query(
+            "SELECT * FROM events WHERE subject_kind = 'thread' AND subject_id = ? ORDER BY seq",
+        )
+        .bind(thread_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(event_from_row).collect()
+    }
+
+    async fn record_guardrail_trip(&self, trip: &Trip) -> Result<Event> {
+        let now = Utc::now();
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let system = Self::load_actor(&mut tx, ActorId::SYSTEM).await?;
+        let ctx = RoutingContext {
+            human_id: Self::load_human_id(&mut tx).await?,
+            ..Default::default()
+        };
+        let kinds = vec![EventKind::GuardrailTripped {
+            rule: trip.rule,
+            action: trip.action,
+            subject: trip.subject,
+            detail: trip.detail.clone(),
+        }];
+        let mut events = Self::append_events_with(&mut tx, &system, now, kinds, &ctx).await?;
+        tx.commit().await?;
+        let event = events.remove(0);
+        self.publish(vec![event.clone()]);
+        Ok(event)
+    }
+
+    async fn guardrail_trips_since(&self, since: Timestamp) -> Result<Vec<Event>> {
+        let rows = sqlx::query(
+            "SELECT * FROM events WHERE kind = 'guardrail.tripped' AND occurred_at >= ? \
+             ORDER BY seq DESC",
+        )
+        .bind(fmt_ts(&since))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(event_from_row).collect()
     }
 
     async fn utility_cost_since(&self, since: Timestamp) -> Result<f64> {

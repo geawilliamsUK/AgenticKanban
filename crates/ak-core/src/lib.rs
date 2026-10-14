@@ -15,6 +15,7 @@ pub mod commands;
 pub mod config;
 pub mod error;
 pub mod event;
+pub mod guardrails;
 pub mod ids;
 pub mod mentions;
 pub mod notification;
@@ -28,7 +29,8 @@ pub use approval::{Approval, ApprovalState};
 pub use board::{Column, ColumnKind, Comment, Priority, Ticket};
 pub use chat::{Chat, ChatKind, Message, Thread, ThreadHit};
 pub use error::CoreError;
-pub use event::{Event, EventKind, FieldChange, MentionSource};
+pub use event::{Event, EventKind, FieldChange, MentionSource, Subject};
+pub use guardrails::{GuardrailAction, GuardrailRule, Trip};
 pub use ids::*;
 pub use notification::{
     Notification, NotificationDraft, NotificationKind, NotificationState, RoutingContext,

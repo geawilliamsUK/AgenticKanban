@@ -13,9 +13,13 @@ use ak_core::agent::{AgentDefinition, AgentState};
 use ak_core::commands::NewTicket;
 use ak_core::config::{GlobalSettings, PermissionProfile};
 use ak_core::run::{ExitReason, RunEventKind, RunTrigger};
+use ak_core::NotificationKind;
 use ak_runtime::{HomePaths, OpenProject, ProjectRegistry};
 use ak_supervisor::supervisor::{RunNotice, StopReason};
-use ak_supervisor::{workspace, RunSpec, Scheduler, Supervisor, SupervisorConfig};
+use ak_supervisor::{
+    workspace, GuardrailMonitor, RunSpec, Scheduler, Supervisor, SupervisorConfig,
+};
+use chrono::Utc;
 
 fn fake_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_fake_claude"))
@@ -355,8 +359,22 @@ async fn scheduler_wakes_on_assignment_and_cools_down_on_no_progress() {
             .await
             .unwrap()
             .len(),
-        1
+        3,
+        "three strikes before the cooldown"
     );
+    let trips = store
+        .guardrail_trips_since(Utc::now() - chrono::Duration::hours(1))
+        .await
+        .unwrap();
+    assert_eq!(trips.len(), 1);
+    assert!(f
+        .project
+        .store()
+        .notifications(f.project.human.id, true)
+        .await
+        .unwrap()
+        .iter()
+        .any(|n| n.kind == NotificationKind::Guardrail));
 
     // Resume clears the cooldown and a halted agent never starts.
     scheduler.halt(f.agent.actor_id).await.unwrap();
@@ -370,5 +388,73 @@ async fn scheduler_wakes_on_assignment_and_cools_down_on_no_progress() {
     assert_eq!(
         store.agent(f.agent.actor_id).await.unwrap().state,
         AgentState::Idle
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn guardrail_monitor_freezes_a_ping_pong_ticket() {
+    let f = fixture().await;
+    let store = f.project.store();
+    let _monitor = GuardrailMonitor::spawn(f.project.clone());
+    let columns = store.columns().await.unwrap();
+    let ticket = store
+        .create_ticket(
+            NewTicket {
+                title: "Hot potato".into(),
+                column_id: columns[1].id,
+                ..Default::default()
+            },
+            f.project.human.id,
+        )
+        .await
+        .unwrap();
+
+    // An agent moves it back and forth until the guardrail freezes it.
+    let mut version = ticket.version;
+    for i in 0..8 {
+        let to = if i % 2 == 0 {
+            columns[2].id
+        } else {
+            columns[1].id
+        };
+        match store
+            .move_ticket(ticket.id, to, version, f.agent.actor_id)
+            .await
+        {
+            Ok(t) => version = t.version,
+            Err(e) => {
+                assert!(e.to_string().contains("frozen"), "{e}");
+                break;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(60)).await;
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let t = store.ticket(ticket.id).await.unwrap();
+        if t.frozen {
+            assert!(
+                t.freeze_reason
+                    .as_deref()
+                    .unwrap_or("")
+                    .contains("ping-pong"),
+                "{:?}",
+                t.freeze_reason
+            );
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "never froze");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let inbox = store.notifications(f.project.human.id, true).await.unwrap();
+    assert!(inbox.iter().any(|n| n.kind == NotificationKind::Guardrail));
+    let trips = store
+        .guardrail_trips_since(Utc::now() - chrono::Duration::hours(1))
+        .await
+        .unwrap();
+    assert_eq!(
+        trips.len(),
+        1,
+        "one trip, then the frozen ticket is left alone"
     );
 }

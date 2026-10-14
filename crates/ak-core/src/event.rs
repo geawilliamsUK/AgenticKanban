@@ -5,6 +5,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::chat::ChatKind;
+use crate::guardrails::{GuardrailAction, GuardrailRule};
 use crate::ids::{ActorId, ChatId, ColumnId, CommentId, EventId, MessageId, ThreadId, TicketId};
 use crate::Timestamp;
 
@@ -35,11 +36,13 @@ impl Event {
 }
 
 /// What an event is about, for indexing and for timelines.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "id", rename_all = "snake_case")]
 pub enum Subject {
     Ticket(TicketId),
     Thread(ThreadId),
     Chat(ChatId),
+    Agent(ActorId),
 }
 
 impl Subject {
@@ -48,6 +51,7 @@ impl Subject {
             Subject::Ticket(_) => "ticket",
             Subject::Thread(_) => "thread",
             Subject::Chat(_) => "chat",
+            Subject::Agent(_) => "agent",
         }
     }
 
@@ -56,6 +60,7 @@ impl Subject {
             Subject::Ticket(id) => id.to_string(),
             Subject::Thread(id) => id.to_string(),
             Subject::Chat(id) => id.to_string(),
+            Subject::Agent(id) => id.to_string(),
         }
     }
 }
@@ -180,6 +185,13 @@ pub enum EventKind {
         thread_id: ThreadId,
         title: String,
     },
+    /// A guardrail fired. Recorded by the system; the human is notified.
+    GuardrailTripped {
+        rule: GuardrailRule,
+        action: GuardrailAction,
+        subject: Subject,
+        detail: String,
+    },
 }
 
 impl EventKind {
@@ -201,6 +213,7 @@ impl EventKind {
             EventKind::ThreadMessagePosted { .. } => "thread.message_posted",
             EventKind::ThreadPaused { .. } => "thread.paused",
             EventKind::ThreadUnpaused { .. } => "thread.unpaused",
+            EventKind::GuardrailTripped { .. } => "guardrail.tripped",
         }
     }
 
@@ -225,6 +238,7 @@ impl EventKind {
             | EventKind::ThreadMessagePosted { thread_id, .. }
             | EventKind::ThreadPaused { thread_id, .. }
             | EventKind::ThreadUnpaused { thread_id, .. } => Subject::Thread(*thread_id),
+            EventKind::GuardrailTripped { subject, .. } => *subject,
         }
     }
 

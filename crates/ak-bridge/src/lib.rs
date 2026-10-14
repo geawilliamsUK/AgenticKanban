@@ -26,6 +26,7 @@ use axum::Router;
 use tokio::sync::{broadcast, oneshot};
 
 use ak_core::approval::{Approval, ApprovalState};
+use ak_core::ids::RunId;
 use ak_core::ids::{ActorId, ApprovalId};
 
 pub use runs::RunContext;
@@ -45,6 +46,12 @@ pub enum BridgeError {
 pub enum BridgeEvent {
     ApprovalRequested(Approval),
     ApprovalDecided(Approval),
+    /// A run-level guardrail fired inside a hook; the scheduler stops the run.
+    RunGuardrail {
+        run_id: RunId,
+        agent_id: ActorId,
+        reason: String,
+    },
 }
 
 struct Inner {
@@ -54,6 +61,8 @@ struct Inner {
     waiting: Mutex<HashMap<ApprovalId, oneshot::Sender<ApprovalState>>>,
     events: broadcast::Sender<BridgeEvent>,
     approval_timeout: Duration,
+    /// The last tool call per run and how many times in a row it was made.
+    repeats: Mutex<HashMap<RunId, (String, u32)>>,
 }
 
 /// A cheap handle to the running bridge.
@@ -90,6 +99,7 @@ impl Bridge {
                 waiting: Mutex::new(HashMap::new()),
                 events,
                 approval_timeout,
+                repeats: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -126,7 +136,28 @@ impl Bridge {
     }
 
     pub fn unregister_run(&self, token: &str) {
-        self.inner.runs.write().expect("runs lock").remove(token);
+        let removed = self.inner.runs.write().expect("runs lock").remove(token);
+        if let Some(ctx) = removed {
+            self.inner
+                .repeats
+                .lock()
+                .expect("repeats lock")
+                .remove(&ctx.run_id);
+        }
+    }
+
+    /// Counts identical consecutive tool calls within a run and returns the
+    /// current streak length.
+    pub(crate) fn note_tool_call(&self, run: RunId, tool: &str, input: &serde_json::Value) -> u32 {
+        let fingerprint = format!("{tool}:{input}");
+        let mut repeats = self.inner.repeats.lock().expect("repeats lock");
+        let entry = repeats.entry(run).or_insert_with(|| (String::new(), 0));
+        if entry.0 == fingerprint {
+            entry.1 += 1;
+        } else {
+            *entry = (fingerprint, 1);
+        }
+        entry.1
     }
 
     pub fn run(&self, token: &str) -> Option<Arc<RunContext>> {

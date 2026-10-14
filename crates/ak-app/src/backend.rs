@@ -19,7 +19,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use ak_bridge::{Bridge, BridgeEvent};
-use ak_core::agent::AgentDefinition;
+use ak_core::agent::{Agent, AgentDefinition, AgentState};
 use ak_core::approval::Approval;
 use ak_core::chat::{Thread, ThreadHit};
 use ak_core::commands::{NewTicket, TicketPatch};
@@ -39,9 +39,11 @@ use ak_runtime::snapshot::{
 };
 use ak_runtime::{OpenProject, ProjectRegistry, RuntimeError, UtilityRunner};
 use ak_store::Store;
-use ak_supervisor::{RunNotice, Scheduler, Supervisor, SupervisorConfig};
+use ak_supervisor::{GuardrailMonitor, RunNotice, Scheduler, Supervisor, SupervisorConfig};
 
-use crate::model::{BoardModel, ChatSummary, InboxItem, ThreadDetail, TicketDetail};
+use crate::model::{
+    BoardModel, ChatSummary, InboxItem, ProjectOverview, ThreadDetail, TicketDetail,
+};
 
 /// Builds the utility runner for the current settings. Injected so tests can
 /// supply a fake.
@@ -205,6 +207,8 @@ pub enum Request {
     CheckDrift {
         project: ProjectId,
     },
+    /// The cross-project summary.
+    LoadOverview,
     SaveGlobalSettings(GlobalSettings),
     SaveProjectPolicy {
         project: ProjectId,
@@ -295,6 +299,7 @@ pub enum Response {
         runs: Vec<AgentRun>,
         /// Pending Integrate proposals this agent authored, by target handle.
         integrations: Vec<(String, PendingProposal)>,
+        cost_today: f64,
     },
     RefineStarted {
         project: ProjectId,
@@ -366,6 +371,7 @@ pub enum Response {
         project: ProjectId,
         entries: Vec<DriftEntry>,
     },
+    Overview(Vec<ProjectOverview>),
     RunStarted {
         project: ProjectId,
         run: AgentRun,
@@ -407,6 +413,7 @@ struct ProjectWatchers {
     /// Watches the repository's `.agentic/agents`, once it exists.
     snapshot: Option<(AgentWatcher, JoinHandle<()>)>,
     scheduler: Option<Scheduler>,
+    guardrails: GuardrailMonitor,
 }
 
 impl ProjectWatchers {
@@ -416,6 +423,7 @@ impl ProjectWatchers {
         if let Some((_, task)) = self.snapshot {
             task.abort();
         }
+        self.guardrails.shutdown();
         if let Some(s) = self.scheduler {
             s.shutdown();
         }
@@ -474,6 +482,14 @@ impl Backend {
 
     pub async fn run(mut self) {
         self.start_agent_runtime().await;
+        // Every registered project runs: agents wake in all of them, and
+        // the overview sees all of them.
+        let ids: Vec<ProjectId> = self.registry.projects().iter().map(|e| e.id).collect();
+        for id in ids {
+            if let Err(e) = self.ensure_open(id).await {
+                tracing::warn!(project = %id, "could not open project: {e}");
+            }
+        }
         self.send(Response::Projects(self.registry.projects().to_vec()));
         self.send_settings();
         let mut housekeeping = tokio::time::interval(Duration::from_secs(3600));
@@ -613,6 +629,76 @@ impl Backend {
         }
     }
 
+    /// One line per open project for the overview.
+    async fn overview(&self) -> Vec<ProjectOverview> {
+        let midnight = start_of_today();
+        let mut out = Vec::new();
+        for entry in self.registry.projects() {
+            let Some(p) = self.registry.opened(entry.id) else {
+                continue;
+            };
+            let store = p.store();
+            let (
+                Ok(agents),
+                Ok(active),
+                Ok(approvals),
+                Ok(inbox),
+                Ok(run_cost),
+                Ok(utility_cost),
+                Ok(trips),
+            ) = (
+                store.agents().await,
+                store.active_runs().await,
+                store.pending_approvals().await,
+                store.notifications(p.human.id, true).await,
+                store.run_cost_since(midnight, None).await,
+                store.utility_cost_since(midnight).await,
+                store.guardrail_trips_since(midnight).await,
+            )
+            else {
+                continue;
+            };
+            let live: Vec<Agent> = agents.into_iter().filter(|a| !a.is_retired()).collect();
+            let running = live
+                .iter()
+                .filter(|a| a.state.is_active())
+                .map(|a| {
+                    let started = active
+                        .iter()
+                        .find(|r| r.agent_id == a.actor_id)
+                        .map(|r| r.started_at)
+                        .unwrap_or_else(Utc::now);
+                    (a.handle.clone(), started)
+                })
+                .collect();
+            let paused = self
+                .watchers
+                .get(&entry.id)
+                .and_then(|w| w.scheduler.as_ref())
+                .map(|s| s.paused())
+                .unwrap_or(true);
+            out.push(ProjectOverview {
+                id: entry.id,
+                name: entry.name.clone(),
+                agents: live.len(),
+                running,
+                halted: live
+                    .iter()
+                    .filter(|a| a.state == AgentState::Halted)
+                    .count(),
+                approvals: approvals.len(),
+                unread: inbox
+                    .iter()
+                    .filter(|n| n.state == NotificationState::Pending)
+                    .count(),
+                cost_today: run_cost + utility_cost,
+                paused,
+                trips,
+            });
+        }
+        out
+    }
+
     fn supervisor_config(&self) -> SupervisorConfig {
         SupervisorConfig {
             binary: claude::locate(self.settings.claude_binary.as_deref())
@@ -681,6 +767,11 @@ impl Backend {
                     let _ = push_approvals(&p, &self.tx, &self.ctx).await;
                     self.send(Response::Info(format!("Approval needed: {}", a.summary)));
                 }
+            }
+            Internal::Bridge(BridgeEvent::RunGuardrail { reason, .. }) => {
+                self.send(Response::Error(format!(
+                    "Guardrail stopped a run: {reason}"
+                )));
             }
             Internal::Bridge(BridgeEvent::ApprovalDecided(a)) => {
                 if let Some(p) = self.project_of_agent(a.agent_id).await {
@@ -1022,6 +1113,10 @@ impl Backend {
                     written.len()
                 )));
             }
+            Request::LoadOverview => {
+                let list = self.overview().await;
+                self.send(Response::Overview(list));
+            }
             Request::CheckDrift { project } => {
                 let p = self.project(project)?;
                 push_drift(&p, &self.tx, &self.ctx).await?;
@@ -1230,20 +1325,10 @@ impl Backend {
         Ok(())
     }
 
-    async fn open_project(&mut self, id: ProjectId) -> Result<(), String> {
+    /// Opens the project's store and starts its watchers, scheduler and
+    /// guardrail monitor if they are not running. Quiet: nothing is pushed.
+    async fn ensure_open(&mut self, id: ProjectId) -> Result<Arc<OpenProject>, String> {
         let p = self.registry.open(id).await.map_err(|e| e.to_string())?;
-        self.send(Response::ProjectOpened {
-            id,
-            name: p.entry.name.clone(),
-            human: p.human.clone(),
-            policy: p.policy(),
-        });
-        push_board(&p, &self.tx, &self.ctx).await?;
-        push_inbox(&p, &self.tx, &self.ctx).await?;
-        push_approvals(&p, &self.tx, &self.ctx).await?;
-        push_chats(&p, &self.tx, &self.ctx).await?;
-        push_drift(&p, &self.tx, &self.ctx).await?;
-        archive_idle_threads(&p).await;
         if !self.watchers.contains_key(&id) {
             let events = tokio::spawn(watch_events(p.clone(), self.tx.clone(), self.ctx.clone()));
             let (file_tx, file_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1263,6 +1348,7 @@ impl Backend {
                     self.settings.clone(),
                 )
             });
+            let guardrails = GuardrailMonitor::spawn(p.clone());
             self.watchers.insert(
                 id,
                 ProjectWatchers {
@@ -1271,10 +1357,29 @@ impl Backend {
                     _agent_watcher: agent_watcher,
                     snapshot: None,
                     scheduler,
+                    guardrails,
                 },
             );
+            self.ensure_snapshot_watch(id);
+            archive_idle_threads(&p).await;
         }
-        self.ensure_snapshot_watch(id);
+        Ok(p)
+    }
+
+    /// Opens the project if needed and announces it to the UI with its state.
+    async fn open_project(&mut self, id: ProjectId) -> Result<(), String> {
+        let p = self.ensure_open(id).await?;
+        self.send(Response::ProjectOpened {
+            id,
+            name: p.entry.name.clone(),
+            human: p.human.clone(),
+            policy: p.policy(),
+        });
+        push_board(&p, &self.tx, &self.ctx).await?;
+        push_inbox(&p, &self.tx, &self.ctx).await?;
+        push_approvals(&p, &self.tx, &self.ctx).await?;
+        push_chats(&p, &self.tx, &self.ctx).await?;
+        push_drift(&p, &self.tx, &self.ctx).await?;
         let paused = self
             .watchers
             .get(&id)
@@ -1678,6 +1783,14 @@ async fn push_inbox(
     Ok(())
 }
 
+fn start_of_today() -> Timestamp {
+    Utc::now()
+        .date_naive()
+        .and_hms_opt(0, 0, 0)
+        .map(|t| t.and_utc())
+        .unwrap_or_else(Utc::now)
+}
+
 /// Archives threads idle for longer than the project's period. Quiet: no
 /// events, nothing to notify.
 async fn archive_idle_threads(p: &OpenProject) {
@@ -1855,7 +1968,7 @@ async fn push_agent(
         None
     };
     let memory = p.agents.read_memory(handle).map_err(|e| e.to_string())?;
-    let (inbox, retired_since, pending, runs, integrations) = match &agent {
+    let (inbox, retired_since, pending, runs, integrations, cost_today) = match &agent {
         Some(a) => {
             let pending = store
                 .pending_proposal(a.actor_id, UtilityKind::Refine)
@@ -1875,15 +1988,20 @@ async fn push_agent(
                 .await
                 .map_err(|e| e.to_string())?;
             let integrations = load_integrations(p, a.actor_id).await?;
+            let cost_today = store
+                .run_cost_since(start_of_today(), Some(a.actor_id))
+                .await
+                .map_err(|e| e.to_string())?;
             (
                 load_inbox(p.store.as_ref(), a.actor_id, true).await?,
                 a.missing_since,
                 pending,
                 runs,
                 integrations,
+                cost_today,
             )
         }
-        None => (Vec::new(), None, None, Vec::new(), Vec::new()),
+        None => (Vec::new(), None, None, Vec::new(), Vec::new(), 0.0),
     };
     tx.send(Response::AgentLoaded {
         project: p.id(),
@@ -1895,6 +2013,7 @@ async fn push_agent(
         pending,
         runs,
         integrations,
+        cost_today,
     })
     .map_err(|_| "ui gone".to_string())?;
     ctx.request_repaint();
@@ -2392,6 +2511,19 @@ name:",
             Response::AgentLoaded { integrations, .. } => {
                 assert_eq!(integrations.len(), 1);
                 assert_eq!(integrations[0].0, "backend");
+            }
+            _ => unreachable!(),
+        }
+
+        // The overview sees every open project.
+        req_tx.send(Request::LoadOverview).unwrap();
+        match next(&resp_rx, |r| matches!(r, Response::Overview(_))) {
+            Response::Overview(list) => {
+                assert_eq!(list.len(), 1);
+                assert_eq!(list[0].name, "Demo Renamed");
+                assert_eq!(list[0].agents, 2);
+                assert!(list[0].running.is_empty());
+                assert!(list[0].paused, "paused earlier in this test");
             }
             _ => unreachable!(),
         }

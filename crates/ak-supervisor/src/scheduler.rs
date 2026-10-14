@@ -17,7 +17,9 @@ use tokio::sync::{broadcast, mpsc, OwnedSemaphorePermit, Semaphore};
 use ak_bridge::tools;
 use ak_core::agent::{Agent, AgentState};
 use ak_core::config::{GlobalSettings, PermissionProfile};
-use ak_core::ids::{ActorId, NotificationId};
+use ak_core::event::Subject;
+use ak_core::guardrails::{GuardrailAction, GuardrailRule, Trip};
+use ak_core::ids::{ActorId, NotificationId, RunId};
 use ak_core::run::RunTrigger;
 use ak_runtime::OpenProject;
 use ak_store::Store;
@@ -39,6 +41,10 @@ struct State {
     wake_times: HashMap<ActorId, VecDeque<Instant>>,
     /// Direct activations waiting for the next tick.
     activations: HashMap<ActorId, (ActorId, String)>,
+    /// Consecutive runs per agent that handled nothing they were woken for.
+    churn: HashMap<ActorId, u32>,
+    /// When the human was last told about a wake storm, per agent.
+    storm_notified: HashMap<ActorId, Instant>,
 }
 
 struct Inner {
@@ -79,6 +85,8 @@ impl Scheduler {
                     paused: false,
                     wake_times: HashMap::new(),
                     activations: HashMap::new(),
+                    churn: HashMap::new(),
+                    storm_notified: HashMap::new(),
                 }),
                 nudge,
                 tick_lock: tokio::sync::Mutex::new(()),
@@ -86,6 +94,7 @@ impl Scheduler {
             }),
         };
         let this = scheduler.clone();
+        let mut bridge_events = this.inner.supervisor.bridge().subscribe();
         tokio::spawn(async move {
             let mut events = project.store.subscribe();
             let mut timer = tokio::time::interval(Duration::from_secs(30));
@@ -104,6 +113,12 @@ impl Scheduler {
                         if n.is_none() {
                             return;
                         }
+                    }
+                    ev = bridge_events.recv() => {
+                        if let Ok(ak_bridge::BridgeEvent::RunGuardrail { run_id, agent_id, reason }) = ev {
+                            this.guardrail_stop(agent_id, run_id, reason).await;
+                        }
+                        continue;
                     }
                 }
                 if this
@@ -260,8 +275,9 @@ impl Scheduler {
                 continue;
             }
 
-            // Wake rate.
-            {
+            // Wake rate: past the storm threshold, wakes wait and the human
+            // hears about it once an hour.
+            let storm = {
                 let mut state = self.inner.state.lock().expect("state");
                 let times = state.wake_times.entry(agent.actor_id).or_default();
                 while times
@@ -270,10 +286,36 @@ impl Scheduler {
                 {
                     times.pop_front();
                 }
-                if times.len() as u32 >= policy.guardrails.wake_storm_per_hour {
-                    tracing::warn!(handle = %agent.handle, "wake rate exceeded; not starting a run");
-                    continue;
+                let exceeded = times.len() as u32 >= policy.guardrails.wake_storm_per_hour;
+                if exceeded {
+                    let notify = !matches!(
+                        state.storm_notified.get(&agent.actor_id),
+                        Some(t) if t.elapsed() < Duration::from_secs(3600)
+                    );
+                    if notify {
+                        state.storm_notified.insert(agent.actor_id, Instant::now());
+                    }
+                    Some(notify)
+                } else {
+                    None
                 }
+            };
+            if let Some(notify) = storm {
+                tracing::warn!(handle = %agent.handle, "wake rate exceeded; not starting a run");
+                if notify {
+                    let _ = store
+                        .record_guardrail_trip(&Trip {
+                            rule: GuardrailRule::WakeStorm,
+                            action: GuardrailAction::Notify,
+                            subject: Subject::Agent(agent.actor_id),
+                            detail: format!(
+                                "@{} reached {} wakes in an hour; further wakes wait",
+                                agent.handle, policy.guardrails.wake_storm_per_hour
+                            ),
+                        })
+                        .await;
+                }
+                continue;
             }
 
             // Budgets.
@@ -439,33 +481,89 @@ impl Scheduler {
             drop(active.handle);
 
             // Churn guard: the same wake items still pending means the run
-            // made no progress on them. Cool down rather than loop.
+            // made no progress on them. After enough such runs in a row, cool
+            // down rather than loop.
             let store = this.inner.project.store();
+            let mut no_progress = false;
             if !active.trigger_ids.is_empty() {
                 if let Ok(open) = store.notifications(agent.actor_id, true).await {
                     let still: HashSet<NotificationId> =
                         open.iter().filter(|n| n.wake).map(|n| n.id).collect();
-                    let is_halted = matches!(
-                        store.agent(agent.actor_id).await.map(|a| a.state),
-                        Ok(AgentState::Halted)
-                    );
-                    if !is_halted && still == active.trigger_ids {
-                        let minutes = this
-                            .inner
-                            .project
-                            .policy()
-                            .guardrails
-                            .run_churn_cooldown_minutes;
-                        let until = Utc::now() + chrono::Duration::minutes(minutes as i64);
-                        tracing::warn!(handle = %agent.handle, "run handled nothing it was woken for; cooling down for {minutes} min");
-                        let _ = store
-                            .set_agent_state(agent.actor_id, AgentState::Cooldown, None)
-                            .await;
-                        let _ = store.set_agent_cooldown(agent.actor_id, Some(until)).await;
-                    }
+                    no_progress = still == active.trigger_ids;
                 }
+            }
+            let is_halted = matches!(
+                store.agent(agent.actor_id).await.map(|a| a.state),
+                Ok(AgentState::Halted)
+            );
+            let guardrails = this.inner.project.policy().guardrails;
+            let strikes = {
+                let mut state = this.inner.state.lock().expect("state");
+                if no_progress {
+                    let n = state.churn.entry(agent.actor_id).or_insert(0);
+                    *n += 1;
+                    *n
+                } else {
+                    state.churn.remove(&agent.actor_id);
+                    0
+                }
+            };
+            if !is_halted
+                && no_progress
+                && guardrails.run_churn_runs > 0
+                && strikes >= guardrails.run_churn_runs
+            {
+                let minutes = guardrails.run_churn_cooldown_minutes;
+                let until = Utc::now() + chrono::Duration::minutes(minutes as i64);
+                tracing::warn!(handle = %agent.handle, "{strikes} runs handled nothing they were woken for; cooling down for {minutes} min");
+                let _ = store
+                    .set_agent_state(agent.actor_id, AgentState::Cooldown, None)
+                    .await;
+                let _ = store.set_agent_cooldown(agent.actor_id, Some(until)).await;
+                this.inner
+                    .state
+                    .lock()
+                    .expect("state")
+                    .churn
+                    .remove(&agent.actor_id);
+                let _ = store
+                    .record_guardrail_trip(&Trip {
+                        rule: GuardrailRule::RunChurn,
+                        action: GuardrailAction::Cooldown,
+                        subject: Subject::Agent(agent.actor_id),
+                        detail: format!(
+                            "@{}: {strikes} runs in a row handled nothing they were woken for; cooling down for {minutes} minutes",
+                            agent.handle
+                        ),
+                    })
+                    .await;
             }
             this.nudge();
         });
+    }
+
+    /// A bridge-side guardrail asked for the run to stop.
+    async fn guardrail_stop(&self, agent: ActorId, run_id: RunId, reason: String) {
+        let stopped = {
+            let mut state = self.inner.state.lock().expect("state");
+            match state.active.get_mut(&agent) {
+                Some(a) if a.handle.run_id == run_id => {
+                    a.handle.stop(StopReason::Guardrail);
+                    true
+                }
+                _ => false,
+            }
+        };
+        if stopped {
+            let store = self.inner.project.store();
+            let _ = store
+                .record_guardrail_trip(&Trip {
+                    rule: GuardrailRule::RepeatedToolCall,
+                    action: GuardrailAction::StopRun,
+                    subject: Subject::Agent(agent),
+                    detail: reason,
+                })
+                .await;
+        }
     }
 }

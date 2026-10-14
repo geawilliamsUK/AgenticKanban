@@ -117,6 +117,8 @@ pub struct AgentEditor {
     pub confirm_retire: bool,
     pub refine: RefineStatus,
     pub integrate: IntegrateState,
+    /// Spent on this agent's runs since midnight.
+    pub cost_today: f64,
 }
 
 impl AgentEditor {
@@ -131,6 +133,7 @@ impl AgentEditor {
             None,
             None,
             Vec::new(),
+            0.0,
         );
         editor.is_new = true;
         editor.loaded = true;
@@ -149,6 +152,7 @@ impl AgentEditor {
             None,
             None,
             Vec::new(),
+            0.0,
         );
         editor.loaded = false;
         editor
@@ -164,6 +168,7 @@ impl AgentEditor {
         retired_since: Option<Timestamp>,
         pending: Option<PendingProposal>,
         integrations: Vec<(String, PendingProposal)>,
+        cost_today: f64,
     ) -> Self {
         let def = definition.unwrap_or_else(|| AgentDefinition::template(handle, ""));
         let budgets = def.frontmatter.budgets.clone().unwrap_or_default();
@@ -193,6 +198,7 @@ impl AgentEditor {
                 None => RefineStatus::Idle,
             },
             integrate: IntegrateState::from_pending(integrations),
+            cost_today,
         }
     }
 
@@ -495,6 +501,9 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
         }
         if let Some(a) = &agent_row {
             ui.colored_label(state_color(a.state), a.state.label());
+        }
+        if editor.cost_today > 0.0 {
+            ui.weak(format!("${:.2} today", editor.cost_today));
         }
         if editor.dirty {
             ui.weak("unsaved");

@@ -654,3 +654,41 @@ async fn chat_tools_round_trip_and_respect_membership() {
     assert!(err);
     assert!(text.contains("not a thread id"), "{text}");
 }
+
+#[tokio::test]
+async fn repeated_identical_calls_are_denied_and_stop_the_run() {
+    let f = fixture(1, Duration::from_secs(1)).await;
+    let ctx = f.bridge.run(&f.token).unwrap();
+    let mut events = f.bridge.subscribe();
+    let same = PreToolUseInput {
+        tool_name: "Read".into(),
+        tool_input: json!({"file_path": "a.rs"}),
+    };
+    for _ in 0..4 {
+        let v = decide(&f.bridge, &ctx, &same).await;
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "allow");
+    }
+    // A different call resets the streak.
+    let other = PreToolUseInput {
+        tool_name: "Read".into(),
+        tool_input: json!({"file_path": "b.rs"}),
+    };
+    decide(&f.bridge, &ctx, &other).await;
+    for _ in 0..4 {
+        let v = decide(&f.bridge, &ctx, &same).await;
+        assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "allow");
+    }
+    let v = decide(&f.bridge, &ctx, &same).await;
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny");
+    assert!(v["hookSpecificOutput"]["permissionDecisionReason"]
+        .as_str()
+        .unwrap()
+        .contains("guardrail"));
+    match events.try_recv() {
+        Ok(BridgeEvent::RunGuardrail { run_id, reason, .. }) => {
+            assert_eq!(run_id, ctx.run_id);
+            assert!(reason.contains("5 times"), "{reason}");
+        }
+        other => panic!("expected a guardrail event, got {other:?}"),
+    }
+}

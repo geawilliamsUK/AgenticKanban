@@ -21,6 +21,7 @@ use ak_core::board::{Column, Comment, Ticket};
 use ak_core::chat::{Chat, Message, Thread, ThreadHit};
 use ak_core::commands::{NewTicket, TicketPatch};
 use ak_core::config::ProjectPolicy;
+use ak_core::guardrails::Trip;
 use ak_core::ids::{
     ActorId, ApprovalId, CallId, ChatId, ColumnId, CommentId, NotificationId, RunId, ThreadId,
     TicketId,
@@ -153,6 +154,14 @@ pub trait Store: Send + Sync {
     ) -> Result<Vec<UtilityCall>>;
     /// Total recorded cost of calls started at or after `since`.
     async fn utility_cost_since(&self, since: Timestamp) -> Result<f64>;
+
+    // Guardrails.
+    /// Events on a thread, oldest first.
+    async fn events_for_thread(&self, thread_id: ThreadId) -> Result<Vec<Event>>;
+    /// Records a trip as a system event and notifies the human.
+    async fn record_guardrail_trip(&self, trip: &Trip) -> Result<Event>;
+    /// Trip events since a time, newest first.
+    async fn guardrail_trips_since(&self, since: Timestamp) -> Result<Vec<Event>>;
 
     // Chats and threads.
     /// Every chat, for the human, who observes all of them.

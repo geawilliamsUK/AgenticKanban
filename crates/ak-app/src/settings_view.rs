@@ -444,6 +444,86 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             ui.end_row();
                         });
 
+                    egui::CollapsingHeader::new("Guardrails")
+                        .id_salt("guardrails")
+                        .show(ui, |ui| {
+                            ui.weak("Each rule has a threshold and a window; the action is fixed. Zero disables a rule.");
+                            let g = &mut policy.guardrails;
+                            let mut changed = false;
+                            egui::Grid::new("guardrail_fields")
+                                .num_columns(3)
+                                .spacing([12.0, 6.0])
+                                .show(ui, |ui| {
+                                    ui.label("Ticket ping-pong");
+                                    changed |= ui.add(egui::DragValue::new(&mut g.ping_pong_moves)).changed();
+                                    ui.horizontal(|ui| {
+                                        ui.weak("moves or reassignments in");
+                                        changed |= ui.add(egui::DragValue::new(&mut g.ping_pong_window_minutes).suffix(" min")).changed();
+                                        ui.weak("freezes the ticket");
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("Comment storm");
+                                    changed |= ui.add(egui::DragValue::new(&mut g.comment_storm_comments)).changed();
+                                    ui.horizontal(|ui| {
+                                        ui.weak("agent comments in");
+                                        changed |= ui.add(egui::DragValue::new(&mut g.comment_storm_window_minutes).suffix(" min")).changed();
+                                        ui.weak("freezes the ticket");
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("Mention loop");
+                                    changed |= ui.add(egui::DragValue::new(&mut g.mention_loop_mentions)).changed();
+                                    ui.horizontal(|ui| {
+                                        ui.weak("agent-to-agent mentions in");
+                                        changed |= ui.add(egui::DragValue::new(&mut g.mention_loop_window_minutes).suffix(" min")).changed();
+                                        ui.weak("with no progress freezes the ticket or pauses the thread");
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("Run churn");
+                                    changed |= ui.add(egui::DragValue::new(&mut g.run_churn_runs)).changed();
+                                    ui.horizontal(|ui| {
+                                        ui.weak("runs in a row that handle nothing cool the agent down for");
+                                        changed |= ui.add(egui::DragValue::new(&mut g.run_churn_cooldown_minutes).suffix(" min")).changed();
+                                    });
+                                    ui.end_row();
+
+                                    ui.label("Repeated tool call");
+                                    changed |= ui.add(egui::DragValue::new(&mut g.repeated_tool_calls)).changed();
+                                    ui.weak("identical calls in a row stop the run");
+                                    ui.end_row();
+
+                                    ui.label("Turns per run");
+                                    changed |= ui.add(egui::DragValue::new(&mut g.max_turns_per_run)).changed();
+                                    ui.weak("unless the agent sets its own");
+                                    ui.end_row();
+
+                                    ui.label("Cost per run");
+                                    changed |= ui.add(egui::DragValue::new(&mut g.max_usd_per_run).speed(0.1).prefix("$")).changed();
+                                    ui.weak("unless the agent sets its own");
+                                    ui.end_row();
+
+                                    ui.label("Cost per agent per day");
+                                    changed |= ui.add(egui::DragValue::new(&mut g.max_usd_per_agent_per_day).speed(0.5).prefix("$")).changed();
+                                    ui.weak("no more runs for that agent today");
+                                    ui.end_row();
+
+                                    ui.label("Wall clock per run");
+                                    changed |= ui.add(egui::DragValue::new(&mut g.max_wall_clock_minutes).suffix(" min")).changed();
+                                    ui.weak("stops the run");
+                                    ui.end_row();
+
+                                    ui.label("Wake storm");
+                                    changed |= ui.add(egui::DragValue::new(&mut g.wake_storm_per_hour)).changed();
+                                    ui.weak("wakes per hour; further wakes wait and you are told");
+                                    ui.end_row();
+                                });
+                            if changed {
+                                editor.project_dirty = true;
+                            }
+                        });
+
                     ui.add_space(6.0);
                     ui.horizontal(|ui| {
                         if ui

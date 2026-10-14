@@ -5,6 +5,7 @@
 //!
 //! This sits above the bridge and the runtime because it needs both.
 
+pub mod guardrails;
 pub mod prompts;
 pub mod scheduler;
 pub mod supervisor;
@@ -12,6 +13,7 @@ pub mod workspace;
 
 use std::path::PathBuf;
 
+pub use guardrails::GuardrailMonitor;
 pub use scheduler::Scheduler;
 pub use supervisor::{RunHandle, RunNotice, RunSpec, StopReason, Supervisor, SupervisorConfig};
 pub use workspace::Workspace;

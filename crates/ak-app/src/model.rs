@@ -7,7 +7,7 @@ use ak_core::agent::Agent;
 use ak_core::board::{Column, Comment, Priority, Ticket};
 use ak_core::chat::{Chat, Message, Thread};
 use ak_core::event::{Event, EventKind, MentionSource};
-use ak_core::ids::{ActorId, ColumnId, TicketId};
+use ak_core::ids::{ActorId, ColumnId, ProjectId, TicketId};
 use ak_core::run::{AgentRun, RunEvent};
 use ak_core::{Actor, ActorKind, Notification, NotificationKind};
 
@@ -134,6 +134,23 @@ impl ChatSummary {
     }
 }
 
+/// One project's line on the overview.
+#[derive(Clone)]
+pub struct ProjectOverview {
+    pub id: ProjectId,
+    pub name: String,
+    pub agents: usize,
+    /// Running agents: handle and when the run started.
+    pub running: Vec<(String, ak_core::Timestamp)>,
+    pub halted: usize,
+    pub approvals: usize,
+    pub unread: usize,
+    pub cost_today: f64,
+    pub paused: bool,
+    /// Today's guardrail trips, newest first.
+    pub trips: Vec<Event>,
+}
+
 #[derive(Clone)]
 pub struct ThreadDetail {
     pub thread: Thread,
@@ -160,6 +177,7 @@ pub fn kind_label(k: NotificationKind) -> &'static str {
         NotificationKind::Assigned => "Assigned",
         NotificationKind::Mentioned => "Mention",
         NotificationKind::Unfrozen => "Unfrozen",
+        NotificationKind::Guardrail => "Guardrail",
         NotificationKind::Activated => "Activated",
     }
 }
@@ -295,6 +313,12 @@ pub fn describe_event(event: &Event, board: &BoardModel) -> String {
         }
         EventKind::ThreadPaused { title, .. } => format!("{who} paused thread \"{title}\""),
         EventKind::ThreadUnpaused { title, .. } => format!("{who} unpaused thread \"{title}\""),
+        EventKind::GuardrailTripped {
+            rule,
+            action,
+            detail,
+            ..
+        } => format!("guardrail {}: {detail} ({})", rule.label(), action.label()),
     }
 }
 

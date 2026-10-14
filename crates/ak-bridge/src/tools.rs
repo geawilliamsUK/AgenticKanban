@@ -1214,6 +1214,12 @@ pub fn describe(e: &Event, snap: &Snapshot) -> String {
         }
         EventKind::ThreadPaused { title, .. } => format!("{who} paused thread \"{title}\""),
         EventKind::ThreadUnpaused { title, .. } => format!("{who} unpaused thread \"{title}\""),
+        EventKind::GuardrailTripped {
+            rule,
+            action,
+            detail,
+            ..
+        } => format!("guardrail {}: {detail} ({})", rule.label(), action.label()),
     }
 }
 

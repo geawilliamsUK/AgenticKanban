@@ -22,7 +22,9 @@ use crate::backend::{Backend, Request, Response, RunnerFactory};
 use crate::chats_view::ChatsState;
 use crate::dialogs::{AddProjectDialog, NewTicketDialog};
 use crate::markdown::Markdown;
-use crate::model::{BoardModel, ChatSummary, InboxItem, LiveRun, ThreadDetail, TicketDetail};
+use crate::model::{
+    BoardModel, ChatSummary, InboxItem, LiveRun, ProjectOverview, ThreadDetail, TicketDetail,
+};
 use crate::settings_view::SettingsEditor;
 use crate::snapshot_view::{ExportDialog, ImportDialog};
 use crate::team_view::{AgentEditor, ProposalView, RefineStatus};
@@ -33,6 +35,7 @@ pub enum View {
     Board,
     Inbox,
     Chats,
+    Overview,
     Team,
     Settings,
 }
@@ -83,6 +86,9 @@ pub struct App {
     pub drift: Vec<DriftEntry>,
     pub export_dialog: Option<ExportDialog>,
     pub import_dialog: Option<ImportDialog>,
+
+    pub overview: Vec<ProjectOverview>,
+    pub overview_requested: Option<Instant>,
 
     /// Permission profile names and default model from the open project's policy.
     pub profiles: Vec<String>,
@@ -166,6 +172,8 @@ impl App {
             drift: Vec::new(),
             export_dialog: None,
             import_dialog: None,
+            overview: Vec::new(),
+            overview_requested: None,
             view: View::Board,
             profiles: Vec::new(),
             default_model: None,
@@ -277,7 +285,7 @@ impl App {
                 self.export_dialog = None;
                 self.import_dialog = None;
                 self.ticket_panel = TicketPanelState::default();
-                if self.view != View::Settings {
+                if self.view == View::Overview {
                     self.view = View::Board;
                 }
             }
@@ -372,6 +380,7 @@ impl App {
                 pending,
                 runs,
                 integrations,
+                cost_today,
             } => {
                 if Some(project) != self.current {
                     return;
@@ -396,6 +405,7 @@ impl App {
                         retired_since,
                         pending,
                         integrations,
+                        cost_today,
                     ));
                 }
             }
@@ -595,6 +605,7 @@ impl App {
                     self.view = View::Team;
                 }
             }
+            Response::Overview(list) => self.overview = list,
             Response::Drift { project, entries } => {
                 if Some(project) == self.current {
                     self.drift = entries;
@@ -633,6 +644,9 @@ impl App {
                 }
                 Action::SwitchView(view) => {
                     self.view = view;
+                    if view == View::Overview {
+                        self.overview_requested = None;
+                    }
                     if view == View::Team {
                         if let Some(project) = self.current {
                             self.send(Request::CheckDrift { project });
@@ -749,6 +763,12 @@ impl App {
         ui.separator();
         ui.add_space(4.0);
 
+        if ui
+            .selectable_label(self.view == View::Overview, "Overview")
+            .clicked()
+        {
+            self.actions.push(Action::SwitchView(View::Overview));
+        }
         let enabled = self.current.is_some();
         ui.add_enabled_ui(enabled, |ui| {
             if ui
@@ -888,6 +908,16 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_responses();
 
+        if self.view == View::Overview
+            && self
+                .overview_requested
+                .is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(5))
+        {
+            self.overview_requested = Some(Instant::now());
+            self.send(Request::LoadOverview);
+            ctx.request_repaint_after(std::time::Duration::from_secs(5));
+        }
+
         if let Some(err) = self.startup_error.clone() {
             egui::CentralPanel::default().show(ctx, |ui| {
                 ui.heading("AgenticKanban could not start");
@@ -918,6 +948,10 @@ impl eframe::App for App {
                 crate::settings_view::draw(self, ui);
                 return;
             }
+            if self.view == View::Overview {
+                crate::overview_view::draw(self, ui);
+                return;
+            }
             if self.current.is_none() {
                 ui.centered_and_justified(|ui| {
                     ui.label("Add a project from the sidebar to get started.");
@@ -929,7 +963,7 @@ impl eframe::App for App {
                 View::Inbox => crate::inbox_view::draw(self, ui),
                 View::Chats => crate::chats_view::draw(self, ui),
                 View::Team => crate::team_view::draw(self, ui),
-                View::Settings => unreachable!(),
+                View::Settings | View::Overview => unreachable!(),
             }
         });
 

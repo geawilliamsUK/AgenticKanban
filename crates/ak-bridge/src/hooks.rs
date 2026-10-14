@@ -63,6 +63,26 @@ pub async fn pre_tool_use(
 /// The decision for one tool call. Separate from the handler so tests can
 /// call it without HTTP.
 pub async fn decide(bridge: &Bridge, ctx: &RunContext, input: &PreToolUseInput) -> Value {
+    // Repeated tool call: the same call over and over is a loop, not work.
+    let limit = ctx.project.policy().guardrails.repeated_tool_calls;
+    let streak = bridge.note_tool_call(ctx.run_id, &input.tool_name, &input.tool_input);
+    if limit > 0 && streak >= limit {
+        let reason = format!(
+            "@{} made the same {} call {streak} times in a row",
+            ctx.agent.handle, input.tool_name
+        );
+        bridge.emit(BridgeEvent::RunGuardrail {
+            run_id: ctx.run_id,
+            agent_id: ctx.agent.actor_id,
+            reason,
+        });
+        return permission(
+            "deny",
+            &format!(
+                "guardrail: this exact call was made {streak} times in a row; the run is being stopped"
+            ),
+        );
+    }
     if input.tool_name.starts_with(BOARD_TOOL_PREFIX) {
         return permission("allow", "board tools are always available");
     }
