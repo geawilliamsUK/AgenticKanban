@@ -635,7 +635,11 @@ pub fn parse_line(line: &str) -> Vec<(RunEventKind, Value)> {
                         return Vec::new();
                     }
                     let message =
-                        format!("hook {} {outcome}: {}", text("hook_name"), text("output"));
+                        format!(
+                            "hook {} {outcome} (from your own Claude Code settings or plugins, not this app): {}",
+                            text("hook_name"),
+                            text("output")
+                        );
                     vec![(
                         RunEventKind::Other,
                         json!({"message": truncate(&message, 2000)}),
