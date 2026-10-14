@@ -6,7 +6,9 @@ The design is in [docs/DESIGN.md](docs/DESIGN.md).
 
 ## Status
 
-Milestone 1 of 5: a human-only, multi-project kanban. Projects, tickets, comments with replies, `@mentions`, an event log, notifications and an inbox. Agents arrive in milestone 2.
+Milestones 1 and 2 are implemented: the human-only board, then agents. Agents are defined in the GUI (Claude Code subagent format) with Refine and Integrate, run as headless Claude Code processes in their own git worktrees, reach the board through a localhost MCP bridge with per-agent permission profiles and human approvals, and are scheduled from wake notifications under budgets and guardrails. Direct and group chats with threads and search, Export and Import of agent definitions through a repository's `.agentic/` snapshot, an Overview across projects, and a run inspector are in. Progress, known gaps and what comes next are kept in [docs/STATUS.md](docs/STATUS.md).
+
+Two ignored tests exercise the real Claude Code binary and cost real money (about half a dollar each): `cargo test -p ak-supervisor --test live -- --ignored --nocapture` has an agent complete a ticket end to end, and `--test live_chat` has an agent answer a question in a direct thread.
 
 ## Build and run
 
@@ -26,7 +28,9 @@ The app keeps all of its state under `~/.agentic-kanban/`. Set `AGENTIC_KANBAN_H
 
 | Crate | What it is |
 |---|---|
-| `crates/ak-core` | Pure domain logic: entities, events, the decide functions behind every command, notification routing, config types. No IO. |
+| `crates/ak-core` | Pure domain logic: entities, events, the decide functions behind every command, notification routing, permission rules, guardrail rules, config types. No IO. |
 | `crates/ak-store` | The `Store` trait and its SQLite implementation. One database per project. Commands are transactional and publish events after commit. |
-| `crates/ak-runtime` | Filesystem and process side: home directory layout, config IO, the project registry. The scheduler and Claude Code supervisor land here in milestone 2. |
-| `crates/ak-app` | The egui desktop application. A backend task bridges the UI thread and the async stores; a watcher per open project pushes fresh state whenever events land. |
+| `crates/ak-runtime` | Filesystem and process side: home directory layout, config IO, the project registry, agent definition files, utility calls (Refine, Integrate), the `.agentic/` snapshot, the instance lock. |
+| `crates/ak-bridge` | The localhost MCP server that exposes the board to a run, plus the permission and stop hooks. |
+| `crates/ak-supervisor` | Spawns and watches one Claude Code process per run, schedules runs, manages worktrees, composes prompts, applies guardrails. |
+| `crates/ak-app` | The egui desktop application. A backend task bridges the UI thread and the async runtime; watchers per project push fresh state whenever events land. |
