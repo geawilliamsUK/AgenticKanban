@@ -421,7 +421,10 @@ async fn pre_tool_use_follows_the_profile_and_asks_the_human() {
         };
         assert_eq!(a.tool_name, "Bash");
         assert!(a.summary.contains("git push"));
-        bridge.decide(&ctx2, a.id, true, human).await.unwrap()
+        bridge
+            .decide(ctx2.store().as_ref(), a.id, true, human)
+            .await
+            .unwrap()
     });
     let v = decide(
         &f.bridge,
@@ -457,7 +460,10 @@ async fn pre_tool_use_follows_the_profile_and_asks_the_human() {
     let mut events = f.bridge.subscribe();
     tokio::spawn(async move {
         if let Ok(BridgeEvent::ApprovalRequested(a)) = events.recv().await {
-            bridge.decide(&ctx2, a.id, false, human).await.unwrap();
+            bridge
+                .decide(ctx2.store().as_ref(), a.id, false, human)
+                .await
+                .unwrap();
         }
     });
     let v = decide(

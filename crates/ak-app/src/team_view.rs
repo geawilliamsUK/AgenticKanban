@@ -1,10 +1,11 @@
 //! The Team view: the agents on this project and the editor for one of them,
-//! including Refine proposals and their review.
+//! including Refine proposals, live runs and run history.
 
 use std::collections::BTreeMap;
 use std::time::Instant;
 
 use ak_core::agent::{AgentDefinition, AgentState, Budgets, Frontmatter};
+use ak_core::run::{AgentRun, RunEventKind};
 use ak_core::Timestamp;
 
 use crate::app::{Action, App};
@@ -52,6 +53,7 @@ pub struct AgentEditor {
     pub body: String,
     pub memory: String,
     pub inbox: Vec<InboxItem>,
+    pub runs: Vec<AgentRun>,
     pub retired_since: Option<Timestamp>,
     pub dirty: bool,
     pub confirm_retire: bool,
@@ -61,8 +63,15 @@ pub struct AgentEditor {
 impl AgentEditor {
     pub fn new_agent(profile: &str) -> Self {
         let def = AgentDefinition::template("", "");
-        let mut editor =
-            Self::from_definition("", Some(def), String::new(), Vec::new(), None, None);
+        let mut editor = Self::from_definition(
+            "",
+            Some(def),
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+        );
         editor.is_new = true;
         editor.loaded = true;
         editor.permission_profile = profile.to_string();
@@ -71,7 +80,15 @@ impl AgentEditor {
     }
 
     pub fn pending(handle: &str) -> Self {
-        let mut editor = Self::from_definition(handle, None, String::new(), Vec::new(), None, None);
+        let mut editor = Self::from_definition(
+            handle,
+            None,
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+        );
         editor.loaded = false;
         editor
     }
@@ -81,6 +98,7 @@ impl AgentEditor {
         definition: Option<AgentDefinition>,
         memory: String,
         inbox: Vec<InboxItem>,
+        runs: Vec<AgentRun>,
         retired_since: Option<Timestamp>,
         pending: Option<PendingProposal>,
     ) -> Self {
@@ -103,6 +121,7 @@ impl AgentEditor {
             body: def.body.clone(),
             memory,
             inbox,
+            runs,
             retired_since,
             dirty: false,
             confirm_retire: false,
@@ -193,6 +212,17 @@ impl AgentEditor {
     }
 }
 
+fn state_color(state: AgentState) -> egui::Color32 {
+    match state {
+        AgentState::Idle => egui::Color32::from_rgb(130, 140, 150),
+        AgentState::Scheduled | AgentState::Starting => egui::Color32::from_rgb(230, 190, 80),
+        AgentState::Running => egui::Color32::from_rgb(120, 220, 130),
+        AgentState::Stopping => egui::Color32::from_rgb(230, 150, 80),
+        AgentState::Errored | AgentState::Halted => egui::Color32::from_rgb(240, 120, 120),
+        AgentState::Cooldown => egui::Color32::from_rgb(90, 160, 230),
+    }
+}
+
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let Some(project) = app.current else { return };
 
@@ -207,6 +237,28 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         app.actions.push(Action::OpenAgent(None));
                     }
                 });
+            });
+            ui.add_space(4.0);
+            ui.horizontal(|ui| {
+                let paused = app.scheduler_paused;
+                let label = if paused { "Agents paused" } else { "Agents active" };
+                let color = if paused {
+                    egui::Color32::from_rgb(240, 120, 120)
+                } else {
+                    egui::Color32::from_rgb(120, 220, 130)
+                };
+                ui.colored_label(color, label);
+                let button = if paused { "Resume all" } else { "Pause all" };
+                if ui
+                    .small_button(button)
+                    .on_hover_text("Paused: no new runs start anywhere in this project. Running agents finish or are stopped by you.")
+                    .clicked()
+                {
+                    app.actions.push(Action::Request(Request::SetSchedulerPaused {
+                        project,
+                        paused: !paused,
+                    }));
+                }
             });
             ui.add_space(6.0);
             if let Some(h) = &app.human {
@@ -238,11 +290,18 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 } else {
                     egui::RichText::new(text)
                 };
-                let resp = ui.selectable_label(is_selected, rich);
-                if resp.clicked() {
+                let resp = ui.horizontal(|ui| {
+                    let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+                    if !a.is_retired() {
+                        ui.painter().circle_filled(rect.center(), 4.0, state_color(a.state));
+                    }
+                    ui.selectable_label(is_selected, rich)
+                });
+                let label = resp.inner;
+                if label.clicked() {
                     app.actions.push(Action::OpenAgent(Some(a.handle.clone())));
                 }
-                resp.on_hover_text(if a.is_retired() {
+                label.on_hover_text(if a.is_retired() {
                     "Retired: the definition file was removed".to_string()
                 } else {
                     format!("{}\nState: {}", a.description, a.state.label())
@@ -267,6 +326,14 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
     let actors = app.board.actors.clone();
     let board = app.board.clone();
     let runner_description = app.runner_description.clone();
+    let agent_row = app
+        .team
+        .as_ref()
+        .and_then(|e| board.agent_by_handle(&e.handle).cloned());
+    let live = agent_row
+        .as_ref()
+        .and_then(|a| app.live_runs.get(&a.actor_id).cloned());
+    let run_events = app.run_events.clone();
     let Some(editor) = app.team.as_mut() else {
         return;
     };
@@ -286,6 +353,9 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
             ui.heading("New agent");
         } else {
             ui.heading(format!("@{}", editor.handle));
+        }
+        if let Some(a) = &agent_row {
+            ui.colored_label(state_color(a.state), a.state.label());
         }
         if editor.dirty {
             ui.weak("unsaved");
@@ -341,6 +411,65 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
         });
     });
 
+    // Run controls.
+    if let Some(a) = &agent_row {
+        if editor.retired_since.is_none() {
+            ui.horizontal(|ui| {
+                let handle = editor.handle.clone();
+                if a.state.is_active() {
+                    if ui
+                        .button("Stop run")
+                        .on_hover_text("Kills the process. The agent can be woken again.")
+                        .clicked()
+                    {
+                        actions.push(Action::Request(Request::StopAgent {
+                            project,
+                            handle: handle.clone(),
+                        }));
+                    }
+                } else if ui
+                    .button("Wake now")
+                    .on_hover_text("Starts a run even with nothing pending.")
+                    .clicked()
+                {
+                    actions.push(Action::Request(Request::WakeAgent {
+                        project,
+                        handle: handle.clone(),
+                    }));
+                }
+                if a.state == AgentState::Halted || a.state == AgentState::Cooldown {
+                    if ui
+                        .button("Resume")
+                        .on_hover_text("Clears the halt or cooldown so the agent can be woken.")
+                        .clicked()
+                    {
+                        actions.push(Action::Request(Request::ResumeAgent {
+                            project,
+                            handle: handle.clone(),
+                        }));
+                    }
+                } else if ui
+                    .button("Halt")
+                    .on_hover_text(
+                        "Kills any run and refuses to wake the agent until you resume it.",
+                    )
+                    .clicked()
+                {
+                    actions.push(Action::Request(Request::HaltAgent {
+                        project,
+                        handle: handle.clone(),
+                    }));
+                }
+                if let Some(until) = a.cooldown_until {
+                    if a.state == AgentState::Cooldown {
+                        ui.weak(format!("cooling down until {}", format_time(&until)));
+                    }
+                }
+            });
+            ui.add_space(4.0);
+        }
+    }
+
     if let Some(since) = editor.retired_since {
         egui::Frame::new()
             .fill(egui::Color32::from_rgb(70, 50, 30))
@@ -369,6 +498,7 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
     egui::ScrollArea::vertical()
         .id_salt("agent_editor_scroll")
         .show(ui, |ui| {
+            draw_runs(ui, editor, &live, &run_events, actions, project);
             draw_refine_panel(ui, editor, actions, project, &runner_description);
 
             ui.add_enabled_ui(editable, |ui| {
@@ -549,20 +679,143 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
                         });
                     }
                 });
-
-            if let Some(a) = board.agent_by_handle(&editor.handle) {
-                ui.add_space(6.0);
-                ui.weak(format!(
-                    "State: {}{}",
-                    a.state.label(),
-                    if a.state == AgentState::Idle {
-                        " (agents cannot run until the supervisor lands)"
-                    } else {
-                        ""
-                    }
-                ));
-            }
         });
+}
+
+/// The live run, if any, and the run history with transcripts on demand.
+fn draw_runs(
+    ui: &mut egui::Ui,
+    editor: &AgentEditor,
+    live: &Option<crate::model::LiveRun>,
+    run_events: &Option<(ak_core::ids::RunId, Vec<ak_core::run::RunEvent>)>,
+    actions: &mut Vec<Action>,
+    project: ak_core::ids::ProjectId,
+) {
+    if let Some(live) = live {
+        let running = live.run.is_active();
+        let title = if running {
+            format!(
+                "Run in progress, started {}",
+                format_time(&live.run.started_at)
+            )
+        } else {
+            format!(
+                "Last run: {}{}",
+                live.run.exit_reason.map(|r| r.label()).unwrap_or("unknown"),
+                live.run
+                    .cost_usd
+                    .map(|c| format!(", ${c:.3}"))
+                    .unwrap_or_default()
+            )
+        };
+        egui::CollapsingHeader::new(title)
+            .id_salt("live_run")
+            .default_open(true)
+            .show(ui, |ui| {
+                if running {
+                    ui.ctx()
+                        .request_repaint_after(std::time::Duration::from_millis(500));
+                }
+                if let Some(err) = &live.run.error {
+                    ui.colored_label(egui::Color32::from_rgb(240, 120, 120), err);
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt("live_events")
+                    .max_height(260.0)
+                    .stick_to_bottom(true)
+                    .show(ui, |ui| {
+                        ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+                        for e in &live.events {
+                            let color = match e.kind {
+                                RunEventKind::ToolCall => egui::Color32::from_rgb(120, 180, 255),
+                                RunEventKind::ToolResult => ui.visuals().weak_text_color(),
+                                RunEventKind::AssistantText => ui.visuals().text_color(),
+                                RunEventKind::Result | RunEventKind::SystemInit => {
+                                    egui::Color32::from_rgb(120, 220, 130)
+                                }
+                                RunEventKind::Stderr => egui::Color32::from_rgb(240, 120, 120),
+                                RunEventKind::Supervisor | RunEventKind::Other => {
+                                    egui::Color32::from_rgb(230, 190, 80)
+                                }
+                            };
+                            ui.add(
+                                egui::Label::new(
+                                    egui::RichText::new(format!(
+                                        "{} {:<14} {}",
+                                        e.at.with_timezone(&chrono::Local).format("%H:%M:%S"),
+                                        e.kind.as_str(),
+                                        e.summary()
+                                    ))
+                                    .color(color),
+                                )
+                                .wrap(),
+                            );
+                        }
+                    });
+            });
+        ui.add_space(6.0);
+    }
+
+    if !editor.runs.is_empty() {
+        egui::CollapsingHeader::new(format!("Run history ({})", editor.runs.len()))
+            .id_salt("run_history")
+            .show(ui, |ui| {
+                for r in &editor.runs {
+                    ui.horizontal(|ui| {
+                        ui.weak(format_time(&r.started_at));
+                        let label = r.exit_reason.map(|x| x.label()).unwrap_or("running");
+                        ui.label(label);
+                        ui.weak(format!(
+                            "{} turns{}",
+                            r.num_turns,
+                            r.cost_usd.map(|c| format!(", ${c:.3}")).unwrap_or_default()
+                        ));
+                        if let Some(err) = &r.error {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(240, 120, 120),
+                                err.chars().take(80).collect::<String>(),
+                            );
+                        }
+                        if ui.small_button("Transcript").clicked() {
+                            actions.push(Action::Request(Request::LoadRunEvents {
+                                project,
+                                run_id: r.id,
+                            }));
+                        }
+                    });
+                    if let Some((id, events)) = run_events {
+                        if *id == r.id {
+                            egui::Frame::new()
+                                .fill(ui.visuals().faint_bg_color)
+                                .inner_margin(6.0)
+                                .show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    egui::ScrollArea::vertical()
+                                        .id_salt(("transcript", r.id))
+                                        .max_height(300.0)
+                                        .show(ui, |ui| {
+                                            ui.style_mut().override_text_style =
+                                                Some(egui::TextStyle::Monospace);
+                                            for e in events {
+                                                ui.add(
+                                                    egui::Label::new(format!(
+                                                        "{} {:<14} {}",
+                                                        e.at.with_timezone(&chrono::Local)
+                                                            .format("%H:%M:%S"),
+                                                        e.kind.as_str(),
+                                                        e.summary()
+                                                    ))
+                                                    .wrap(),
+                                                );
+                                            }
+                                        });
+                                });
+                        }
+                    }
+                }
+            });
+        ui.add_space(6.0);
+    }
 }
 
 /// The Refine status strip and, when a proposal is waiting, its review.

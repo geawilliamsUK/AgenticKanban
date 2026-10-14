@@ -11,6 +11,7 @@ use ak_core::agent::{Agent, AgentState, Budgets};
 use ak_core::approval::{Approval, ApprovalState};
 use ak_core::board::{Column, ColumnKind, Comment, Priority, Ticket};
 use ak_core::event::EventKind;
+use ak_core::run::{AgentRun, ExitReason, RunEvent, RunEventKind};
 use ak_core::utility::{UtilityCall, UtilityKind, UtilityState};
 use ak_core::{Actor, ActorKind, Event, Notification, NotificationKind, NotificationState};
 
@@ -194,5 +195,49 @@ pub fn approval_from_row(row: &SqliteRow) -> Result<Approval, StoreError> {
         created_at: parse_ts(&row.try_get::<String, _>("created_at")?)?,
         decided_by: parse_opt_id(row.try_get("decided_by")?, "actor")?,
         decided_at: decided_at.as_deref().map(parse_ts).transpose()?,
+    })
+}
+
+pub fn run_from_row(row: &SqliteRow) -> Result<AgentRun, StoreError> {
+    let trigger: String = row.try_get("trigger")?;
+    let ended_at: Option<String> = row.try_get("ended_at")?;
+    let exit_reason: Option<String> = row.try_get("exit_reason")?;
+    let workspace_path: String = row.try_get("workspace_path")?;
+    let num_turns: i64 = row.try_get("num_turns")?;
+    let input_tokens: i64 = row.try_get("input_tokens")?;
+    let output_tokens: i64 = row.try_get("output_tokens")?;
+    Ok(AgentRun {
+        id: parse_id(&row.try_get::<String, _>("id")?, "run")?,
+        agent_id: parse_id(&row.try_get::<String, _>("agent_actor_id")?, "actor")?,
+        trigger: serde_json::from_str(&trigger)?,
+        claude_session_id: row.try_get("claude_session_id")?,
+        workspace_path: workspace_path.into(),
+        started_at: parse_ts(&row.try_get::<String, _>("started_at")?)?,
+        ended_at: ended_at.as_deref().map(parse_ts).transpose()?,
+        exit_reason: exit_reason
+            .as_deref()
+            .map(|s| {
+                ExitReason::parse(s)
+                    .ok_or_else(|| StoreError::corrupt(format!("exit reason {s:?}")))
+            })
+            .transpose()?,
+        num_turns: num_turns.max(0) as u32,
+        input_tokens: input_tokens.max(0) as u64,
+        output_tokens: output_tokens.max(0) as u64,
+        cost_usd: row.try_get("cost_usd")?,
+        error: row.try_get("error")?,
+    })
+}
+
+pub fn run_event_from_row(row: &SqliteRow) -> Result<RunEvent, StoreError> {
+    let kind: String = row.try_get("kind")?;
+    let payload: String = row.try_get("payload")?;
+    Ok(RunEvent {
+        run_id: parse_id(&row.try_get::<String, _>("run_id")?, "run")?,
+        seq: row.try_get("seq")?,
+        at: parse_ts(&row.try_get::<String, _>("at")?)?,
+        kind: RunEventKind::parse(&kind)
+            .ok_or_else(|| StoreError::corrupt(format!("run event kind {kind:?}")))?,
+        payload: serde_json::from_str(&payload)?,
     })
 }

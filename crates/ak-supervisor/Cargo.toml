@@ -1,0 +1,22 @@
+[package]
+name = "ak-supervisor"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+ak-bridge = { version = "0.1.0", path = "../ak-bridge" }
+ak-core = { version = "0.1.0", path = "../ak-core" }
+ak-runtime = { version = "0.1.0", path = "../ak-runtime" }
+ak-store = { version = "0.1.0", path = "../ak-store" }
+chrono = "0.4.45"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "2.0.21"
+tokio = { version = "1.53.3", features = ["rt-multi-thread", "sync", "macros", "process", "io-util", "time", "fs"] }
+tracing = "0.1.44"
+uuid = { version = "1.26.1", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"

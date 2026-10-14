@@ -2,14 +2,10 @@
 //!
 //! The UI sends `Request`s over a channel. The backend runs them against the
 //! registry and stores on a tokio runtime, and sends `Response`s back. Every
-//! open project has two watchers: one subscribed to its event bus, pushing a
-//! fresh board and inbox whenever an event lands, and one on its agents
-//! directory, reconciling agent rows whenever a definition file changes. The
-//! UI never has to ask for a refresh after a mutation, and agent activity will
-//! reach the screen the same way.
-//!
-//! Long-running work such as a Refine call runs in its own task so the loop
-//! keeps serving other requests.
+//! open project has watchers on its event bus and its agents directory, and
+//! a scheduler that wakes agents. Run notices from the supervisor and
+//! approval events from the bridge are forwarded to the UI through an
+//! internal channel, so the loop stays the single owner of the registry.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -18,13 +14,19 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
-use tokio::sync::mpsc::UnboundedReceiver;
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+use ak_bridge::{Bridge, BridgeEvent};
 use ak_core::agent::AgentDefinition;
+use ak_core::approval::Approval;
 use ak_core::commands::{NewTicket, TicketPatch};
 use ak_core::config::{GlobalSettings, ProjectEntry, ProjectPolicy};
-use ak_core::ids::{ActorId, CallId, ColumnId, CommentId, NotificationId, ProjectId, TicketId};
+use ak_core::ids::{
+    ActorId, ApprovalId, CallId, ColumnId, CommentId, NotificationId, ProjectId, RunId, TicketId,
+};
+use ak_core::run::{AgentRun, RunEvent};
 use ak_core::utility::{UtilityCall, UtilityKind, UtilityState};
 use ak_core::{Actor, ActorKind, Event, NotificationState, Timestamp};
 use ak_runtime::agents::{self, AgentWatcher};
@@ -32,6 +34,7 @@ use ak_runtime::authoring::{self, RosterEntry};
 use ak_runtime::claude::{self, ClaudeProbe};
 use ak_runtime::{OpenProject, ProjectRegistry, RuntimeError, UtilityRunner};
 use ak_store::Store;
+use ak_supervisor::{RunNotice, Scheduler, Supervisor, SupervisorConfig};
 
 use crate::model::{BoardModel, InboxItem, TicketDetail};
 
@@ -139,6 +142,36 @@ pub enum Request {
     },
     /// Locates the Claude Code binary and asks it about its login.
     ProbeClaude,
+    // Agent control.
+    WakeAgent {
+        project: ProjectId,
+        handle: String,
+    },
+    StopAgent {
+        project: ProjectId,
+        handle: String,
+    },
+    HaltAgent {
+        project: ProjectId,
+        handle: String,
+    },
+    ResumeAgent {
+        project: ProjectId,
+        handle: String,
+    },
+    SetSchedulerPaused {
+        project: ProjectId,
+        paused: bool,
+    },
+    DecideApproval {
+        project: ProjectId,
+        id: ApprovalId,
+        approve: bool,
+    },
+    LoadRunEvents {
+        project: ProjectId,
+        run_id: RunId,
+    },
 }
 
 /// A proposal awaiting review, with the text it would replace.
@@ -155,6 +188,7 @@ pub enum Response {
     Settings {
         settings: GlobalSettings,
         runner_description: String,
+        bridge_addr: Option<String>,
     },
     ProjectOpened {
         id: ProjectId,
@@ -188,6 +222,7 @@ pub enum Response {
         inbox: Vec<InboxItem>,
         retired_since: Option<Timestamp>,
         pending: Option<PendingProposal>,
+        runs: Vec<AgentRun>,
     },
     RefineStarted {
         project: ProjectId,
@@ -203,20 +238,54 @@ pub enum Response {
         handle: String,
         error: String,
     },
+    RunStarted {
+        project: ProjectId,
+        run: AgentRun,
+    },
+    RunEvent {
+        project: ProjectId,
+        event: RunEvent,
+    },
+    RunEnded {
+        project: ProjectId,
+        run: AgentRun,
+    },
+    RunEvents {
+        project: ProjectId,
+        run_id: RunId,
+        events: Vec<RunEvent>,
+    },
+    Approvals {
+        project: ProjectId,
+        items: Vec<Approval>,
+    },
+    SchedulerPaused {
+        project: ProjectId,
+        paused: bool,
+    },
     Error(String),
     Info(String),
+}
+
+enum Internal {
+    Run(RunNotice),
+    Bridge(BridgeEvent),
 }
 
 struct ProjectWatchers {
     events: JoinHandle<()>,
     files: JoinHandle<()>,
     _agent_watcher: AgentWatcher,
+    scheduler: Option<Scheduler>,
 }
 
 impl ProjectWatchers {
     fn stop(self) {
         self.events.abort();
         self.files.abort();
+        if let Some(s) = self.scheduler {
+            s.shutdown();
+        }
     }
 }
 
@@ -229,6 +298,11 @@ pub struct Backend {
     tx: Sender<Response>,
     ctx: egui::Context,
     watchers: HashMap<ProjectId, ProjectWatchers>,
+    bridge: Option<Bridge>,
+    supervisor: Option<Arc<Supervisor>>,
+    slots: Arc<Semaphore>,
+    internal_tx: UnboundedSender<Internal>,
+    internal_rx: UnboundedReceiver<Internal>,
 }
 
 impl Backend {
@@ -241,6 +315,8 @@ impl Backend {
     ) -> Self {
         let settings = registry.config().settings.clone();
         let runner = runner_factory(&settings);
+        let slots = Arc::new(Semaphore::new(settings.max_concurrent_runs.max(1) as usize));
+        let (internal_tx, internal_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             registry,
             runner_factory,
@@ -250,19 +326,98 @@ impl Backend {
             tx,
             ctx,
             watchers: HashMap::new(),
+            bridge: None,
+            supervisor: None,
+            slots,
+            internal_tx,
+            internal_rx,
         }
     }
 
     pub async fn run(mut self) {
+        self.start_agent_runtime().await;
         self.send(Response::Projects(self.registry.projects().to_vec()));
         self.send_settings();
-        while let Some(req) = self.rx.recv().await {
-            if let Err(msg) = self.handle(req).await {
-                self.send(Response::Error(msg));
+        loop {
+            tokio::select! {
+                req = self.rx.recv() => match req {
+                    Some(req) => {
+                        if let Err(msg) = self.handle(req).await {
+                            self.send(Response::Error(msg));
+                        }
+                    }
+                    None => break,
+                },
+                msg = self.internal_rx.recv() => {
+                    if let Some(msg) = msg {
+                        self.handle_internal(msg).await;
+                    }
+                }
             }
         }
         for (_, w) in self.watchers.drain() {
             w.stop();
+        }
+    }
+
+    /// Starts the bridge and the supervisor. Without them the app still
+    /// works as a board; agents just cannot run.
+    async fn start_agent_runtime(&mut self) {
+        match Bridge::start().await {
+            Ok(bridge) => {
+                let supervisor = Arc::new(Supervisor::new(
+                    bridge.clone(),
+                    self.registry.paths().clone(),
+                    self.supervisor_config(),
+                ));
+                let mut notices = supervisor.subscribe();
+                let tx = self.internal_tx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match notices.recv().await {
+                            Ok(n) => {
+                                if tx.send(Internal::Run(n)).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        }
+                    }
+                });
+                let mut events = bridge.subscribe();
+                let tx = self.internal_tx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match events.recv().await {
+                            Ok(e) => {
+                                if tx.send(Internal::Bridge(e)).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        }
+                    }
+                });
+                self.bridge = Some(bridge);
+                self.supervisor = Some(supervisor);
+            }
+            Err(e) => {
+                tracing::error!("bridge failed to start: {e}");
+                self.send(Response::Error(format!(
+                    "agent bridge failed to start, agents cannot run: {e}"
+                )));
+            }
+        }
+    }
+
+    fn supervisor_config(&self) -> SupervisorConfig {
+        SupervisorConfig {
+            binary: claude::locate(self.settings.claude_binary.as_deref())
+                .map_err(|e| e.to_string()),
+            pass_api_key: false,
+            startup_timeout: Duration::from_secs(90),
         }
     }
 
@@ -276,6 +431,7 @@ impl Backend {
         self.send(Response::Settings {
             settings: self.settings.clone(),
             runner_description: self.runner.describe(),
+            bridge_addr: self.bridge.as_ref().map(|b| b.addr().to_string()),
         });
     }
 
@@ -283,6 +439,65 @@ impl Backend {
         self.registry
             .opened(id)
             .ok_or_else(|| "project is not open".to_string())
+    }
+
+    fn scheduler(&self, id: ProjectId) -> Result<Scheduler, String> {
+        self.watchers
+            .get(&id)
+            .and_then(|w| w.scheduler.clone())
+            .ok_or_else(|| "agents cannot run: the agent runtime is not available".to_string())
+    }
+
+    async fn agent_actor(&self, p: &OpenProject, handle: &str) -> Result<ActorId, String> {
+        p.store()
+            .agent_by_handle(handle)
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|a| a.actor_id)
+            .ok_or_else(|| format!("no agent @{handle}"))
+    }
+
+    async fn handle_internal(&mut self, msg: Internal) {
+        match msg {
+            Internal::Run(RunNotice::Started { project, run }) => {
+                if let Some(p) = self.registry.opened(project) {
+                    let _ = push_board(&p, &self.tx, &self.ctx).await;
+                }
+                self.send(Response::RunStarted { project, run });
+            }
+            Internal::Run(RunNotice::Event { project, event }) => {
+                self.send(Response::RunEvent { project, event });
+            }
+            Internal::Run(RunNotice::Ended { project, run }) => {
+                if let Some(p) = self.registry.opened(project) {
+                    let _ = push_board(&p, &self.tx, &self.ctx).await;
+                    let _ = push_inbox(&p, &self.tx, &self.ctx).await;
+                }
+                self.send(Response::RunEnded { project, run });
+            }
+            Internal::Bridge(BridgeEvent::ApprovalRequested(a)) => {
+                if let Some(p) = self.project_of_agent(a.agent_id).await {
+                    let _ = push_approvals(&p, &self.tx, &self.ctx).await;
+                    self.send(Response::Info(format!("Approval needed: {}", a.summary)));
+                }
+            }
+            Internal::Bridge(BridgeEvent::ApprovalDecided(a)) => {
+                if let Some(p) = self.project_of_agent(a.agent_id).await {
+                    let _ = push_approvals(&p, &self.tx, &self.ctx).await;
+                }
+            }
+        }
+    }
+
+    async fn project_of_agent(&self, agent: ActorId) -> Option<Arc<OpenProject>> {
+        for entry in self.registry.projects() {
+            if let Some(p) = self.registry.opened(entry.id) {
+                if p.store().agent(agent).await.is_ok() {
+                    return Some(p);
+                }
+            }
+        }
+        None
     }
 
     async fn handle(&mut self, req: Request) -> Result<(), String> {
@@ -491,11 +706,11 @@ impl Backend {
                 self.registry
                     .save_project_policy(project, &policy)
                     .map_err(|e| e.to_string())?;
-                let renamed = self.registry.entry(project).is_some_and(|e| e.name != name);
                 self.send(Response::ProjectPolicy {
                     project,
                     policy: p.policy(),
                 });
+                let renamed = self.registry.entry(project).is_some_and(|e| e.name != name);
                 if renamed {
                     self.registry
                         .rename_project(project, &name)
@@ -507,6 +722,73 @@ impl Backend {
             Request::ProbeClaude => {
                 let probe = claude::probe(self.settings.claude_binary.as_deref()).await;
                 self.send(Response::ClaudeProbe(probe));
+            }
+            Request::WakeAgent { project, handle } => {
+                let p = self.project(project)?;
+                let actor = self.agent_actor(&p, &handle).await?;
+                let scheduler = self.scheduler(project)?;
+                scheduler.activate(actor, p.human.id, "woken from the Team view".into());
+                self.send(Response::Info(format!("Waking @{handle}")));
+            }
+            Request::StopAgent { project, handle } => {
+                let p = self.project(project)?;
+                let actor = self.agent_actor(&p, &handle).await?;
+                self.scheduler(project)?.stop(actor);
+                self.send(Response::Info(format!("Stopping @{handle}")));
+            }
+            Request::HaltAgent { project, handle } => {
+                let p = self.project(project)?;
+                let actor = self.agent_actor(&p, &handle).await?;
+                self.scheduler(project)?
+                    .halt(actor)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                push_board(&p, &self.tx, &self.ctx).await?;
+                self.send(Response::Info(format!("Halted @{handle}")));
+            }
+            Request::ResumeAgent { project, handle } => {
+                let p = self.project(project)?;
+                let actor = self.agent_actor(&p, &handle).await?;
+                self.scheduler(project)?
+                    .resume(actor)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                push_board(&p, &self.tx, &self.ctx).await?;
+                self.send(Response::Info(format!("Resumed @{handle}")));
+            }
+            Request::SetSchedulerPaused { project, paused } => {
+                let scheduler = self.scheduler(project)?;
+                scheduler.set_paused(paused);
+                self.send(Response::SchedulerPaused { project, paused });
+            }
+            Request::DecideApproval {
+                project,
+                id,
+                approve,
+            } => {
+                let p = self.project(project)?;
+                let bridge = self
+                    .bridge
+                    .clone()
+                    .ok_or_else(|| "the agent runtime is not available".to_string())?;
+                bridge
+                    .decide(p.store().as_ref(), id, approve, p.human.id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                push_approvals(&p, &self.tx, &self.ctx).await?;
+            }
+            Request::LoadRunEvents { project, run_id } => {
+                let p = self.project(project)?;
+                let events = p
+                    .store()
+                    .run_events(run_id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                self.send(Response::RunEvents {
+                    project,
+                    run_id,
+                    events,
+                });
             }
         }
         Ok(())
@@ -550,6 +832,14 @@ impl Backend {
             .map_err(|e| e.to_string())?;
         self.settings = settings.clone();
         self.runner = (self.runner_factory)(&self.settings);
+        if let Some(s) = &self.supervisor {
+            s.set_config(self.supervisor_config());
+        }
+        for w in self.watchers.values() {
+            if let Some(s) = &w.scheduler {
+                s.update_settings(self.settings.clone());
+            }
+        }
         self.send_settings();
 
         if human_changed {
@@ -581,6 +871,7 @@ impl Backend {
         });
         push_board(&p, &self.tx, &self.ctx).await?;
         push_inbox(&p, &self.tx, &self.ctx).await?;
+        push_approvals(&p, &self.tx, &self.ctx).await?;
         if !self.watchers.contains_key(&id) {
             let events = tokio::spawn(watch_events(p.clone(), self.tx.clone(), self.ctx.clone()));
             let (file_tx, file_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -592,15 +883,34 @@ impl Backend {
                 self.tx.clone(),
                 self.ctx.clone(),
             ));
+            let scheduler = self.supervisor.as_ref().map(|s| {
+                Scheduler::spawn(
+                    p.clone(),
+                    s.clone(),
+                    self.slots.clone(),
+                    self.settings.clone(),
+                )
+            });
             self.watchers.insert(
                 id,
                 ProjectWatchers {
                     events,
                     files,
                     _agent_watcher: agent_watcher,
+                    scheduler,
                 },
             );
         }
+        let paused = self
+            .watchers
+            .get(&id)
+            .and_then(|w| w.scheduler.as_ref())
+            .map(|s| s.paused())
+            .unwrap_or(true);
+        self.send(Response::SchedulerPaused {
+            project: id,
+            paused,
+        });
         Ok(())
     }
 
@@ -858,6 +1168,25 @@ async fn push_inbox(
     Ok(())
 }
 
+async fn push_approvals(
+    p: &OpenProject,
+    tx: &Sender<Response>,
+    ctx: &egui::Context,
+) -> Result<(), String> {
+    let items = p
+        .store()
+        .pending_approvals()
+        .await
+        .map_err(|e| e.to_string())?;
+    tx.send(Response::Approvals {
+        project: p.id(),
+        items,
+    })
+    .map_err(|_| "ui gone".to_string())?;
+    ctx.request_repaint();
+    Ok(())
+}
+
 async fn push_agent(
     p: &OpenProject,
     handle: &str,
@@ -879,7 +1208,7 @@ async fn push_agent(
         None
     };
     let memory = p.agents.read_memory(handle).map_err(|e| e.to_string())?;
-    let (inbox, retired_since, pending) = match &agent {
+    let (inbox, retired_since, pending, runs) = match &agent {
         Some(a) => {
             let pending = store
                 .pending_proposal(a.actor_id, UtilityKind::Refine)
@@ -894,13 +1223,18 @@ async fn push_agent(
                         original,
                     })
                 });
+            let runs = store
+                .runs_for_agent(a.actor_id, 20)
+                .await
+                .map_err(|e| e.to_string())?;
             (
                 load_inbox(p.store.as_ref(), a.actor_id, true).await?,
                 a.missing_since,
                 pending,
+                runs,
             )
         }
-        None => (Vec::new(), None, None),
+        None => (Vec::new(), None, None, Vec::new()),
     };
     tx.send(Response::AgentLoaded {
         project: p.id(),
@@ -910,6 +1244,7 @@ async fn push_agent(
         inbox,
         retired_since,
         pending,
+        runs,
     })
     .map_err(|_| "ui gone".to_string())?;
     ctx.request_repaint();
@@ -984,7 +1319,14 @@ mod tests {
             _ => unreachable!(),
         }
         match next(&resp_rx, |r| matches!(r, Response::Settings { .. })) {
-            Response::Settings { settings, .. } => assert_eq!(settings.human_handle, "me"),
+            Response::Settings {
+                settings,
+                bridge_addr,
+                ..
+            } => {
+                assert_eq!(settings.human_handle, "me");
+                assert!(bridge_addr.is_some(), "the bridge is listening");
+            }
             _ => unreachable!(),
         }
 
@@ -1016,6 +1358,23 @@ mod tests {
         };
         assert_eq!(columns.len(), 5);
         next(&resp_rx, |r| matches!(r, Response::Inbox { .. }));
+        match next(&resp_rx, |r| matches!(r, Response::SchedulerPaused { .. })) {
+            Response::SchedulerPaused { paused, .. } => assert!(!paused),
+            _ => unreachable!(),
+        }
+
+        // Pause the scheduler for the rest of the test so no run starts
+        // against a binary that is not there.
+        req_tx
+            .send(Request::SetSchedulerPaused {
+                project,
+                paused: true,
+            })
+            .unwrap();
+        match next(&resp_rx, |r| matches!(r, Response::SchedulerPaused { .. })) {
+            Response::SchedulerPaused { paused, .. } => assert!(paused),
+            _ => unreachable!(),
+        }
 
         // A mutation is not acknowledged directly; the watcher pushes a fresh board.
         req_tx
@@ -1121,10 +1480,12 @@ mod tests {
                 handle,
                 definition,
                 pending,
+                runs,
                 ..
             } => {
                 assert_eq!(handle, "backend");
                 assert!(pending.is_none());
+                assert!(runs.is_empty());
                 definition.unwrap()
             }
             _ => unreachable!(),
@@ -1231,6 +1592,28 @@ mod tests {
         next(
             &resp_rx,
             |r| matches!(r, Response::Board { board, .. } if board.agent_inbox_counts.get(&backend_id) == Some(&1)),
+        );
+
+        // Halting and resuming go through the scheduler and refresh the board.
+        req_tx
+            .send(Request::HaltAgent {
+                project,
+                handle: "backend".into(),
+            })
+            .unwrap();
+        next(
+            &resp_rx,
+            |r| matches!(r, Response::Board { board, .. } if board.agents[0].state == ak_core::agent::AgentState::Halted),
+        );
+        req_tx
+            .send(Request::ResumeAgent {
+                project,
+                handle: "backend".into(),
+            })
+            .unwrap();
+        next(
+            &resp_rx,
+            |r| matches!(r, Response::Board { board, .. } if board.agents[0].state == ak_core::agent::AgentState::Idle),
         );
 
         // Retiring deletes the file; the agent row stays, marked missing.

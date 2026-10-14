@@ -116,6 +116,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let project_name = app.project_name.clone();
     let probe = app.claude_probe.clone();
     let probing = app.probing;
+    let bridge_line = app
+        .bridge_addr
+        .clone()
+        .map(|a| format!("listening on {a}"))
+        .unwrap_or_else(|| "not running: agents cannot start".into());
     let editor = app.settings_editor.as_mut().expect("just created");
     let actions = &mut app.actions;
 
@@ -156,6 +161,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     if r.changed() {
                         editor.global_dirty = true;
                     }
+                    ui.end_row();
+
+                    ui.label("Agent bridge");
+                    ui.label(bridge_line.clone());
                     ui.end_row();
 
                     ui.label("Claude Code binary");

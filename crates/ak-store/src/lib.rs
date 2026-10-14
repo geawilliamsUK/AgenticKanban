@@ -23,6 +23,7 @@ use ak_core::config::ProjectPolicy;
 use ak_core::ids::{
     ActorId, ApprovalId, CallId, ColumnId, CommentId, NotificationId, RunId, TicketId,
 };
+use ak_core::run::{AgentRun, RunEvent};
 use ak_core::utility::{UtilityCall, UtilityKind};
 use ak_core::{Actor, Event, Notification, NotificationState, Timestamp};
 
@@ -166,6 +167,20 @@ pub trait Store: Send + Sync {
         state: ApprovalState,
         decided_by: Option<ActorId>,
     ) -> Result<Approval>;
+
+    // Agent runs and transcripts.
+
+    async fn insert_run(&self, run: &AgentRun) -> Result<()>;
+    async fn update_run(&self, run: &AgentRun) -> Result<()>;
+    async fn run(&self, id: RunId) -> Result<AgentRun>;
+    /// Newest first.
+    async fn runs_for_agent(&self, agent: ActorId, limit: u32) -> Result<Vec<AgentRun>>;
+    async fn active_runs(&self) -> Result<Vec<AgentRun>>;
+    async fn append_run_event(&self, event: &RunEvent) -> Result<()>;
+    async fn run_events(&self, run: RunId) -> Result<Vec<RunEvent>>;
+    /// Cost of runs started at or after `since`, for one agent or all.
+    async fn run_cost_since(&self, since: Timestamp, agent: Option<ActorId>) -> Result<f64>;
+    async fn set_agent_cooldown(&self, actor_id: ActorId, until: Option<Timestamp>) -> Result<()>;
 }
 
 pub type SharedStore = Arc<dyn Store>;

@@ -7,6 +7,7 @@ use ak_core::agent::Agent;
 use ak_core::board::{Column, Comment, Priority, Ticket};
 use ak_core::event::{Event, EventKind, MentionSource};
 use ak_core::ids::{ActorId, ColumnId, TicketId};
+use ak_core::run::{AgentRun, RunEvent};
 use ak_core::{Actor, ActorKind, Notification, NotificationKind};
 
 #[derive(Default, Clone)]
@@ -218,5 +219,31 @@ pub fn describe_event(event: &Event, board: &BoardModel) -> String {
                 key(source.ticket_id())
             )
         }
+    }
+}
+
+/// The run in progress, or the last one, for an agent: a bounded transcript
+/// for the live view.
+#[derive(Clone)]
+pub struct LiveRun {
+    pub run: AgentRun,
+    pub events: std::collections::VecDeque<RunEvent>,
+}
+
+impl LiveRun {
+    pub const CAP: usize = 300;
+
+    pub fn new(run: AgentRun) -> Self {
+        Self {
+            run,
+            events: std::collections::VecDeque::new(),
+        }
+    }
+
+    pub fn push(&mut self, event: RunEvent) {
+        if self.events.len() >= Self::CAP {
+            self.events.pop_front();
+        }
+        self.events.push_back(event);
     }
 }

@@ -7,15 +7,19 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc::UnboundedSender;
 
+use std::collections::HashMap;
+
+use ak_core::approval::Approval;
 use ak_core::config::{GlobalSettings, ProjectEntry, ProjectPolicy};
-use ak_core::ids::{ProjectId, TicketId};
+use ak_core::ids::{ActorId, ProjectId, RunId, TicketId};
+use ak_core::run::RunEvent;
 use ak_core::{Actor, NotificationState};
 use ak_runtime::{ClaudeCodeRunner, ClaudeProbe, HomePaths, ProjectRegistry, UtilityRunner};
 
 use crate::backend::{Backend, Request, Response, RunnerFactory};
 use crate::dialogs::{AddProjectDialog, NewTicketDialog};
 use crate::markdown::Markdown;
-use crate::model::{BoardModel, InboxItem, TicketDetail};
+use crate::model::{BoardModel, InboxItem, LiveRun, TicketDetail};
 use crate::settings_view::SettingsEditor;
 use crate::team_view::{AgentEditor, ProposalView, RefineStatus};
 use crate::ticket_view::TicketPanelState;
@@ -71,6 +75,14 @@ pub struct App {
     pub settings_editor: Option<SettingsEditor>,
     pub claude_probe: Option<ClaudeProbe>,
     pub probing: bool,
+    pub bridge_addr: Option<String>,
+
+    /// The run in progress or the last one, per agent.
+    pub live_runs: HashMap<ActorId, LiveRun>,
+    /// A transcript loaded on demand from the run history.
+    pub run_events: Option<(RunId, Vec<RunEvent>)>,
+    pub approvals: Vec<Approval>,
+    pub scheduler_paused: bool,
 
     pub new_ticket: Option<NewTicketDialog>,
     pub add_project: Option<AddProjectDialog>,
@@ -133,6 +145,11 @@ impl App {
             settings_editor: None,
             claude_probe: None,
             probing: false,
+            bridge_addr: None,
+            live_runs: HashMap::new(),
+            run_events: None,
+            approvals: Vec::new(),
+            scheduler_paused: true,
             new_ticket: None,
             add_project: None,
             remove_confirm: None,
@@ -215,9 +232,72 @@ impl App {
                 self.selected = None;
                 self.detail = None;
                 self.team = None;
+                self.live_runs.clear();
+                self.run_events = None;
+                self.approvals.clear();
                 self.ticket_panel = TicketPanelState::default();
                 if self.view != View::Settings {
                     self.view = View::Board;
+                }
+            }
+            Response::RunStarted { project, run } => {
+                if Some(project) == self.current {
+                    let handle = self.board.handle(run.agent_id);
+                    self.live_runs.insert(run.agent_id, LiveRun::new(run));
+                    self.toast(format!("{handle} started a run"), false);
+                }
+            }
+            Response::RunEvent { project, event } => {
+                if Some(project) == self.current {
+                    if let Some(live) = self
+                        .live_runs
+                        .values_mut()
+                        .find(|l| l.run.id == event.run_id)
+                    {
+                        live.push(event);
+                    }
+                }
+            }
+            Response::RunEnded { project, run } => {
+                if Some(project) == self.current {
+                    let handle = self.board.handle(run.agent_id);
+                    let label = run.exit_reason.map(|r| r.label()).unwrap_or("ended");
+                    let is_error =
+                        !matches!(run.exit_reason, Some(ak_core::run::ExitReason::Completed));
+                    match self.live_runs.get_mut(&run.agent_id) {
+                        Some(live) if live.run.id == run.id => live.run = run.clone(),
+                        _ => {
+                            self.live_runs
+                                .insert(run.agent_id, LiveRun::new(run.clone()));
+                        }
+                    }
+                    self.toast(format!("{handle}: run {label}"), is_error);
+                    if let Some(e) = self.team.as_mut() {
+                        if self.board.agent_by_handle(&e.handle).map(|a| a.actor_id)
+                            == Some(run.agent_id)
+                        {
+                            e.runs.insert(0, run);
+                        }
+                    }
+                }
+            }
+            Response::RunEvents {
+                project,
+                run_id,
+                events,
+            } => {
+                if Some(project) == self.current {
+                    self.run_events = Some((run_id, events));
+                }
+            }
+            Response::Approvals { project, items } => {
+                if Some(project) == self.current {
+                    self.approvals = items;
+                }
+            }
+            Response::SchedulerPaused { project, paused } => {
+                if Some(project) == self.current {
+                    self.scheduler_paused = paused;
                 }
             }
             Response::ProjectPolicy { project, policy } => {
@@ -228,8 +308,10 @@ impl App {
             Response::Settings {
                 settings,
                 runner_description,
+                bridge_addr,
             } => {
                 self.runner_description = runner_description;
+                self.bridge_addr = bridge_addr;
                 if let Some(e) = self.settings_editor.as_mut() {
                     e.refresh_global(&settings);
                 }
@@ -247,6 +329,7 @@ impl App {
                 inbox,
                 retired_since,
                 pending,
+                runs,
             } => {
                 if Some(project) != self.current {
                     return;
@@ -266,6 +349,7 @@ impl App {
                         definition,
                         memory,
                         inbox,
+                        runs,
                         retired_since,
                         pending,
                     ));
@@ -467,8 +551,10 @@ impl App {
             {
                 self.actions.push(Action::SwitchView(View::Board));
             }
-            let unread = self.unread_count();
-            let label = if unread > 0 {
+            let unread = self.unread_count() + self.approvals.len();
+            let label = if !self.approvals.is_empty() {
+                format!("Inbox  ({unread}) ⚠")
+            } else if unread > 0 {
                 format!("Inbox  ({unread})")
             } else {
                 "Inbox".to_string()

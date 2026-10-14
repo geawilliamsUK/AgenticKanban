@@ -21,6 +21,7 @@ use ak_core::config::ProjectPolicy;
 use ak_core::event::{EventKind, MentionSource};
 use ak_core::ids::*;
 use ak_core::notification::{self, RoutingContext};
+use ak_core::run::{AgentRun, RunEvent};
 use ak_core::utility::{UtilityCall, UtilityKind};
 use ak_core::{Actor, ActorKind, Event, Notification, NotificationState, Timestamp};
 
@@ -1008,5 +1009,135 @@ impl Store for SqliteStore {
             };
         }
         self.approval(id).await
+    }
+
+    async fn insert_run(&self, run: &AgentRun) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO runs (id, agent_actor_id, trigger, claude_session_id, workspace_path, \
+             started_at, ended_at, exit_reason, num_turns, input_tokens, output_tokens, cost_usd, \
+             error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(run.id.to_string())
+        .bind(run.agent_id.to_string())
+        .bind(serde_json::to_string(&run.trigger)?)
+        .bind(&run.claude_session_id)
+        .bind(run.workspace_path.to_string_lossy().to_string())
+        .bind(fmt_ts(&run.started_at))
+        .bind(run.ended_at.as_ref().map(fmt_ts))
+        .bind(run.exit_reason.map(|r| r.as_str()))
+        .bind(run.num_turns as i64)
+        .bind(run.input_tokens as i64)
+        .bind(run.output_tokens as i64)
+        .bind(run.cost_usd)
+        .bind(&run.error)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn update_run(&self, run: &AgentRun) -> Result<()> {
+        let result = sqlx::query(
+            "UPDATE runs SET claude_session_id = ?, ended_at = ?, exit_reason = ?, num_turns = ?, \
+             input_tokens = ?, output_tokens = ?, cost_usd = ?, error = ? WHERE id = ?",
+        )
+        .bind(&run.claude_session_id)
+        .bind(run.ended_at.as_ref().map(fmt_ts))
+        .bind(run.exit_reason.map(|r| r.as_str()))
+        .bind(run.num_turns as i64)
+        .bind(run.input_tokens as i64)
+        .bind(run.output_tokens as i64)
+        .bind(run.cost_usd)
+        .bind(&run.error)
+        .bind(run.id.to_string())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::not_found(format!("run {}", run.id)));
+        }
+        Ok(())
+    }
+
+    async fn run(&self, id: RunId) -> Result<AgentRun> {
+        let row = sqlx::query("SELECT * FROM runs WHERE id = ?")
+            .bind(id.to_string())
+            .fetch_optional(&self.pool)
+            .await?
+            .ok_or_else(|| StoreError::not_found(format!("run {id}")))?;
+        run_from_row(&row)
+    }
+
+    async fn runs_for_agent(&self, agent: ActorId, limit: u32) -> Result<Vec<AgentRun>> {
+        let rows = sqlx::query(
+            "SELECT * FROM runs WHERE agent_actor_id = ? ORDER BY started_at DESC LIMIT ?",
+        )
+        .bind(agent.to_string())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(run_from_row).collect()
+    }
+
+    async fn active_runs(&self) -> Result<Vec<AgentRun>> {
+        let rows = sqlx::query("SELECT * FROM runs WHERE ended_at IS NULL ORDER BY started_at")
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(run_from_row).collect()
+    }
+
+    async fn append_run_event(&self, event: &RunEvent) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO run_events (run_id, seq, at, kind, payload) VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(event.run_id.to_string())
+        .bind(event.seq)
+        .bind(fmt_ts(&event.at))
+        .bind(event.kind.as_str())
+        .bind(serde_json::to_string(&event.payload)?)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn run_events(&self, run: RunId) -> Result<Vec<RunEvent>> {
+        let rows = sqlx::query("SELECT * FROM run_events WHERE run_id = ? ORDER BY seq")
+            .bind(run.to_string())
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(run_event_from_row).collect()
+    }
+
+    async fn run_cost_since(&self, since: Timestamp, agent: Option<ActorId>) -> Result<f64> {
+        let row =
+            match agent {
+                Some(a) => {
+                    sqlx::query(
+                        "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM runs \
+                     WHERE started_at >= ? AND agent_actor_id = ?",
+                    )
+                    .bind(fmt_ts(&since))
+                    .bind(a.to_string())
+                    .fetch_one(&self.pool)
+                    .await?
+                }
+                None => sqlx::query(
+                    "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM runs WHERE started_at >= ?",
+                )
+                .bind(fmt_ts(&since))
+                .fetch_one(&self.pool)
+                .await?,
+            };
+        Ok(sqlx::Row::try_get(&row, "total")?)
+    }
+
+    async fn set_agent_cooldown(&self, actor_id: ActorId, until: Option<Timestamp>) -> Result<()> {
+        let result = sqlx::query("UPDATE agents SET cooldown_until = ? WHERE actor_id = ?")
+            .bind(until.as_ref().map(fmt_ts))
+            .bind(actor_id.to_string())
+            .execute(&self.pool)
+            .await?;
+        if result.rows_affected() == 0 {
+            return Err(StoreError::not_found(format!("agent {actor_id}")));
+        }
+        Ok(())
     }
 }

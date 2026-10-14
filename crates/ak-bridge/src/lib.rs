@@ -176,7 +176,7 @@ impl Bridge {
     /// Records the human's decision and releases the waiting hook, if any.
     pub async fn decide(
         &self,
-        ctx: &RunContext,
+        store: &dyn ak_store::Store,
         id: ApprovalId,
         approved: bool,
         by: ActorId,
@@ -186,11 +186,7 @@ impl Bridge {
         } else {
             ApprovalState::Denied
         };
-        let approval = ctx
-            .project
-            .store()
-            .decide_approval(id, state, Some(by))
-            .await?;
+        let approval = store.decide_approval(id, state, Some(by)).await?;
         if let Some(tx) = self.inner.waiting.lock().expect("waiting lock").remove(&id) {
             let _ = tx.send(state);
         }

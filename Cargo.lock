@@ -118,9 +118,11 @@ checksum = "320119579fcad9c21884f5c4861d16174d0e06250625266f50fe6898340abefa"
 name = "agentic-kanban"
 version = "0.1.0"
 dependencies = [
+ "ak-bridge",
  "ak-core",
  "ak-runtime",
  "ak-store",
+ "ak-supervisor",
  "anyhow",
  "chrono",
  "eframe",
@@ -128,6 +130,7 @@ dependencies = [
  "egui_commonmark",
  "egui_extras",
  "rfd",
+ "serde_json",
  "similar",
  "tempfile",
  "tokio",
@@ -223,6 +226,24 @@ dependencies = [
  "serde",
  "serde_json",
  "sqlx",
+ "tempfile",
+ "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
+name = "ak-supervisor"
+version = "0.1.0"
+dependencies = [
+ "ak-bridge",
+ "ak-core",
+ "ak-runtime",
+ "ak-store",
+ "chrono",
+ "serde",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.21",
  "tokio",
