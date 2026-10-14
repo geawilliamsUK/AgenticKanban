@@ -143,6 +143,12 @@ pub trait Store: Send + Sync {
         agent_id: ActorId,
         kind: UtilityKind,
     ) -> Result<Option<UtilityCall>>;
+    /// Every call for the agent that still awaits a decision, newest first.
+    async fn pending_proposals(
+        &self,
+        agent_id: ActorId,
+        kind: UtilityKind,
+    ) -> Result<Vec<UtilityCall>>;
     /// Total recorded cost of calls started at or after `since`.
     async fn utility_cost_since(&self, since: Timestamp) -> Result<f64>;
 

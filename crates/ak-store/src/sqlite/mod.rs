@@ -905,6 +905,21 @@ impl Store for SqliteStore {
         row.as_ref().map(utility_call_from_row).transpose()
     }
 
+    async fn pending_proposals(
+        &self,
+        agent_id: ActorId,
+        kind: UtilityKind,
+    ) -> Result<Vec<UtilityCall>> {
+        let rows = sqlx::query(
+            "SELECT * FROM utility_calls WHERE agent_actor_id = ? AND kind = ? \n             AND state = 'proposed' ORDER BY started_at DESC",
+        )
+        .bind(agent_id.to_string())
+        .bind(kind.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(utility_call_from_row).collect()
+    }
+
     async fn utility_cost_since(&self, since: Timestamp) -> Result<f64> {
         let row = sqlx::query(
             "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM utility_calls WHERE started_at >= ?",

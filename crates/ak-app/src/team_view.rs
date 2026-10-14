@@ -35,6 +35,64 @@ impl ProposalView {
     }
 }
 
+/// Integrate in progress or awaiting review: one proposal per target agent.
+#[derive(Default)]
+pub struct IntegrateState {
+    /// The targets on offer with their checkboxes, while the picker is open.
+    pub picker: Option<Vec<(String, bool)>>,
+    pub running: Vec<String>,
+    pub since: Option<Instant>,
+    pub proposals: Vec<IntegrationView>,
+    pub failures: Vec<(String, String)>,
+}
+
+pub struct IntegrationView {
+    pub target: String,
+    pub view: ProposalView,
+}
+
+impl IntegrateState {
+    pub fn from_pending(pending: Vec<(String, PendingProposal)>) -> Self {
+        Self {
+            proposals: pending
+                .into_iter()
+                .map(|(target, p)| IntegrationView {
+                    target,
+                    view: ProposalView::new(p),
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    pub fn start(&mut self, targets: Vec<String>) {
+        self.running = targets;
+        self.since = Some(Instant::now());
+        self.failures.clear();
+        self.picker = None;
+    }
+
+    pub fn propose(&mut self, target: String, proposal: PendingProposal) {
+        self.running.retain(|t| t != &target);
+        self.proposals.retain(|v| v.target != target);
+        self.proposals.push(IntegrationView {
+            target,
+            view: ProposalView::new(proposal),
+        });
+        if self.running.is_empty() {
+            self.since = None;
+        }
+    }
+
+    pub fn fail(&mut self, target: String, error: String) {
+        self.running.retain(|t| t != &target);
+        self.failures.push((target, error));
+        if self.running.is_empty() {
+            self.since = None;
+        }
+    }
+}
+
 /// Editor state for one agent. Built from a loaded definition, or from the
 /// template for a new one.
 pub struct AgentEditor {
@@ -58,6 +116,7 @@ pub struct AgentEditor {
     pub dirty: bool,
     pub confirm_retire: bool,
     pub refine: RefineStatus,
+    pub integrate: IntegrateState,
 }
 
 impl AgentEditor {
@@ -71,6 +130,7 @@ impl AgentEditor {
             Vec::new(),
             None,
             None,
+            Vec::new(),
         );
         editor.is_new = true;
         editor.loaded = true;
@@ -88,11 +148,13 @@ impl AgentEditor {
             Vec::new(),
             None,
             None,
+            Vec::new(),
         );
         editor.loaded = false;
         editor
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn from_definition(
         handle: &str,
         definition: Option<AgentDefinition>,
@@ -101,6 +163,7 @@ impl AgentEditor {
         runs: Vec<AgentRun>,
         retired_since: Option<Timestamp>,
         pending: Option<PendingProposal>,
+        integrations: Vec<(String, PendingProposal)>,
     ) -> Self {
         let def = definition.unwrap_or_else(|| AgentDefinition::template(handle, ""));
         let budgets = def.frontmatter.budgets.clone().unwrap_or_default();
@@ -129,6 +192,7 @@ impl AgentEditor {
                 Some(p) => RefineStatus::Proposed(ProposalView::new(p)),
                 None => RefineStatus::Idle,
             },
+            integrate: IntegrateState::from_pending(integrations),
         }
     }
 
@@ -334,6 +398,16 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
         .as_ref()
         .and_then(|a| app.live_runs.get(&a.actor_id).cloned());
     let run_events = app.run_events.clone();
+    let selected_handle = app
+        .team
+        .as_ref()
+        .map(|e| e.handle.clone())
+        .unwrap_or_default();
+    let others: Vec<String> = board
+        .active_agents()
+        .map(|a| a.handle.clone())
+        .filter(|h| *h != selected_handle)
+        .collect();
     let Some(editor) = app.team.as_mut() else {
         return;
     };
@@ -500,6 +574,7 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
         .show(ui, |ui| {
             draw_runs(ui, editor, &live, &run_events, actions, project);
             draw_refine_panel(ui, editor, actions, project, &runner_description);
+            draw_integrate_panel(ui, editor, actions, project, &runner_description);
 
             ui.add_enabled_ui(editable, |ui| {
                 egui::Grid::new("agent_fields")
@@ -591,10 +666,32 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
                     ui.label(egui::RichText::new("Definition").strong());
                     ui.weak("markdown, Claude Code subagent format");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        ui.add_enabled(false, egui::Button::new("Integrate"))
-                            .on_disabled_hover_text(
-                                "Coming next: updates the rest of the team about this agent.",
-                            );
+                        let busy = !editor.integrate.running.is_empty();
+                        let can_integrate = !editor.is_new
+                            && !editor.dirty
+                            && editor.retired_since.is_none()
+                            && !busy
+                            && !others.is_empty();
+                        let why_not = if editor.dirty {
+                            "Save first."
+                        } else if busy {
+                            "Integrate is running."
+                        } else {
+                            "Needs a saved agent and at least one teammate."
+                        };
+                        if ui
+                            .add_enabled(can_integrate, egui::Button::new("Integrate"))
+                            .on_hover_text(
+                                "Proposes an edit to each teammate's definition about this agent, and a Team section for this agent. One Claude Code call per teammate; each proposal is reviewed on its own.",
+                            )
+                            .on_disabled_hover_text(why_not)
+                            .clicked()
+                        {
+                            let mut list: Vec<(String, bool)> =
+                                others.iter().map(|h| (h.clone(), true)).collect();
+                            list.push((editor.handle.clone(), true));
+                            editor.integrate.picker = Some(list);
+                        }
                         let can_refine = matches!(
                             editor.refine,
                             RefineStatus::Idle | RefineStatus::Failed(_)
@@ -942,4 +1039,197 @@ enum Decision {
     AcceptSave,
     AcceptEdit,
     Reject,
+}
+
+/// The target picker, the running strip, failures, and one review per
+/// proposal.
+fn draw_integrate_panel(
+    ui: &mut egui::Ui,
+    editor: &mut AgentEditor,
+    actions: &mut Vec<Action>,
+    project: ak_core::ids::ProjectId,
+    runner_description: &str,
+) {
+    let red = egui::Color32::from_rgb(220, 80, 80);
+    let own = editor.handle.clone();
+
+    // Picker.
+    let mut send: Option<Vec<String>> = None;
+    let mut close = false;
+    if let Some(list) = editor.integrate.picker.as_mut() {
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(30, 45, 60))
+            .corner_radius(4.0)
+            .inner_margin(10.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.label(egui::RichText::new("Integrate with").strong());
+                ui.weak("Each chosen teammate gets a proposed edit about this agent. Choosing this agent itself rewrites its Team section from the roster.");
+                for (handle, on) in list.iter_mut() {
+                    let label = if *handle == own {
+                        format!("@{handle} (its own Team section)")
+                    } else {
+                        format!("@{handle}")
+                    };
+                    ui.checkbox(on, label);
+                }
+                ui.horizontal(|ui| {
+                    let chosen: Vec<String> = list
+                        .iter()
+                        .filter(|(_, on)| *on)
+                        .map(|(h, _)| h.clone())
+                        .collect();
+                    if ui
+                        .add_enabled(
+                            !chosen.is_empty(),
+                            egui::Button::new(format!("Integrate {} agent(s)", chosen.len())),
+                        )
+                        .on_hover_text(runner_description)
+                        .clicked()
+                    {
+                        send = Some(chosen);
+                    }
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                });
+            });
+        ui.add_space(8.0);
+    }
+    if let Some(targets) = send {
+        editor.integrate.start(targets.clone());
+        actions.push(Action::Request(Request::Integrate {
+            project,
+            handle: own.clone(),
+            targets,
+        }));
+    }
+    if close {
+        editor.integrate.picker = None;
+    }
+
+    // Progress and failures.
+    if !editor.integrate.running.is_empty() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            let secs = editor
+                .integrate
+                .since
+                .map(|s| s.elapsed().as_secs())
+                .unwrap_or(0);
+            let names: Vec<String> = editor
+                .integrate
+                .running
+                .iter()
+                .map(|h| format!("@{h}"))
+                .collect();
+            ui.label(format!("Integrating with {}… {secs}s", names.join(", ")));
+        });
+        ui.ctx()
+            .request_repaint_after(std::time::Duration::from_millis(500));
+        ui.add_space(6.0);
+    }
+    for (target, error) in &editor.integrate.failures {
+        ui.horizontal_wrapped(|ui| {
+            ui.colored_label(red, format!("Integrate @{target} failed:"));
+            ui.label(error);
+        });
+    }
+    if !editor.integrate.failures.is_empty() {
+        ui.add_space(6.0);
+    }
+
+    // Proposals.
+    if editor.integrate.proposals.is_empty() {
+        return;
+    }
+    let count = editor.integrate.proposals.len();
+    let mut decisions: Vec<(usize, Decision)> = Vec::new();
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(format!("Integrate proposals ({count})")).strong());
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if ui.small_button("Discard all").clicked() {
+                decisions.extend((0..count).map(|i| (i, Decision::Reject)));
+            }
+            if ui.small_button("Accept all and save").clicked() {
+                decisions.extend((0..count).map(|i| (i, Decision::AcceptSave)));
+            }
+        });
+    });
+    for (i, item) in editor.integrate.proposals.iter().enumerate() {
+        let pending = &item.view.pending;
+        egui::Frame::new()
+            .fill(egui::Color32::from_rgb(30, 45, 60))
+            .corner_radius(4.0)
+            .inner_margin(10.0)
+            .show(ui, |ui| {
+                ui.set_width(ui.available_width());
+                ui.horizontal(|ui| {
+                    let what = if item.target == own {
+                        format!("@{}: its own Team section", item.target)
+                    } else {
+                        format!("@{}", item.target)
+                    };
+                    ui.label(egui::RichText::new(what).strong());
+                    if let Some(cost) = pending.call.cost_usd {
+                        ui.weak(format!("${cost:.3}"));
+                    }
+                    if let Some(model) = &pending.call.model {
+                        ui.weak(model);
+                    }
+                    ui.weak(format_time(&pending.call.started_at));
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.button("Discard").clicked() {
+                            decisions.push((i, Decision::Reject));
+                        }
+                        if ui
+                            .button("Accept and save")
+                            .on_hover_text("Writes the proposed definition to that agent's file.")
+                            .clicked()
+                        {
+                            decisions.push((i, Decision::AcceptSave));
+                        }
+                    });
+                });
+                for w in &pending.call.warnings {
+                    ui.colored_label(egui::Color32::from_rgb(230, 190, 80), format!("Note: {w}"));
+                }
+                ui.add_space(4.0);
+                crate::diff_view::draw(
+                    ui,
+                    &format!("integrate_diff_{}", item.target),
+                    &pending.original,
+                    &item.view.proposed_text,
+                );
+            });
+        ui.add_space(6.0);
+    }
+
+    // Apply from the highest index down so removals keep the rest valid.
+    decisions.sort_by_key(|d| std::cmp::Reverse(d.0));
+    decisions.dedup_by(|a, b| a.0 == b.0);
+    for (i, d) in decisions {
+        if i >= editor.integrate.proposals.len() {
+            continue;
+        }
+        let item = editor.integrate.proposals.remove(i);
+        let pending = item.view.pending;
+        match d {
+            Decision::AcceptSave | Decision::AcceptEdit => {
+                actions.push(Action::Request(Request::AcceptProposal {
+                    project,
+                    call_id: pending.call.id,
+                    definition: pending.proposed,
+                    save: true,
+                }));
+            }
+            Decision::Reject => {
+                actions.push(Action::Request(Request::RejectProposal {
+                    project,
+                    call_id: pending.call.id,
+                    handle: own.clone(),
+                }));
+            }
+        }
+    }
 }

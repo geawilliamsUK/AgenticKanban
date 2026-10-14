@@ -30,7 +30,7 @@ use ak_core::run::{AgentRun, RunEvent};
 use ak_core::utility::{UtilityCall, UtilityKind, UtilityState};
 use ak_core::{Actor, ActorKind, Event, NotificationState, Timestamp};
 use ak_runtime::agents::{self, AgentWatcher};
-use ak_runtime::authoring::{self, RosterEntry};
+use ak_runtime::authoring::{self, RosterEntry, TeamMember};
 use ak_runtime::claude::{self, ClaudeProbe};
 use ak_runtime::{OpenProject, ProjectRegistry, RuntimeError, UtilityRunner};
 use ak_store::Store;
@@ -135,6 +135,13 @@ pub enum Request {
         call_id: CallId,
         handle: String,
     },
+    /// Runs Integrate for a saved agent against the chosen teammates. The
+    /// agent's own handle among the targets means its Team section.
+    Integrate {
+        project: ProjectId,
+        handle: String,
+        targets: Vec<String>,
+    },
     SaveGlobalSettings(GlobalSettings),
     SaveProjectPolicy {
         project: ProjectId,
@@ -223,6 +230,8 @@ pub enum Response {
         retired_since: Option<Timestamp>,
         pending: Option<PendingProposal>,
         runs: Vec<AgentRun>,
+        /// Pending Integrate proposals this agent authored, by target handle.
+        integrations: Vec<(String, PendingProposal)>,
     },
     RefineStarted {
         project: ProjectId,
@@ -236,6 +245,23 @@ pub enum Response {
     RefineFailed {
         project: ProjectId,
         handle: String,
+        error: String,
+    },
+    IntegrateStarted {
+        project: ProjectId,
+        handle: String,
+        targets: Vec<String>,
+    },
+    IntegrateProposal {
+        project: ProjectId,
+        handle: String,
+        target: String,
+        proposal: PendingProposal,
+    },
+    IntegrateFailed {
+        project: ProjectId,
+        handle: String,
+        target: String,
         error: String,
     },
     RunStarted {
@@ -301,6 +327,7 @@ pub struct Backend {
     bridge: Option<Bridge>,
     supervisor: Option<Arc<Supervisor>>,
     slots: Arc<Semaphore>,
+    utility_slots: Arc<Semaphore>,
     internal_tx: UnboundedSender<Internal>,
     internal_rx: UnboundedReceiver<Internal>,
 }
@@ -316,6 +343,9 @@ impl Backend {
         let settings = registry.config().settings.clone();
         let runner = runner_factory(&settings);
         let slots = Arc::new(Semaphore::new(settings.max_concurrent_runs.max(1) as usize));
+        let utility_slots = Arc::new(Semaphore::new(
+            settings.max_concurrent_utility_calls.max(1) as usize
+        ));
         let (internal_tx, internal_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             registry,
@@ -329,6 +359,7 @@ impl Backend {
             bridge: None,
             supervisor: None,
             slots,
+            utility_slots,
             internal_tx,
             internal_rx,
         }
@@ -650,6 +681,14 @@ impl Backend {
                 push_agent(&p, &handle, &self.tx, &self.ctx).await?;
                 self.send(Response::Info(format!("Retired @{handle}")));
             }
+            Request::Integrate {
+                project,
+                handle,
+                targets,
+            } => {
+                let p = self.project(project)?;
+                self.start_integrate(p, handle, targets).await?;
+            }
             Request::Refine { project, draft } => {
                 let p = self.project(project)?;
                 self.start_refine(p, draft).await?;
@@ -832,6 +871,9 @@ impl Backend {
             .map_err(|e| e.to_string())?;
         self.settings = settings.clone();
         self.runner = (self.runner_factory)(&self.settings);
+        self.utility_slots = Arc::new(Semaphore::new(
+            self.settings.max_concurrent_utility_calls.max(1) as usize,
+        ));
         if let Some(s) = &self.supervisor {
             s.set_config(self.supervisor_config());
         }
@@ -914,6 +956,152 @@ impl Backend {
         Ok(())
     }
 
+    /// Refuses a utility call once today's spend has reached the global cap.
+    async fn check_utility_budget(&self, store: &dyn Store) -> Result<(), String> {
+        let since_midnight = Utc::now()
+            .date_naive()
+            .and_hms_opt(0, 0, 0)
+            .map(|t| t.and_utc())
+            .unwrap_or_else(Utc::now);
+        let spent = store
+            .utility_cost_since(since_midnight)
+            .await
+            .map_err(|e| e.to_string())?;
+        let limit = self.settings.global_daily_budget_usd;
+        if spent >= limit {
+            return Err(RuntimeError::BudgetExceeded { limit, spent }.to_string());
+        }
+        Ok(())
+    }
+
+    /// One call per target, in parallel under the utility cap. Each answer
+    /// arrives as its own proposal; the call row is recorded first.
+    async fn start_integrate(
+        &self,
+        p: Arc<OpenProject>,
+        handle: String,
+        targets: Vec<String>,
+    ) -> Result<(), String> {
+        if targets.is_empty() {
+            return Err("pick at least one agent to integrate with".into());
+        }
+        let store = p.store();
+        let source = store
+            .agent_by_handle(&handle)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("no agent @{handle}"))?;
+        let changed = p
+            .agents
+            .read_definition(&handle)
+            .map_err(|e| e.to_string())?;
+        self.check_utility_budget(store.as_ref()).await?;
+
+        // The roster comes from the files: descriptions and contracts.
+        let mut team = Vec::new();
+        let mut defs: HashMap<String, (ak_core::agent::Agent, AgentDefinition)> = HashMap::new();
+        for a in store.agents().await.map_err(|e| e.to_string())? {
+            if a.is_retired() {
+                continue;
+            }
+            match p.agents.read_definition(&a.handle) {
+                Ok(d) => {
+                    team.push(TeamMember::from_definition(&d));
+                    defs.insert(a.handle.clone(), (a, d));
+                }
+                Err(e) => tracing::warn!(handle = %a.handle, "definition skipped: {e}"),
+            }
+        }
+        let model = p
+            .policy()
+            .authoring_model
+            .clone()
+            .or_else(|| self.settings.authoring_model.clone());
+
+        let mut started = Vec::new();
+        let mut jobs = Vec::new();
+        for target in targets {
+            let Some((agent, def)) = defs.get(&target) else {
+                return Err(format!("no agent @{target} to integrate with"));
+            };
+            let call = UtilityCall::start(
+                UtilityKind::Integrate,
+                source.actor_id,
+                Some(agent.actor_id),
+                model.clone(),
+                Utc::now(),
+            );
+            store
+                .insert_utility_call(&call)
+                .await
+                .map_err(|e| e.to_string())?;
+            let request = authoring::integrate_request(&changed, def, &team, model.clone());
+            started.push(target.clone());
+            jobs.push((target, def.clone(), call, request));
+        }
+        self.send(Response::IntegrateStarted {
+            project: p.id(),
+            handle: handle.clone(),
+            targets: started,
+        });
+
+        for (target, def, mut call, request) in jobs {
+            let runner = self.runner.clone();
+            let slots = self.utility_slots.clone();
+            let tx = self.tx.clone();
+            let ctx = self.ctx.clone();
+            let p = p.clone();
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                let _permit = slots.acquire_owned().await.ok();
+                let outcome = runner.call(request).await.and_then(|out| {
+                    authoring::apply_integrate(&def, &out.text).map(|prop| (prop, out.cost_usd))
+                });
+                let now = Utc::now();
+                let project = p.id();
+                let response = match outcome {
+                    Ok((proposal, cost)) => {
+                        call.propose(
+                            proposal.definition.render(),
+                            proposal.warnings.clone(),
+                            cost,
+                            now,
+                        );
+                        if let Err(e) = p.store().update_utility_call(&call).await {
+                            tracing::warn!("could not record proposal: {e}");
+                        }
+                        Response::IntegrateProposal {
+                            project,
+                            handle,
+                            target,
+                            proposal: PendingProposal {
+                                call,
+                                proposed: proposal.definition,
+                                original: def.render(),
+                            },
+                        }
+                    }
+                    Err(e) => {
+                        call.fail(e.to_string(), None, now);
+                        if let Err(e) = p.store().update_utility_call(&call).await {
+                            tracing::warn!("could not record failure: {e}");
+                        }
+                        Response::IntegrateFailed {
+                            project,
+                            handle,
+                            target,
+                            error: e.to_string(),
+                        }
+                    }
+                };
+                if tx.send(response).is_ok() {
+                    ctx.request_repaint();
+                }
+            });
+        }
+        Ok(())
+    }
+
     /// Records the call, answers immediately, and runs the model call in its
     /// own task so the loop stays responsive.
     async fn start_refine(
@@ -942,19 +1130,7 @@ impl Backend {
             }
         };
 
-        let since_midnight = Utc::now()
-            .date_naive()
-            .and_hms_opt(0, 0, 0)
-            .map(|t| t.and_utc())
-            .unwrap_or_else(Utc::now);
-        let spent = store
-            .utility_cost_since(since_midnight)
-            .await
-            .map_err(|e| e.to_string())?;
-        let limit = self.settings.global_daily_budget_usd;
-        if spent >= limit {
-            return Err(RuntimeError::BudgetExceeded { limit, spent }.to_string());
-        }
+        self.check_utility_budget(store.as_ref()).await?;
 
         // Project override, then the global setting, then Claude Code's own default.
         let model = p
@@ -1187,6 +1363,53 @@ async fn push_approvals(
     Ok(())
 }
 
+/// Pending Integrate proposals this agent authored, with each target's
+/// handle and current file. Retired targets and unparseable proposals are
+/// skipped.
+async fn load_integrations(
+    p: &OpenProject,
+    source: ActorId,
+) -> Result<Vec<(String, PendingProposal)>, String> {
+    let store = p.store();
+    let mut out = Vec::new();
+    for call in store
+        .pending_proposals(source, UtilityKind::Integrate)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        let Some(target_id) = call.target_id else {
+            continue;
+        };
+        let Ok(target) = store.agent(target_id).await else {
+            continue;
+        };
+        if target.is_retired() {
+            continue;
+        }
+        let Some(proposed) = call
+            .proposal
+            .as_deref()
+            .and_then(|t| AgentDefinition::parse(t).ok())
+        else {
+            continue;
+        };
+        let original = p
+            .agents
+            .read_definition(&target.handle)
+            .map(|d| d.render())
+            .unwrap_or_default();
+        out.push((
+            target.handle.clone(),
+            PendingProposal {
+                call,
+                proposed,
+                original,
+            },
+        ));
+    }
+    Ok(out)
+}
+
 async fn push_agent(
     p: &OpenProject,
     handle: &str,
@@ -1208,7 +1431,7 @@ async fn push_agent(
         None
     };
     let memory = p.agents.read_memory(handle).map_err(|e| e.to_string())?;
-    let (inbox, retired_since, pending, runs) = match &agent {
+    let (inbox, retired_since, pending, runs, integrations) = match &agent {
         Some(a) => {
             let pending = store
                 .pending_proposal(a.actor_id, UtilityKind::Refine)
@@ -1227,14 +1450,16 @@ async fn push_agent(
                 .runs_for_agent(a.actor_id, 20)
                 .await
                 .map_err(|e| e.to_string())?;
+            let integrations = load_integrations(p, a.actor_id).await?;
             (
                 load_inbox(p.store.as_ref(), a.actor_id, true).await?,
                 a.missing_since,
                 pending,
                 runs,
+                integrations,
             )
         }
-        None => (Vec::new(), None, None, Vec::new()),
+        None => (Vec::new(), None, None, Vec::new(), Vec::new()),
     };
     tx.send(Response::AgentLoaded {
         project: p.id(),
@@ -1245,6 +1470,7 @@ async fn push_agent(
         retired_since,
         pending,
         runs,
+        integrations,
     })
     .map_err(|_| "ui gone".to_string())?;
     ctx.request_repaint();
@@ -1279,16 +1505,43 @@ mod tests {
     fn fake_factory() -> RunnerFactory {
         Box::new(|_settings| {
             Arc::new(FakeRunner::new(|req| {
-                let marker = "# Draft definition file to refine\n\n";
-                let start = req.input.find(marker).ok_or("no draft in input")? + marker.len();
-                let draft =
+                // The last file in the input is the one to rewrite: the draft
+                // for Refine, the target for Integrate.
+                let start = req
+                    .input
+                    .rfind(
+                        "---
+name:",
+                    )
+                    .ok_or("no definition in input")?;
+                let base =
                     AgentDefinition::parse(&req.input[start..]).map_err(|e| e.to_string())?;
-                let mut refined = draft;
-                refined.frontmatter.description = format!(
-                    "Refined description. model={}",
-                    req.model.clone().unwrap_or_default()
-                );
-                refined.body = "# refined body\n\n**You own:** everything\n".into();
+                let mut refined = base;
+                if req.instruction.contains("target") {
+                    let changed = req
+                        .label
+                        .split_whitespace()
+                        .nth(1)
+                        .unwrap_or("@?")
+                        .to_string();
+                    refined.body.push_str(&format!(
+                        "
+## Team
+
+- **{changed}**: integrated by the fake.
+"
+                    ));
+                } else {
+                    refined.frontmatter.description = format!(
+                        "Refined description. model={}",
+                        req.model.clone().unwrap_or_default()
+                    );
+                    refined.body = "# refined body
+
+**You own:** everything
+"
+                    .into();
+                }
                 Ok(format!("```markdown\n{}\n```", refined.render()))
             }))
         })
@@ -1546,6 +1799,101 @@ mod tests {
             |r| matches!(r, Response::AgentLoaded { definition: Some(d), .. } if d.frontmatter.description.starts_with("Refined description.")),
         ) {
             Response::AgentLoaded { pending, .. } => assert!(pending.is_none()),
+            _ => unreachable!(),
+        }
+
+        // Integrate: one proposal per chosen target, including the agent's own
+        // Team section, each reviewed on its own.
+        req_tx
+            .send(Request::SaveAgent {
+                project,
+                definition: AgentDefinition::template("frontend", "Frontend developer"),
+            })
+            .unwrap();
+        next(
+            &resp_rx,
+            |r| matches!(r, Response::AgentLoaded { handle, .. } if handle == "frontend"),
+        );
+        req_tx
+            .send(Request::Integrate {
+                project,
+                handle: "backend".into(),
+                targets: vec!["frontend".into(), "backend".into()],
+            })
+            .unwrap();
+        match next(&resp_rx, |r| matches!(r, Response::IntegrateStarted { .. })) {
+            Response::IntegrateStarted { targets, .. } => {
+                assert_eq!(targets, vec!["frontend", "backend"]);
+            }
+            _ => unreachable!(),
+        }
+        let mut proposals = Vec::new();
+        while proposals.len() < 2 {
+            match next(&resp_rx, |r| {
+                matches!(
+                    r,
+                    Response::IntegrateProposal { .. } | Response::IntegrateFailed { .. }
+                )
+            }) {
+                Response::IntegrateProposal {
+                    target, proposal, ..
+                } => proposals.push((target, proposal)),
+                Response::IntegrateFailed { target, error, .. } => {
+                    panic!("integrate @{target} failed: {error}")
+                }
+                _ => unreachable!(),
+            }
+        }
+        let (_, for_frontend) = proposals
+            .iter()
+            .find(|(t, _)| t == "frontend")
+            .expect("a proposal for @frontend");
+        assert!(for_frontend
+            .proposed
+            .body
+            .contains("**@backend**: integrated by the fake"));
+        assert!(
+            for_frontend.call.warnings.is_empty(),
+            "{:?}",
+            for_frontend.call.warnings
+        );
+        assert!(for_frontend.call.target_id.is_some());
+        assert_eq!(for_frontend.proposed.handle(), "frontend");
+        let (_, for_self) = proposals
+            .iter()
+            .find(|(t, _)| t == "backend")
+            .expect("a proposal for @backend itself");
+        assert!(for_self.proposed.body.contains("integrated by the fake"));
+
+        // Accepting the @frontend one with save changes its file.
+        req_tx
+            .send(Request::AcceptProposal {
+                project,
+                call_id: for_frontend.call.id,
+                definition: for_frontend.proposed.clone(),
+                save: true,
+            })
+            .unwrap();
+        next(
+            &resp_rx,
+            |r| matches!(r, Response::AgentLoaded { handle, definition: Some(d), .. } if handle == "frontend" && d.body.contains("integrated by the fake")),
+        );
+
+        // The other one still waits on @backend's editor.
+        req_tx
+            .send(Request::LoadAgent {
+                project,
+                handle: "backend".into(),
+            })
+            .unwrap();
+        match next(
+            &resp_rx,
+            |r| matches!(r, Response::AgentLoaded { handle, .. } if handle == "backend"),
+        ) {
+            Response::AgentLoaded { integrations, .. } => {
+                assert_eq!(integrations.len(), 1);
+                assert_eq!(integrations[0].0, "backend");
+            }
             _ => unreachable!(),
         }
 

@@ -330,6 +330,7 @@ impl App {
                 retired_since,
                 pending,
                 runs,
+                integrations,
             } => {
                 if Some(project) != self.current {
                     return;
@@ -340,6 +341,7 @@ impl App {
                         e.handle == handle
                             && (!e.dirty || !e.loaded)
                             && !matches!(e.refine, RefineStatus::Running { .. })
+                            && e.integrate.running.is_empty()
                     }
                     None => false,
                 };
@@ -352,6 +354,7 @@ impl App {
                         runs,
                         retired_since,
                         pending,
+                        integrations,
                     ));
                 }
             }
@@ -379,6 +382,49 @@ impl App {
                     }
                 }
                 self.toast(format!("Refine proposal ready for @{handle}"), false);
+            }
+            Response::IntegrateStarted {
+                project,
+                handle,
+                targets,
+            } => {
+                if Some(project) == self.current {
+                    if let Some(e) = self.team.as_mut() {
+                        if e.handle == handle {
+                            e.integrate.start(targets);
+                        }
+                    }
+                }
+            }
+            Response::IntegrateProposal {
+                project,
+                handle,
+                target,
+                proposal,
+            } => {
+                if Some(project) == self.current {
+                    if let Some(e) = self.team.as_mut() {
+                        if e.handle == handle {
+                            e.integrate.propose(target.clone(), proposal);
+                        }
+                    }
+                }
+                self.toast(format!("Integrate proposal for @{target} ready"), false);
+            }
+            Response::IntegrateFailed {
+                project,
+                handle,
+                target,
+                error,
+            } => {
+                if Some(project) == self.current {
+                    if let Some(e) = self.team.as_mut() {
+                        if e.handle == handle {
+                            e.integrate.fail(target.clone(), error.clone());
+                        }
+                    }
+                }
+                self.toast(format!("Integrate @{target} failed: {error}"), true);
             }
             Response::RefineFailed {
                 project,
