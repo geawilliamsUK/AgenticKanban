@@ -62,6 +62,8 @@ pub struct App {
     tx: UnboundedSender<Request>,
     rx: Receiver<Response>,
     startup_error: Option<String>,
+    /// Held for the life of the process: one instance per home directory.
+    _instance: Option<ak_runtime::instance::InstanceLock>,
 
     pub projects: Vec<ProjectEntry>,
     pub current: Option<ProjectId>,
@@ -127,8 +129,13 @@ impl App {
         let (resp_tx, resp_rx) = std::sync::mpsc::channel();
         let ctx = cc.egui_ctx.clone();
 
-        let startup_error = match HomePaths::resolve().and_then(ProjectRegistry::load) {
-            Ok(registry) => {
+        let mut instance = None;
+        let startup_error = match HomePaths::resolve()
+            .and_then(|paths| ak_runtime::instance::acquire(&paths).map(|lock| (paths, lock)))
+            .and_then(|(paths, lock)| ProjectRegistry::load(paths).map(|r| (r, lock)))
+        {
+            Ok((registry, lock)) => {
+                instance = Some(lock);
                 let paths = registry.paths().clone();
                 let factory: RunnerFactory = Box::new(move |settings| {
                     let runner: Arc<dyn UtilityRunner> =
@@ -154,6 +161,7 @@ impl App {
             tx: req_tx,
             rx: resp_rx,
             startup_error,
+            _instance: instance,
             projects: Vec::new(),
             current: None,
             project_name: String::new(),

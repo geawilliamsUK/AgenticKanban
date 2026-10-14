@@ -7,6 +7,7 @@ pub mod authoring;
 pub mod claude;
 pub mod config;
 pub mod error;
+pub mod instance;
 pub mod paths;
 pub mod registry;
 pub mod snapshot;

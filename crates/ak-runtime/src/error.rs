@@ -43,6 +43,9 @@ pub enum RuntimeError {
     #[error("{0}")]
     Snapshot(String),
 
+    #[error("AgenticKanban is already running; close it first (lock: {0})")]
+    AlreadyRunning(PathBuf),
+
     #[error("daily budget of ${limit:.2} reached (${spent:.2} spent today)")]
     BudgetExceeded { limit: f64, spent: f64 },
 

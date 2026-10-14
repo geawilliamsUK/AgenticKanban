@@ -1067,6 +1067,45 @@ impl Store for SqliteStore {
         rows.iter().map(event_from_row).collect()
     }
 
+    async fn recover_stale_runs(&self, reason: &str) -> Result<u64> {
+        let result = sqlx::query(
+            "UPDATE runs SET ended_at = ?, exit_reason = 'crashed', error = ? WHERE ended_at IS NULL",
+        )
+        .bind(fmt_ts(&Utc::now()))
+        .bind(reason)
+        .execute(&self.pool)
+        .await?;
+        sqlx::query(
+            "UPDATE agents SET state = 'idle', current_run_id = NULL \
+             WHERE state IN ('starting', 'running', 'stopping')",
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
+    async fn prune_run_events(&self, before: Timestamp) -> Result<Vec<RunId>> {
+        let rows = sqlx::query(
+            "SELECT DISTINCT r.id AS id FROM runs r JOIN run_events e ON e.run_id = r.id \
+             WHERE r.ended_at IS NOT NULL AND r.ended_at < ?",
+        )
+        .bind(fmt_ts(&before))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut ids = Vec::new();
+        for r in &rows {
+            let raw: String = sqlx::Row::try_get(r, "id")?;
+            ids.push(parse_id::<RunId>(&raw, "run")?);
+        }
+        for id in &ids {
+            sqlx::query("DELETE FROM run_events WHERE run_id = ?")
+                .bind(id.to_string())
+                .execute(&self.pool)
+                .await?;
+        }
+        Ok(ids)
+    }
+
     async fn utility_cost_since(&self, since: Timestamp) -> Result<f64> {
         let row = sqlx::query(
             "SELECT COALESCE(SUM(cost_usd), 0.0) AS total FROM utility_calls WHERE started_at >= ?",

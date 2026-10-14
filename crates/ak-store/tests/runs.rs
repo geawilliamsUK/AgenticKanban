@@ -128,3 +128,68 @@ async fn cost_windows_and_cooldown() {
     store.set_agent_cooldown(agent, None).await.unwrap();
     assert!(store.agent(agent).await.unwrap().cooldown_until.is_none());
 }
+
+#[tokio::test]
+async fn recovery_closes_open_runs_and_pruning_drops_old_transcripts() {
+    let (store, agent) = store_with_agent().await;
+    let open = AgentRun::start(agent, RunTrigger::Manual, "C:/ws".into(), Utc::now());
+    store.insert_run(&open).await.unwrap();
+    store
+        .set_agent_state(agent, ak_core::agent::AgentState::Running, Some(open.id))
+        .await
+        .unwrap();
+
+    let closed = store
+        .recover_stale_runs("the app was not running")
+        .await
+        .unwrap();
+    assert_eq!(closed, 1);
+    let run = store.run(open.id).await.unwrap();
+    assert_eq!(run.exit_reason, Some(ExitReason::Crashed));
+    assert!(run.ended_at.is_some());
+    assert_eq!(run.error.as_deref(), Some("the app was not running"));
+    assert_eq!(
+        store.agent(agent).await.unwrap().state,
+        ak_core::agent::AgentState::Idle
+    );
+    assert!(store.active_runs().await.unwrap().is_empty());
+    assert_eq!(store.recover_stale_runs("again").await.unwrap(), 0);
+
+    // An old run loses its transcript but keeps its row and its cost.
+    let mut old = AgentRun::start(
+        agent,
+        RunTrigger::Manual,
+        "C:/ws".into(),
+        Utc::now() - Duration::days(40),
+    );
+    old.ended_at = Some(Utc::now() - Duration::days(40));
+    old.exit_reason = Some(ExitReason::Completed);
+    old.cost_usd = Some(1.5);
+    store.insert_run(&old).await.unwrap();
+    store.update_run(&old).await.unwrap();
+    store
+        .append_run_event(&RunEvent {
+            run_id: old.id,
+            seq: 0,
+            at: old.started_at,
+            kind: RunEventKind::Supervisor,
+            payload: json!({"message": "x"}),
+        })
+        .await
+        .unwrap();
+    let pruned = store
+        .prune_run_events(Utc::now() - Duration::days(30))
+        .await
+        .unwrap();
+    assert_eq!(pruned, vec![old.id]);
+    assert!(store.run_events(old.id).await.unwrap().is_empty());
+    assert_eq!(store.run(old.id).await.unwrap().cost_usd, Some(1.5));
+    assert!(
+        store
+            .prune_run_events(Utc::now() - Duration::days(30))
+            .await
+            .unwrap()
+            .is_empty(),
+        "nothing left to prune"
+    );
+}

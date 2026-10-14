@@ -37,7 +37,7 @@ use ak_runtime::claude::{self, ClaudeProbe};
 use ak_runtime::snapshot::{
     self, DriftEntry, ExportOptions, ExportReport, ImportReview, ImportSelection,
 };
-use ak_runtime::{OpenProject, ProjectRegistry, RuntimeError, UtilityRunner};
+use ak_runtime::{HomePaths, OpenProject, ProjectRegistry, RuntimeError, UtilityRunner};
 use ak_store::Store;
 use ak_supervisor::{GuardrailMonitor, RunNotice, Scheduler, Supervisor, SupervisorConfig};
 
@@ -513,6 +513,7 @@ impl Backend {
                     for id in ids {
                         if let Some(p) = self.registry.opened(id) {
                             archive_idle_threads(&p).await;
+                            prune_runs(&p, self.registry.paths(), self.settings.run_retention_days).await;
                         }
                     }
                 }
@@ -1330,6 +1331,18 @@ impl Backend {
     async fn ensure_open(&mut self, id: ProjectId) -> Result<Arc<OpenProject>, String> {
         let p = self.registry.open(id).await.map_err(|e| e.to_string())?;
         if !self.watchers.contains_key(&id) {
+            // Runs a previous session left open ended with that session.
+            match p
+                .store()
+                .recover_stale_runs("the app was not running when this run ended")
+                .await
+            {
+                Ok(n) if n > 0 => {
+                    tracing::warn!(project = %p.entry.name, "closed {n} run(s) left open by a previous session")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("run recovery failed: {e}"),
+            }
             let events = tokio::spawn(watch_events(p.clone(), self.tx.clone(), self.ctx.clone()));
             let (file_tx, file_rx) = tokio::sync::mpsc::unbounded_channel();
             let agent_watcher =
@@ -1789,6 +1802,28 @@ fn start_of_today() -> Timestamp {
         .and_hms_opt(0, 0, 0)
         .map(|t| t.and_utc())
         .unwrap_or_else(Utc::now)
+}
+
+/// Drops transcripts and run directories older than the retention period.
+/// Run rows stay, so cost history does.
+async fn prune_runs(p: &OpenProject, paths: &HomePaths, days: u32) {
+    let before = Utc::now() - chrono::Duration::days(days.max(1) as i64);
+    match p.store().prune_run_events(before).await {
+        Ok(ids) => {
+            for id in &ids {
+                let dir = paths.run_dir(p.id(), *id);
+                if dir.is_dir() {
+                    if let Err(e) = std::fs::remove_dir_all(&dir) {
+                        tracing::warn!("could not remove {}: {e}", dir.display());
+                    }
+                }
+            }
+            if !ids.is_empty() {
+                tracing::info!(project = %p.entry.name, "pruned {} run transcript(s)", ids.len());
+            }
+        }
+        Err(e) => tracing::warn!("run pruning failed: {e}"),
+    }
 }
 
 /// Archives threads idle for longer than the project's period. Quiet: no

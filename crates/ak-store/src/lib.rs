@@ -163,6 +163,14 @@ pub trait Store: Send + Sync {
     /// Trip events since a time, newest first.
     async fn guardrail_trips_since(&self, since: Timestamp) -> Result<Vec<Event>>;
 
+    // Housekeeping.
+    /// Closes runs a previous process left open as crashed and resets agents
+    /// stuck in a running state. Returns how many runs were closed.
+    async fn recover_stale_runs(&self, reason: &str) -> Result<u64>;
+    /// Drops the transcripts of runs that ended before `before`, keeping the
+    /// run rows for cost history. Returns the runs pruned.
+    async fn prune_run_events(&self, before: Timestamp) -> Result<Vec<RunId>>;
+
     // Chats and threads.
     /// Every chat, for the human, who observes all of them.
     async fn chats(&self) -> Result<Vec<Chat>>;
