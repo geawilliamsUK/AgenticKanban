@@ -21,10 +21,12 @@ use tokio::task::JoinHandle;
 use ak_bridge::{Bridge, BridgeEvent};
 use ak_core::agent::AgentDefinition;
 use ak_core::approval::Approval;
+use ak_core::chat::{Thread, ThreadHit};
 use ak_core::commands::{NewTicket, TicketPatch};
 use ak_core::config::{GlobalSettings, ProjectEntry, ProjectPolicy};
 use ak_core::ids::{
-    ActorId, ApprovalId, CallId, ColumnId, CommentId, NotificationId, ProjectId, RunId, TicketId,
+    ActorId, ApprovalId, CallId, ChatId, ColumnId, CommentId, NotificationId, ProjectId, RunId,
+    ThreadId, TicketId,
 };
 use ak_core::run::{AgentRun, RunEvent};
 use ak_core::utility::{UtilityCall, UtilityKind, UtilityState};
@@ -36,7 +38,7 @@ use ak_runtime::{OpenProject, ProjectRegistry, RuntimeError, UtilityRunner};
 use ak_store::Store;
 use ak_supervisor::{RunNotice, Scheduler, Supervisor, SupervisorConfig};
 
-use crate::model::{BoardModel, InboxItem, TicketDetail};
+use crate::model::{BoardModel, ChatSummary, InboxItem, ThreadDetail, TicketDetail};
 
 /// Builds the utility runner for the current settings. Injected so tests can
 /// supply a fake.
@@ -141,6 +143,45 @@ pub enum Request {
         project: ProjectId,
         handle: String,
         targets: Vec<String>,
+    },
+    // Chats.
+    LoadThreads {
+        project: ProjectId,
+        chat: ChatId,
+        include_archived: bool,
+    },
+    LoadThread {
+        project: ProjectId,
+        thread: ThreadId,
+    },
+    CreateDirectChat {
+        project: ProjectId,
+        with: ActorId,
+    },
+    CreateGroupChat {
+        project: ProjectId,
+        name: String,
+        members: Vec<ActorId>,
+    },
+    CreateThread {
+        project: ProjectId,
+        chat: ChatId,
+        title: String,
+        body: String,
+    },
+    PostMessage {
+        project: ProjectId,
+        thread: ThreadId,
+        body: String,
+    },
+    SetThreadPaused {
+        project: ProjectId,
+        thread: ThreadId,
+        paused: bool,
+    },
+    SearchThreads {
+        project: ProjectId,
+        query: String,
     },
     SaveGlobalSettings(GlobalSettings),
     SaveProjectPolicy {
@@ -264,6 +305,33 @@ pub enum Response {
         target: String,
         error: String,
     },
+    Chats {
+        project: ProjectId,
+        chats: Vec<ChatSummary>,
+    },
+    Threads {
+        project: ProjectId,
+        chat: ChatId,
+        threads: Vec<Thread>,
+    },
+    ThreadDetail {
+        project: ProjectId,
+        detail: ThreadDetail,
+    },
+    ThreadSearch {
+        project: ProjectId,
+        query: String,
+        hits: Vec<ThreadHit>,
+    },
+    /// A chat was opened or created from the UI; the view should select it.
+    ChatOpened {
+        project: ProjectId,
+        chat: ChatId,
+    },
+    ThreadOpened {
+        project: ProjectId,
+        thread: ThreadId,
+    },
     RunStarted {
         project: ProjectId,
         run: AgentRun,
@@ -369,6 +437,7 @@ impl Backend {
         self.start_agent_runtime().await;
         self.send(Response::Projects(self.registry.projects().to_vec()));
         self.send_settings();
+        let mut housekeeping = tokio::time::interval(Duration::from_secs(3600));
         loop {
             tokio::select! {
                 req = self.rx.recv() => match req {
@@ -382,6 +451,14 @@ impl Backend {
                 msg = self.internal_rx.recv() => {
                     if let Some(msg) = msg {
                         self.handle_internal(msg).await;
+                    }
+                }
+                _ = housekeeping.tick() => {
+                    let ids: Vec<ProjectId> = self.registry.projects().iter().map(|e| e.id).collect();
+                    for id in ids {
+                        if let Some(p) = self.registry.opened(id) {
+                            archive_idle_threads(&p).await;
+                        }
                     }
                 }
             }
@@ -681,6 +758,126 @@ impl Backend {
                 push_agent(&p, &handle, &self.tx, &self.ctx).await?;
                 self.send(Response::Info(format!("Retired @{handle}")));
             }
+            Request::LoadThreads {
+                project,
+                chat,
+                include_archived,
+            } => {
+                let p = self.project(project)?;
+                let threads = p
+                    .store()
+                    .threads(chat, include_archived)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                self.send(Response::Threads {
+                    project,
+                    chat,
+                    threads,
+                });
+            }
+            Request::LoadThread { project, thread } => {
+                let p = self.project(project)?;
+                push_thread(&p, thread, &self.tx, &self.ctx).await?;
+            }
+            Request::CreateDirectChat { project, with } => {
+                let p = self.project(project)?;
+                let chat = p
+                    .store()
+                    .direct_chat(p.human.id, with, p.human.id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                push_chats(&p, &self.tx, &self.ctx).await?;
+                self.send(Response::ChatOpened {
+                    project,
+                    chat: chat.id,
+                });
+            }
+            Request::CreateGroupChat {
+                project,
+                name,
+                members,
+            } => {
+                let p = self.project(project)?;
+                let chat = p
+                    .store()
+                    .create_group_chat(name, members, p.human.id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                push_chats(&p, &self.tx, &self.ctx).await?;
+                self.send(Response::ChatOpened {
+                    project,
+                    chat: chat.id,
+                });
+            }
+            Request::CreateThread {
+                project,
+                chat,
+                title,
+                body,
+            } => {
+                let p = self.project(project)?;
+                let (thread, _) = p
+                    .store()
+                    .create_thread(chat, title, body, p.human.id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let threads = p
+                    .store()
+                    .threads(chat, false)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                self.send(Response::Threads {
+                    project,
+                    chat,
+                    threads,
+                });
+                self.send(Response::ThreadOpened {
+                    project,
+                    thread: thread.id,
+                });
+            }
+            Request::PostMessage {
+                project,
+                thread,
+                body,
+            } => {
+                let p = self.project(project)?;
+                p.store()
+                    .post_message(thread, body, p.human.id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                push_thread(&p, thread, &self.tx, &self.ctx).await?;
+            }
+            Request::SetThreadPaused {
+                project,
+                thread,
+                paused,
+            } => {
+                let p = self.project(project)?;
+                p.store()
+                    .set_thread_paused(thread, paused, p.human.id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                push_thread(&p, thread, &self.tx, &self.ctx).await?;
+                self.send(Response::Info(if paused {
+                    "Thread paused: agents cannot post until you unpause it".into()
+                } else {
+                    "Thread unpaused".into()
+                }));
+            }
+            Request::SearchThreads { project, query } => {
+                let p = self.project(project)?;
+                let hits = p
+                    .store()
+                    .search_threads(None, &query, 30)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                self.send(Response::ThreadSearch {
+                    project,
+                    query,
+                    hits,
+                });
+            }
             Request::Integrate {
                 project,
                 handle,
@@ -914,6 +1111,8 @@ impl Backend {
         push_board(&p, &self.tx, &self.ctx).await?;
         push_inbox(&p, &self.tx, &self.ctx).await?;
         push_approvals(&p, &self.tx, &self.ctx).await?;
+        push_chats(&p, &self.tx, &self.ctx).await?;
+        archive_idle_threads(&p).await;
         if !self.watchers.contains_key(&id) {
             let events = tokio::spawn(watch_events(p.clone(), self.tx.clone(), self.ctx.clone()));
             let (file_tx, file_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1247,6 +1446,7 @@ async fn watch_events(p: Arc<OpenProject>, tx: Sender<Response>, ctx: egui::Cont
             return;
         }
         let _ = push_inbox(&p, &tx, &ctx).await;
+        let _ = push_chats(&p, &tx, &ctx).await;
     }
 }
 
@@ -1338,6 +1538,65 @@ async fn push_inbox(
     tx.send(Response::Inbox {
         project: p.id(),
         items,
+    })
+    .map_err(|_| "ui gone".to_string())?;
+    ctx.request_repaint();
+    Ok(())
+}
+
+/// Archives threads idle for longer than the project's period. Quiet: no
+/// events, nothing to notify.
+async fn archive_idle_threads(p: &OpenProject) {
+    let days = p.policy().thread_archive_days.max(1) as i64;
+    let since = Utc::now() - chrono::Duration::days(days);
+    match p.store().archive_idle_threads(since).await {
+        Ok(n) if n > 0 => tracing::info!(project = %p.entry.name, "archived {n} idle thread(s)"),
+        Ok(_) => {}
+        Err(e) => tracing::warn!("could not archive idle threads: {e}"),
+    }
+}
+
+async fn push_chats(
+    p: &OpenProject,
+    tx: &Sender<Response>,
+    ctx: &egui::Context,
+) -> Result<(), String> {
+    let store = p.store();
+    let mut chats = Vec::new();
+    for chat in store.chats().await.map_err(|e| e.to_string())? {
+        let members = store
+            .chat_members(chat.id)
+            .await
+            .map_err(|e| e.to_string())?;
+        chats.push(ChatSummary { chat, members });
+    }
+    tx.send(Response::Chats {
+        project: p.id(),
+        chats,
+    })
+    .map_err(|_| "ui gone".to_string())?;
+    ctx.request_repaint();
+    Ok(())
+}
+
+async fn push_thread(
+    p: &OpenProject,
+    id: ThreadId,
+    tx: &Sender<Response>,
+    ctx: &egui::Context,
+) -> Result<(), String> {
+    let store = p.store();
+    let detail = ThreadDetail {
+        thread: store.thread(id).await.map_err(|e| e.to_string())?,
+        messages: store.messages(id).await.map_err(|e| e.to_string())?,
+        participants: store
+            .thread_participants(id)
+            .await
+            .map_err(|e| e.to_string())?,
+    };
+    tx.send(Response::ThreadDetail {
+        project: p.id(),
+        detail,
     })
     .map_err(|_| "ui gone".to_string())?;
     ctx.request_repaint();
@@ -1802,6 +2061,81 @@ name:",
             _ => unreachable!(),
         }
 
+        // Chats: a direct chat with the agent, a thread in it, and the agent's
+        // wake; pausing and search go through the same channel.
+        req_tx
+            .send(Request::CreateDirectChat {
+                project,
+                with: backend_id,
+            })
+            .unwrap();
+        match next(&resp_rx, |r| matches!(r, Response::Chats { .. })) {
+            Response::Chats { chats, .. } => {
+                assert_eq!(chats.len(), 1);
+                assert!(chats[0].members.contains(&backend_id));
+            }
+            _ => unreachable!(),
+        }
+        let chat_id = match next(&resp_rx, |r| matches!(r, Response::ChatOpened { .. })) {
+            Response::ChatOpened { chat, .. } => chat,
+            _ => unreachable!(),
+        };
+        req_tx
+            .send(Request::CreateThread {
+                project,
+                chat: chat_id,
+                title: "Hello".into(),
+                body: "Are you there?".into(),
+            })
+            .unwrap();
+        let thread_id = match next(&resp_rx, |r| matches!(r, Response::ThreadOpened { .. })) {
+            Response::ThreadOpened { thread, .. } => thread,
+            _ => unreachable!(),
+        };
+        // The message woke the agent: its inbox count rises.
+        next(
+            &resp_rx,
+            |r| matches!(r, Response::Board { board, .. } if board.agent_inbox_counts.get(&backend_id) == Some(&1)),
+        );
+        req_tx
+            .send(Request::LoadThread {
+                project,
+                thread: thread_id,
+            })
+            .unwrap();
+        match next(&resp_rx, |r| matches!(r, Response::ThreadDetail { .. })) {
+            Response::ThreadDetail { detail, .. } => {
+                assert_eq!(detail.thread.title, "Hello");
+                assert_eq!(detail.messages.len(), 1);
+                assert!(!detail.thread.paused);
+            }
+            _ => unreachable!(),
+        }
+        req_tx
+            .send(Request::SetThreadPaused {
+                project,
+                thread: thread_id,
+                paused: true,
+            })
+            .unwrap();
+        next(
+            &resp_rx,
+            |r| matches!(r, Response::ThreadDetail { detail, .. } if detail.thread.paused),
+        );
+        req_tx
+            .send(Request::SearchThreads {
+                project,
+                query: "there".into(),
+            })
+            .unwrap();
+        match next(&resp_rx, |r| matches!(r, Response::ThreadSearch { .. })) {
+            Response::ThreadSearch { hits, .. } => {
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].thread.id, thread_id);
+            }
+            _ => unreachable!(),
+        }
+
         // Integrate: one proposal per chosen target, including the agent's own
         // Team section, each reviewed on its own.
         req_tx
@@ -1939,7 +2273,7 @@ name:",
             .unwrap();
         next(
             &resp_rx,
-            |r| matches!(r, Response::Board { board, .. } if board.agent_inbox_counts.get(&backend_id) == Some(&1)),
+            |r| matches!(r, Response::Board { board, .. } if board.agent_inbox_counts.get(&backend_id) == Some(&2)),
         );
 
         // Halting and resuming go through the scheduler and refresh the board.

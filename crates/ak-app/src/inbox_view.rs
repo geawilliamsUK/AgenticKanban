@@ -144,6 +144,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                             .push(Action::SwitchView(crate::app::View::Board));
                                     }
                                 }
+                                if let Some(tid) = e.kind.thread_id() {
+                                    if ui.small_button("Open thread").clicked() {
+                                        app.actions.push(Action::SelectThread(Some(tid)));
+                                    }
+                                }
                             }
                         });
                     });

@@ -10,6 +10,7 @@ use sqlx::Row;
 use ak_core::agent::{Agent, AgentState, Budgets};
 use ak_core::approval::{Approval, ApprovalState};
 use ak_core::board::{Column, ColumnKind, Comment, Priority, Ticket};
+use ak_core::chat::{Chat, ChatKind, Message, Thread};
 use ak_core::event::EventKind;
 use ak_core::run::{AgentRun, ExitReason, RunEvent, RunEventKind};
 use ak_core::utility::{UtilityCall, UtilityKind, UtilityState};
@@ -239,5 +240,40 @@ pub fn run_event_from_row(row: &SqliteRow) -> Result<RunEvent, StoreError> {
         kind: RunEventKind::parse(&kind)
             .ok_or_else(|| StoreError::corrupt(format!("run event kind {kind:?}")))?,
         payload: serde_json::from_str(&payload)?,
+    })
+}
+
+pub fn chat_from_row(row: &SqliteRow) -> Result<Chat, StoreError> {
+    let kind: String = row.try_get("kind")?;
+    Ok(Chat {
+        id: parse_id(&row.try_get::<String, _>("id")?, "chat")?,
+        kind: ChatKind::parse(&kind)
+            .ok_or_else(|| StoreError::corrupt(format!("chat kind {kind:?}")))?,
+        name: row.try_get("name")?,
+        created_by: parse_id(&row.try_get::<String, _>("created_by")?, "actor")?,
+        created_at: parse_ts(&row.try_get::<String, _>("created_at")?)?,
+    })
+}
+
+pub fn thread_from_row(row: &SqliteRow) -> Result<Thread, StoreError> {
+    Ok(Thread {
+        id: parse_id(&row.try_get::<String, _>("id")?, "thread")?,
+        chat_id: parse_id(&row.try_get::<String, _>("chat_id")?, "chat")?,
+        title: row.try_get("title")?,
+        created_by: parse_id(&row.try_get::<String, _>("created_by")?, "actor")?,
+        created_at: parse_ts(&row.try_get::<String, _>("created_at")?)?,
+        last_activity_at: parse_ts(&row.try_get::<String, _>("last_activity_at")?)?,
+        paused: row.try_get::<i64, _>("paused")? != 0,
+        archived: row.try_get::<i64, _>("archived")? != 0,
+    })
+}
+
+pub fn message_from_row(row: &SqliteRow) -> Result<Message, StoreError> {
+    Ok(Message {
+        id: parse_id(&row.try_get::<String, _>("id")?, "message")?,
+        thread_id: parse_id(&row.try_get::<String, _>("thread_id")?, "thread")?,
+        author_id: parse_id(&row.try_get::<String, _>("author_id")?, "actor")?,
+        body: row.try_get("body")?,
+        created_at: parse_ts(&row.try_get::<String, _>("created_at")?)?,
     })
 }

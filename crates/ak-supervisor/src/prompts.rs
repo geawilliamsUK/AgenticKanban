@@ -67,6 +67,10 @@ is a queue.\n\
 you start, when you are blocked, and when you finish. Move it as it progresses through the \
 columns: {columns}. Hand work off by assigning the ticket and @mentioning the assignee.\n\
 - @mention a teammate in a comment to notify them. Only mention people who need to act.\n\
+- Chats are for conversation, not work: tickets carry work and decisions. A direct thread \
+(chat_direct, then thread_create) is for a short clarification with one teammate; a group thread \
+is for a question to the team. Keep messages short. The human sees every chat and may answer. A \
+paused thread rejects your posts; only the human unpauses it.\n\
 - Keep comments short and factual: what changed, what you need, what you decided.\n\
 - Your workspace is your own git worktree at `{path}`, currently on branch `{branch}`. \
 Work for ticket KEY happens on branch `ticket/KEY` created from the default branch. Commit \

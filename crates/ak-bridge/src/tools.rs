@@ -12,9 +12,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use ak_core::board::{Column, ColumnKind, Priority, Ticket};
+use ak_core::chat::{Chat, ChatKind, Thread};
 use ak_core::commands::{NewTicket, TicketPatch};
 use ak_core::event::{Event, EventKind, MentionSource};
-use ak_core::ids::{ActorId, ColumnId, CommentId, NotificationId, TicketId};
+use ak_core::ids::{ActorId, ChatId, ColumnId, CommentId, NotificationId, ThreadId, TicketId};
 use ak_core::{Actor, ActorKind, Notification};
 use ak_store::{Store, StoreError};
 
@@ -24,7 +25,10 @@ pub const INSTRUCTIONS: &str =
     "You are an agent on a kanban board. Start with inbox_list to see why you were woken. \
 Tickets carry work: read them with ticket_get, comment on them, move them, and assign them. \
 Mention a teammate with @handle in a comment to notify them. Before you finish, call inbox_list \
-again, handle what is pending, then memory_update to record what you learned.";
+again, handle what is pending, then memory_update to record what you learned. Chats are for \
+conversation, not work: tickets carry work and decisions. A direct thread (chat_direct, then \
+thread_create) is for a short clarification with one teammate; a group thread is for a question to \
+the team. Keep messages short. The human sees every chat and may answer.";
 
 pub struct Outcome {
     pub text: String,
@@ -150,6 +154,55 @@ pub struct AgentActivateInput {
     pub reason: String,
 }
 
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ChatDirectInput {
+    /// The teammate's handle without the @.
+    pub handle: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ChatCreateGroupInput {
+    pub name: String,
+    /// Handles without the @. You are always a member.
+    pub members: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ThreadListInput {
+    /// From chat_list.
+    pub chat_id: String,
+    #[serde(default)]
+    pub include_archived: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ThreadSearchInput {
+    /// Words to look for in thread titles and messages.
+    pub query: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ThreadReadInput {
+    /// From thread_list, thread_search or your inbox.
+    pub thread_id: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ThreadCreateInput {
+    pub chat_id: String,
+    /// What the thread is about, in a few words.
+    pub title: String,
+    /// The first message, markdown. @mention teammates to notify them.
+    pub body: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct ThreadPostInput {
+    pub thread_id: String,
+    /// Markdown. @mention teammates to notify them.
+    pub body: String,
+}
+
 struct ToolSpec {
     name: &'static str,
     description: &'static str,
@@ -225,6 +278,46 @@ const SPECS: &[ToolSpec] = &[
         name: "memory_update",
         description: "Replace your memory file. Keep it short: what you learned about this project that your next run should know.",
         schema: schema::<MemoryUpdateInput>,
+    },
+    ToolSpec {
+        name: "chat_list",
+        description: "Chats you are in: your direct chats and group chats, with their ids.",
+        schema: schema::<Empty>,
+    },
+    ToolSpec {
+        name: "chat_direct",
+        description: "Your direct chat with a teammate, created if needed. A message there wakes them.",
+        schema: schema::<ChatDirectInput>,
+    },
+    ToolSpec {
+        name: "chat_create_group",
+        description: "A named group chat with teammates. Posts there do not wake anyone; @mentions do.",
+        schema: schema::<ChatCreateGroupInput>,
+    },
+    ToolSpec {
+        name: "thread_list",
+        description: "Threads in a chat, most recent activity first.",
+        schema: schema::<ThreadListInput>,
+    },
+    ToolSpec {
+        name: "thread_search",
+        description: "Full-text search over thread titles and messages in your chats.",
+        schema: schema::<ThreadSearchInput>,
+    },
+    ToolSpec {
+        name: "thread_read",
+        description: "Every message in a thread.",
+        schema: schema::<ThreadReadInput>,
+    },
+    ToolSpec {
+        name: "thread_create",
+        description: "Start a thread in a chat with a title and a first message. Every message lives in a thread.",
+        schema: schema::<ThreadCreateInput>,
+    },
+    ToolSpec {
+        name: "thread_post",
+        description: "Post in an existing thread. Rejected while the thread is paused. Posting handles your notifications about the thread.",
+        schema: schema::<ThreadPostInput>,
     },
     ToolSpec {
         name: "agent_activate",
@@ -528,6 +621,129 @@ async fn run(ctx: &RunContext, name: &str, args: Value) -> Result<String, ToolEr
                 input.content.chars().count()
             ))
         }
+        "chat_list" => {
+            let snap = Snapshot::load(store.as_ref()).await?;
+            let chats = store.chats_for(me).await?;
+            if chats.is_empty() {
+                return Ok("no chats yet: chat_direct opens one with a teammate".into());
+            }
+            let mut lines = Vec::new();
+            for c in &chats {
+                let members = store.chat_members(c.id).await?;
+                lines.push(format!(
+                    "- chat {} | {}",
+                    c.id,
+                    describe_chat(c, &members, me, &snap)
+                ));
+            }
+            Ok(lines.join("\n"))
+        }
+        "chat_direct" => {
+            let input: ChatDirectInput = parse_args(args)?;
+            let snap = Snapshot::load(store.as_ref()).await?;
+            let other = snap.actor_named(&input.handle)?;
+            let chat = store.direct_chat(me, other.id, me).await?;
+            Ok(format!(
+                "chat {} (direct with @{}). Use thread_create to start a thread there.",
+                chat.id, other.handle
+            ))
+        }
+        "chat_create_group" => {
+            let input: ChatCreateGroupInput = parse_args(args)?;
+            let snap = Snapshot::load(store.as_ref()).await?;
+            let mut members = Vec::new();
+            for h in &input.members {
+                members.push(snap.actor_named(h)?.id);
+            }
+            let chat = store.create_group_chat(input.name, members, me).await?;
+            Ok(format!(
+                "chat {} (group \"{}\")",
+                chat.id,
+                chat.name.unwrap_or_default()
+            ))
+        }
+        "thread_list" => {
+            let input: ThreadListInput = parse_args(args)?;
+            let chat_id = parse_chat_id(&input.chat_id)?;
+            member_of(store.as_ref(), chat_id, me).await?;
+            let threads = store.threads(chat_id, input.include_archived).await?;
+            if threads.is_empty() {
+                return Ok("no threads in this chat".into());
+            }
+            Ok(threads
+                .iter()
+                .map(thread_line)
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        "thread_search" => {
+            let input: ThreadSearchInput = parse_args(args)?;
+            let snap = Snapshot::load(store.as_ref()).await?;
+            let hits = store.search_threads(Some(me), &input.query, 20).await?;
+            if hits.is_empty() {
+                return Ok("no threads match".into());
+            }
+            Ok(hits
+                .iter()
+                .map(|h| {
+                    format!(
+                        "- thread {} | \"{}\" | in {} | {}",
+                        h.thread.id,
+                        h.thread.title,
+                        snap.chat_label(h.thread.chat_id),
+                        h.snippet
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("\n"))
+        }
+        "thread_read" => {
+            let input: ThreadReadInput = parse_args(args)?;
+            let thread_id = parse_thread_id(&input.thread_id)?;
+            let thread = store.thread(thread_id).await?;
+            member_of(store.as_ref(), thread.chat_id, me).await?;
+            let snap = Snapshot::load(store.as_ref()).await?;
+            let messages = store.messages(thread_id).await?;
+            let mut out = format!(
+                "thread {} \"{}\" in {}{}{}\n",
+                thread.id,
+                thread.title,
+                snap.chat_label(thread.chat_id),
+                if thread.paused {
+                    " | PAUSED: agents cannot post"
+                } else {
+                    ""
+                },
+                if thread.archived { " | archived" } else { "" }
+            );
+            for m in &messages {
+                out.push_str(&format!(
+                    "\n{} ({}):\n{}\n",
+                    snap.handle(m.author_id),
+                    m.created_at.format("%Y-%m-%d %H:%M"),
+                    m.body
+                ));
+            }
+            Ok(out)
+        }
+        "thread_create" => {
+            let input: ThreadCreateInput = parse_args(args)?;
+            let chat_id = parse_chat_id(&input.chat_id)?;
+            let (thread, _) = store
+                .create_thread(chat_id, input.title, input.body, me)
+                .await?;
+            Ok(format!("created thread {} \"{}\"", thread.id, thread.title))
+        }
+        "thread_post" => {
+            let input: ThreadPostInput = parse_args(args)?;
+            let thread_id = parse_thread_id(&input.thread_id)?;
+            let message = store.post_message(thread_id, input.body, me).await?;
+            auto_handle_thread(ctx, store.as_ref(), thread_id).await?;
+            Ok(format!(
+                "posted in thread {} (message id {})",
+                thread_id, message.id
+            ))
+        }
         "agent_activate" => {
             let input: AgentActivateInput = parse_args(args)?;
             let snap = Snapshot::load(store.as_ref()).await?;
@@ -538,6 +754,95 @@ async fn run(ctx: &RunContext, name: &str, args: Value) -> Result<String, ToolEr
         }
         other => Err(ToolError::Message(format!("unknown tool {other}"))),
     }
+}
+
+fn parse_chat_id(s: &str) -> Result<ChatId, ToolError> {
+    s.trim()
+        .parse()
+        .map_err(|_| ToolError::Message(format!("not a chat id: {s:?}; use the id from chat_list")))
+}
+
+fn parse_thread_id(s: &str) -> Result<ThreadId, ToolError> {
+    s.trim().parse().map_err(|_| {
+        ToolError::Message(format!(
+            "not a thread id: {s:?}; use the id from thread_list or your inbox"
+        ))
+    })
+}
+
+/// Agents read and write only the chats they belong to.
+async fn member_of(store: &dyn Store, chat: ChatId, me: ActorId) -> Result<(), ToolError> {
+    if store.chat_members(chat).await?.contains(&me) {
+        Ok(())
+    } else {
+        Err(ToolError::Message(
+            "you are not a member of that chat".into(),
+        ))
+    }
+}
+
+fn thread_line(t: &Thread) -> String {
+    format!(
+        "- thread {} | \"{}\" | last activity {}{}{}",
+        t.id,
+        t.title,
+        t.last_activity_at.format("%Y-%m-%d %H:%M"),
+        if t.paused { " | paused" } else { "" },
+        if t.archived { " | archived" } else { "" }
+    )
+}
+
+fn describe_chat(c: &Chat, members: &[ActorId], me: ActorId, snap: &Snapshot) -> String {
+    match c.kind {
+        ChatKind::Direct => {
+            let other = members
+                .iter()
+                .find(|m| **m != me)
+                .map(|m| snap.handle(*m))
+                .unwrap_or_else(|| "?".into());
+            format!("direct with {other}")
+        }
+        ChatKind::Group => format!(
+            "group \"{}\": {}",
+            c.name.clone().unwrap_or_default(),
+            members
+                .iter()
+                .map(|m| snap.handle(*m))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+/// After an agent posts in a thread, its own open notifications about that
+/// thread are handled.
+async fn auto_handle_thread(
+    ctx: &RunContext,
+    store: &dyn Store,
+    thread: ThreadId,
+) -> Result<(), ToolError> {
+    let open = store.notifications(ctx.agent.actor_id, true).await?;
+    if open.is_empty() {
+        return Ok(());
+    }
+    let events = store.events_since(0, 5000).await?;
+    let by_id: HashMap<_, &Event> = events.iter().map(|e| (e.id, e)).collect();
+    let ids: Vec<NotificationId> = open
+        .iter()
+        .filter(|n| {
+            by_id
+                .get(&n.event_id)
+                .and_then(|e| e.kind.thread_id())
+                .is_some_and(|t| t == thread)
+        })
+        .map(|n| n.id)
+        .collect();
+    if !ids.is_empty() {
+        store
+            .mark_notifications_handled(&ids, Some(ctx.run_id))
+            .await?;
+    }
+    Ok(())
 }
 
 /// After an agent mutates a ticket, its own open notifications about that
@@ -583,10 +888,19 @@ pub struct Snapshot {
     actors: Vec<Actor>,
     columns: Vec<Column>,
     tickets: HashMap<TicketId, Ticket>,
+    chats: HashMap<ChatId, Chat>,
+    threads: HashMap<ThreadId, Thread>,
 }
 
 impl Snapshot {
     async fn load(store: &dyn Store) -> Result<Self, ToolError> {
+        let chats = store.chats().await?;
+        let mut threads = HashMap::new();
+        for c in &chats {
+            for t in store.threads(c.id, true).await? {
+                threads.insert(t.id, t);
+            }
+        }
         Ok(Self {
             actors: store.actors().await?,
             columns: store.columns().await?,
@@ -596,7 +910,26 @@ impl Snapshot {
                 .into_iter()
                 .map(|t| (t.id, t))
                 .collect(),
+            chats: chats.into_iter().map(|c| (c.id, c)).collect(),
+            threads,
         })
+    }
+
+    fn chat_label(&self, id: ChatId) -> String {
+        match self.chats.get(&id) {
+            Some(c) if c.kind == ChatKind::Group => {
+                format!("group \"{}\"", c.name.clone().unwrap_or_default())
+            }
+            Some(_) => "a direct chat".into(),
+            None => "a chat".into(),
+        }
+    }
+
+    fn thread_title(&self, id: ThreadId) -> String {
+        self.threads
+            .get(&id)
+            .map(|t| t.title.clone())
+            .unwrap_or_else(|| "?".into())
     }
 
     fn handle(&self, id: ActorId) -> String {
@@ -733,8 +1066,20 @@ fn render_inbox(items: &[Notification], events: &[Event], snap: &Snapshot) -> St
             .and_then(|id| snap.tickets.get(&id))
             .map(|t| format!("\n    ticket: {}", summary_line(t, snap)))
             .unwrap_or_default();
+        let thread = event
+            .and_then(|e| e.kind.thread_id())
+            .and_then(|id| snap.threads.get(&id))
+            .map(|t| {
+                format!(
+                    "\n    thread: {} \"{}\" in {}",
+                    t.id,
+                    t.title,
+                    snap.chat_label(t.chat_id)
+                )
+            })
+            .unwrap_or_default();
         out.push_str(&format!(
-            "- id {} | {}{} | {}\n    {what}{ticket}\n",
+            "- id {} | {}{} | {}\n    {what}{ticket}{thread}\n",
             n.id,
             n.kind.as_str(),
             if n.wake { " (woke you)" } else { "" },
@@ -742,8 +1087,8 @@ fn render_inbox(items: &[Notification], events: &[Event], snap: &Snapshot) -> St
         ));
     }
     out.push_str(
-        "\nUse ticket_get for the full ticket. Mutating a ticket handles its notifications; \
-         inbox_handle handles the rest.",
+        "\nUse ticket_get for the full ticket, thread_read for a thread. Mutating a ticket or \
+         posting in a thread handles its notifications; inbox_handle handles the rest.",
     );
     out
 }
@@ -811,17 +1156,64 @@ pub fn describe(e: &Event, snap: &Snapshot) -> String {
         EventKind::MentionCreated {
             source,
             mentioned_id,
-        } => {
-            let place = match source {
-                MentionSource::TicketDescription { .. } => "the description of",
-                MentionSource::Comment { .. } => "a comment on",
-            };
-            format!(
-                "{who} mentioned {} in {place} {}",
+        } => match source {
+            MentionSource::TicketDescription { ticket_id } => format!(
+                "{who} mentioned {} in the description of {}",
                 snap.handle(*mentioned_id),
-                snap.ticket_key(source.ticket_id())
+                snap.ticket_key(*ticket_id)
+            ),
+            MentionSource::Comment { ticket_id, .. } => format!(
+                "{who} mentioned {} in a comment on {}",
+                snap.handle(*mentioned_id),
+                snap.ticket_key(*ticket_id)
+            ),
+            MentionSource::Message { thread_id, .. } => format!(
+                "{who} mentioned {} in thread \"{}\"",
+                snap.handle(*mentioned_id),
+                snap.thread_title(*thread_id)
+            ),
+        },
+        EventKind::ChatCreated {
+            kind,
+            name,
+            member_ids,
+            ..
+        } => {
+            let others: Vec<String> = member_ids
+                .iter()
+                .filter(|m| **m != e.actor_id)
+                .map(|m| snap.handle(*m))
+                .collect();
+            match kind {
+                ChatKind::Direct => {
+                    format!("{who} opened a direct chat with {}", others.join(", "))
+                }
+                ChatKind::Group => format!(
+                    "{who} created group chat \"{}\" with {}",
+                    name.clone().unwrap_or_default(),
+                    others.join(", ")
+                ),
+            }
+        }
+        EventKind::ChatMemberAdded { chat_id, member_id } => format!(
+            "{who} added {} to {}",
+            snap.handle(*member_id),
+            snap.chat_label(*chat_id)
+        ),
+        EventKind::ThreadCreated { chat_id, title, .. } => {
+            format!(
+                "{who} started thread \"{title}\" in {}",
+                snap.chat_label(*chat_id)
             )
         }
+        EventKind::ThreadMessagePosted { chat_id, title, .. } => {
+            format!(
+                "{who} posted in thread \"{title}\" ({})",
+                snap.chat_label(*chat_id)
+            )
+        }
+        EventKind::ThreadPaused { title, .. } => format!("{who} paused thread \"{title}\""),
+        EventKind::ThreadUnpaused { title, .. } => format!("{who} unpaused thread \"{title}\""),
     }
 }
 

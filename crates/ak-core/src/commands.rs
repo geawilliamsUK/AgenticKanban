@@ -9,9 +9,10 @@ use serde_json::json;
 
 use crate::actor::Actor;
 use crate::board::{Comment, Priority, Ticket};
+use crate::chat::{Chat, ChatKind, Message, Thread};
 use crate::error::CoreError;
 use crate::event::{EventKind, FieldChange, MentionSource};
-use crate::ids::{ActorId, ColumnId, CommentId, TicketId};
+use crate::ids::{ActorId, ChatId, ColumnId, CommentId, MessageId, ThreadId, TicketId};
 use crate::mentions;
 use crate::Timestamp;
 
@@ -372,6 +373,265 @@ fn normalise_labels(labels: Vec<String>) -> Vec<String> {
         }
     }
     out
+}
+
+// Chats and threads
+
+/// Members may act in a chat; the human may act in every chat.
+fn chat_access(members: &[ActorId], actor: &Actor) -> Result<(), CoreError> {
+    if actor.is_human() || members.contains(&actor.id) {
+        Ok(())
+    } else {
+        Err(CoreError::NotPermitted(format!(
+            "@{} is not a member of this chat",
+            actor.handle
+        )))
+    }
+}
+
+pub fn create_direct_chat(
+    a: &Actor,
+    b: &Actor,
+    by: &Actor,
+    now: Timestamp,
+) -> Result<Outcome<Chat>, CoreError> {
+    if a.id == b.id {
+        return Err(CoreError::validation(
+            "a direct chat needs two different members",
+        ));
+    }
+    if a.id == ActorId::SYSTEM || b.id == ActorId::SYSTEM {
+        return Err(CoreError::validation("the system actor cannot chat"));
+    }
+    if !by.is_human() && by.id != a.id && by.id != b.id {
+        return Err(CoreError::NotPermitted(
+            "only a member or the human can open a direct chat".into(),
+        ));
+    }
+    let chat = Chat {
+        id: ChatId::new(),
+        kind: ChatKind::Direct,
+        name: None,
+        created_by: by.id,
+        created_at: now,
+    };
+    let events = vec![EventKind::ChatCreated {
+        chat_id: chat.id,
+        kind: ChatKind::Direct,
+        name: None,
+        member_ids: vec![a.id, b.id],
+    }];
+    Ok(Outcome::new(chat, events))
+}
+
+/// A group chat with the given members. An agent creating one is always a
+/// member; the human never is, being an observer of every chat.
+pub fn create_group_chat(
+    name: String,
+    members: Vec<ActorId>,
+    by: &Actor,
+    now: Timestamp,
+) -> Result<Outcome<(Chat, Vec<ActorId>)>, CoreError> {
+    let name = name.trim().to_string();
+    if name.is_empty() {
+        return Err(CoreError::validation("a group chat needs a name"));
+    }
+    let mut ids: Vec<ActorId> = Vec::new();
+    for m in members {
+        if m != ActorId::SYSTEM && !ids.contains(&m) {
+            ids.push(m);
+        }
+    }
+    if by.is_agent() && !ids.contains(&by.id) {
+        ids.push(by.id);
+    }
+    if ids.is_empty() {
+        return Err(CoreError::validation(
+            "a group chat needs at least one member",
+        ));
+    }
+    let chat = Chat {
+        id: ChatId::new(),
+        kind: ChatKind::Group,
+        name: Some(name.clone()),
+        created_by: by.id,
+        created_at: now,
+    };
+    let events = vec![EventKind::ChatCreated {
+        chat_id: chat.id,
+        kind: ChatKind::Group,
+        name: Some(name),
+        member_ids: ids.clone(),
+    }];
+    Ok(Outcome::new((chat, ids), events))
+}
+
+pub fn add_chat_member(
+    chat: &Chat,
+    members: &[ActorId],
+    member: &Actor,
+    by: &Actor,
+    _now: Timestamp,
+) -> Result<Outcome<()>, CoreError> {
+    if chat.kind != ChatKind::Group {
+        return Err(CoreError::validation(
+            "a direct chat has exactly two members",
+        ));
+    }
+    chat_access(members, by)?;
+    if member.id == ActorId::SYSTEM {
+        return Err(CoreError::validation("the system actor cannot chat"));
+    }
+    if members.contains(&member.id) {
+        return Err(CoreError::validation(format!(
+            "@{} is already a member",
+            member.handle
+        )));
+    }
+    Ok(Outcome::new(
+        (),
+        vec![EventKind::ChatMemberAdded {
+            chat_id: chat.id,
+            member_id: member.id,
+        }],
+    ))
+}
+
+/// A thread always starts with a message; there is no posting outside one.
+pub fn create_thread(
+    chat: &Chat,
+    members: &[ActorId],
+    title: String,
+    body: String,
+    author: &Actor,
+    now: Timestamp,
+) -> Result<Outcome<(Thread, Message)>, CoreError> {
+    chat_access(members, author)?;
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Err(CoreError::validation("a thread needs a title"));
+    }
+    let body = body.trim().to_string();
+    if body.is_empty() {
+        return Err(CoreError::validation("the first message cannot be empty"));
+    }
+    let thread = Thread {
+        id: ThreadId::new(),
+        chat_id: chat.id,
+        title,
+        created_by: author.id,
+        created_at: now,
+        last_activity_at: now,
+        paused: false,
+        archived: false,
+    };
+    let message = Message {
+        id: MessageId::new(),
+        thread_id: thread.id,
+        author_id: author.id,
+        body,
+        created_at: now,
+    };
+    let mention_handles = mentions::extract_handles(&message.body);
+    let events = vec![
+        EventKind::ThreadCreated {
+            chat_id: chat.id,
+            thread_id: thread.id,
+            title: thread.title.clone(),
+        },
+        EventKind::ThreadMessagePosted {
+            chat_id: chat.id,
+            thread_id: thread.id,
+            message_id: message.id,
+            title: thread.title.clone(),
+        },
+    ];
+    Ok(Outcome {
+        value: (thread, message),
+        events,
+        mention_handles,
+    })
+}
+
+/// Agents cannot post in a paused thread; the human can. Posting in an
+/// archived thread reopens it, which the store applies.
+pub fn post_message(
+    chat: &Chat,
+    members: &[ActorId],
+    thread: &Thread,
+    body: String,
+    author: &Actor,
+    now: Timestamp,
+) -> Result<Outcome<Message>, CoreError> {
+    chat_access(members, author)?;
+    if thread.chat_id != chat.id {
+        return Err(CoreError::validation("thread belongs to another chat"));
+    }
+    if thread.paused && author.is_agent() {
+        return Err(CoreError::NotPermitted(
+            "this thread is paused; only the human can post in it or unpause it".into(),
+        ));
+    }
+    let body = body.trim().to_string();
+    if body.is_empty() {
+        return Err(CoreError::validation("message cannot be empty"));
+    }
+    let message = Message {
+        id: MessageId::new(),
+        thread_id: thread.id,
+        author_id: author.id,
+        body,
+        created_at: now,
+    };
+    let mention_handles = mentions::extract_handles(&message.body);
+    let events = vec![EventKind::ThreadMessagePosted {
+        chat_id: chat.id,
+        thread_id: thread.id,
+        message_id: message.id,
+        title: thread.title.clone(),
+    }];
+    Ok(Outcome {
+        value: message,
+        events,
+        mention_handles,
+    })
+}
+
+/// Humans and the system pause and unpause threads. Agents may not.
+pub fn set_thread_paused(
+    thread: &Thread,
+    paused: bool,
+    actor: &Actor,
+    _now: Timestamp,
+) -> Result<Outcome<Thread>, CoreError> {
+    if actor.is_agent() {
+        return Err(CoreError::NotPermitted(
+            "agents cannot pause or unpause threads".into(),
+        ));
+    }
+    if thread.paused == paused {
+        return Err(CoreError::validation(if paused {
+            "thread is already paused"
+        } else {
+            "thread is not paused"
+        }));
+    }
+    let mut updated = thread.clone();
+    updated.paused = paused;
+    let kind = if paused {
+        EventKind::ThreadPaused {
+            chat_id: thread.chat_id,
+            thread_id: thread.id,
+            title: thread.title.clone(),
+        }
+    } else {
+        EventKind::ThreadUnpaused {
+            chat_id: thread.chat_id,
+            thread_id: thread.id,
+            title: thread.title.clone(),
+        }
+    };
+    Ok(Outcome::new(updated, vec![kind]))
 }
 
 #[cfg(test)]

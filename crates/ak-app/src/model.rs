@@ -5,6 +5,7 @@ use std::collections::{HashMap, HashSet};
 
 use ak_core::agent::Agent;
 use ak_core::board::{Column, Comment, Priority, Ticket};
+use ak_core::chat::{Chat, Message, Thread};
 use ak_core::event::{Event, EventKind, MentionSource};
 use ak_core::ids::{ActorId, ColumnId, TicketId};
 use ak_core::run::{AgentRun, RunEvent};
@@ -104,6 +105,42 @@ pub struct InboxItem {
     pub event: Option<Event>,
 }
 
+/// A chat with its members, for the chat list.
+#[derive(Clone)]
+pub struct ChatSummary {
+    pub chat: Chat,
+    pub members: Vec<ActorId>,
+}
+
+impl ChatSummary {
+    /// The other member's handle for a direct chat, the name for a group.
+    pub fn label(&self, board: &BoardModel, me: Option<ActorId>) -> String {
+        match &self.chat.name {
+            Some(name) => name.clone(),
+            None => {
+                let others: Vec<String> = self
+                    .members
+                    .iter()
+                    .filter(|m| Some(**m) != me)
+                    .map(|m| board.handle(*m))
+                    .collect();
+                if others.is_empty() {
+                    "(empty chat)".into()
+                } else {
+                    others.join(", ")
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct ThreadDetail {
+    pub thread: Thread,
+    pub messages: Vec<Message>,
+    pub participants: Vec<ActorId>,
+}
+
 pub fn priority_color(p: Priority) -> egui::Color32 {
     match p {
         Priority::Low => egui::Color32::from_rgb(120, 130, 140),
@@ -119,6 +156,7 @@ pub fn kind_label(k: NotificationKind) -> &'static str {
         NotificationKind::Moved => "Moved",
         NotificationKind::Commented => "Comment",
         NotificationKind::Replied => "Reply",
+        NotificationKind::Messaged => "Message",
         NotificationKind::Assigned => "Assigned",
         NotificationKind::Mentioned => "Mention",
         NotificationKind::Unfrozen => "Unfrozen",
@@ -208,17 +246,55 @@ pub fn describe_event(event: &Event, board: &BoardModel) -> String {
         EventKind::MentionCreated {
             source,
             mentioned_id,
-        } => {
-            let place = match source {
-                MentionSource::TicketDescription { .. } => "the description of",
-                MentionSource::Comment { .. } => "a comment on",
-            };
-            format!(
-                "{who} mentioned {} in {place} {}",
+        } => match source {
+            MentionSource::TicketDescription { ticket_id } => format!(
+                "{who} mentioned {} in the description of {}",
                 board.handle(*mentioned_id),
-                key(source.ticket_id())
-            )
+                key(*ticket_id)
+            ),
+            MentionSource::Comment { ticket_id, .. } => format!(
+                "{who} mentioned {} in a comment on {}",
+                board.handle(*mentioned_id),
+                key(*ticket_id)
+            ),
+            MentionSource::Message { .. } => {
+                format!(
+                    "{who} mentioned {} in a thread",
+                    board.handle(*mentioned_id)
+                )
+            }
+        },
+        EventKind::ChatCreated {
+            kind,
+            name,
+            member_ids,
+            ..
+        } => {
+            let others: Vec<String> = member_ids
+                .iter()
+                .filter(|m| **m != event.actor_id)
+                .map(|m| board.handle(*m))
+                .collect();
+            match kind {
+                ak_core::chat::ChatKind::Direct => {
+                    format!("{who} opened a direct chat with {}", others.join(", "))
+                }
+                ak_core::chat::ChatKind::Group => format!(
+                    "{who} created group chat \"{}\" with {}",
+                    name.clone().unwrap_or_default(),
+                    others.join(", ")
+                ),
+            }
         }
+        EventKind::ChatMemberAdded { member_id, .. } => {
+            format!("{who} added {} to a group chat", board.handle(*member_id))
+        }
+        EventKind::ThreadCreated { title, .. } => format!("{who} started thread \"{title}\""),
+        EventKind::ThreadMessagePosted { title, .. } => {
+            format!("{who} posted in thread \"{title}\"")
+        }
+        EventKind::ThreadPaused { title, .. } => format!("{who} paused thread \"{title}\""),
+        EventKind::ThreadUnpaused { title, .. } => format!("{who} unpaused thread \"{title}\""),
     }
 }
 

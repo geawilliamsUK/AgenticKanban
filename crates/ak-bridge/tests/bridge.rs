@@ -18,7 +18,7 @@ use ak_core::approval::ApprovalState;
 use ak_core::commands::NewTicket;
 use ak_core::config::{ProjectEntry, ProjectPolicy};
 use ak_core::ids::{ActorId, ProjectId, RunId};
-use ak_core::NotificationKind;
+use ak_core::{Actor, ActorKind, NotificationKind};
 use ak_runtime::{AgentFiles, OpenProject};
 use ak_store::{HumanIdentity, SqliteStore, Store};
 
@@ -561,4 +561,96 @@ async fn run_configs_point_at_the_bridge() {
         .unwrap()
         .contains("pre-tool-use"));
     assert_eq!(hooks["hooks"]["Stop"][0]["hooks"][0]["timeout"], 30);
+}
+
+#[tokio::test]
+async fn chat_tools_round_trip_and_respect_membership() {
+    let f = fixture(1, Duration::from_secs(1)).await;
+    let store = f.project.store();
+    let other = Actor {
+        id: ActorId::new(),
+        kind: ActorKind::Agent,
+        handle: "frontend".into(),
+        display_name: "Frontend".into(),
+    };
+    store.upsert_actor(&other).await.unwrap();
+
+    let (err, text) = call(&f, "chat_list", json!({})).await;
+    assert!(!err);
+    assert!(text.contains("no chats yet"), "{text}");
+    let (err, text) = call(&f, "chat_direct", json!({"handle": "frontend"})).await;
+    assert!(!err, "{text}");
+    let chat_id = text.split_whitespace().nth(1).unwrap().to_string();
+    let (err, text) = call(
+        &f,
+        "thread_create",
+        json!({"chat_id": chat_id, "title": "Hashing", "body": "bcrypt or argon2?"}),
+    )
+    .await;
+    assert!(!err, "{text}");
+    let thread_id = text.split_whitespace().nth(2).unwrap().to_string();
+
+    // The other member was woken by the first message.
+    let inbox = store.notifications(other.id, true).await.unwrap();
+    assert_eq!(inbox.len(), 1);
+    assert!(inbox[0].wake);
+    assert_eq!(inbox[0].kind, NotificationKind::Messaged);
+
+    // Their reply lands in my inbox with thread context; posting handles it.
+    store
+        .post_message(thread_id.parse().unwrap(), "argon2".into(), other.id)
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .notifications(f.agent.actor_id, true)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    let (_, text) = call(&f, "inbox_list", json!({})).await;
+    assert!(
+        text.contains("thread:") && text.contains("Hashing"),
+        "{text}"
+    );
+    let (err, text) = call(&f, "thread_read", json!({"thread_id": thread_id})).await;
+    assert!(!err, "{text}");
+    assert!(
+        text.contains("argon2") && text.contains("@frontend"),
+        "{text}"
+    );
+    let (err, text) = call(
+        &f,
+        "thread_post",
+        json!({"thread_id": thread_id, "body": "argon2 it is"}),
+    )
+    .await;
+    assert!(!err, "{text}");
+    assert!(
+        store
+            .notifications(f.agent.actor_id, true)
+            .await
+            .unwrap()
+            .is_empty(),
+        "posting handled the notification"
+    );
+    let (_, text) = call(&f, "thread_search", json!({"query": "argon2"})).await;
+    assert!(text.contains("Hashing"), "{text}");
+    let (_, text) = call(&f, "thread_list", json!({"chat_id": chat_id})).await;
+    assert!(text.contains("Hashing"), "{text}");
+    let (_, text) = call(&f, "chat_list", json!({})).await;
+    assert!(text.contains("direct with @frontend"), "{text}");
+
+    // A chat I am not in is closed to me.
+    let group = store
+        .create_group_chat("ops".into(), vec![other.id], f.project.human.id)
+        .await
+        .unwrap();
+    let (err, text) = call(&f, "thread_list", json!({"chat_id": group.id.to_string()})).await;
+    assert!(err);
+    assert!(text.contains("not a member"), "{text}");
+    let (err, text) = call(&f, "thread_read", json!({"thread_id": "nonsense"})).await;
+    assert!(err);
+    assert!(text.contains("not a thread id"), "{text}");
 }

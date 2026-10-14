@@ -97,6 +97,9 @@ pub struct ProjectPolicy {
     pub default_model: Option<String>,
     pub authoring_model: Option<String>,
     pub permission_profiles: Vec<PermissionProfile>,
+    /// Threads with no activity for this many days are archived. Posting
+    /// reopens them.
+    pub thread_archive_days: u32,
 }
 
 impl Default for ProjectPolicy {
@@ -115,6 +118,7 @@ impl ProjectPolicy {
             guardrails: GuardrailThresholds::default(),
             push_policy: PushPolicy::Never,
             allow_project_mcp: false,
+            thread_archive_days: 7,
             default_model: None,
             authoring_model: None,
             permission_profiles: PermissionProfile::defaults(),

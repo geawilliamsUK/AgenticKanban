@@ -10,16 +10,18 @@ use tokio::sync::mpsc::UnboundedSender;
 use std::collections::HashMap;
 
 use ak_core::approval::Approval;
+use ak_core::chat::{Thread, ThreadHit};
 use ak_core::config::{GlobalSettings, ProjectEntry, ProjectPolicy};
-use ak_core::ids::{ActorId, ProjectId, RunId, TicketId};
+use ak_core::ids::{ActorId, ChatId, ProjectId, RunId, ThreadId, TicketId};
 use ak_core::run::RunEvent;
 use ak_core::{Actor, NotificationState};
 use ak_runtime::{ClaudeCodeRunner, ClaudeProbe, HomePaths, ProjectRegistry, UtilityRunner};
 
 use crate::backend::{Backend, Request, Response, RunnerFactory};
+use crate::chats_view::ChatsState;
 use crate::dialogs::{AddProjectDialog, NewTicketDialog};
 use crate::markdown::Markdown;
-use crate::model::{BoardModel, InboxItem, LiveRun, TicketDetail};
+use crate::model::{BoardModel, ChatSummary, InboxItem, LiveRun, ThreadDetail, TicketDetail};
 use crate::settings_view::SettingsEditor;
 use crate::team_view::{AgentEditor, ProposalView, RefineStatus};
 use crate::ticket_view::TicketPanelState;
@@ -28,6 +30,7 @@ use crate::ticket_view::TicketPanelState;
 pub enum View {
     Board,
     Inbox,
+    Chats,
     Team,
     Settings,
 }
@@ -43,6 +46,9 @@ pub enum Action {
     /// `None` starts a new agent; `Some(handle)` loads an existing one.
     OpenAgent(Option<String>),
     CloseAgent,
+    SelectChat(Option<ChatId>),
+    /// Selecting a thread also switches to the Chats view.
+    SelectThread(Option<ThreadId>),
     ProbeClaude,
     Toast(String, bool),
 }
@@ -62,6 +68,14 @@ pub struct App {
     pub detail: Option<TicketDetail>,
     pub inbox: Vec<InboxItem>,
     pub view: View,
+
+    pub chats: Vec<ChatSummary>,
+    pub selected_chat: Option<ChatId>,
+    pub threads: Vec<Thread>,
+    pub selected_thread: Option<ThreadId>,
+    pub thread_detail: Option<ThreadDetail>,
+    pub thread_hits: Vec<ThreadHit>,
+    pub chats_ui: ChatsState,
 
     /// Permission profile names and default model from the open project's policy.
     pub profiles: Vec<String>,
@@ -135,6 +149,13 @@ impl App {
             selected: None,
             detail: None,
             inbox: Vec::new(),
+            chats: Vec::new(),
+            selected_chat: None,
+            threads: Vec::new(),
+            selected_thread: None,
+            thread_detail: None,
+            thread_hits: Vec::new(),
+            chats_ui: ChatsState::default(),
             view: View::Board,
             profiles: Vec::new(),
             default_model: None,
@@ -235,6 +256,13 @@ impl App {
                 self.live_runs.clear();
                 self.run_events = None;
                 self.approvals.clear();
+                self.chats.clear();
+                self.selected_chat = None;
+                self.threads.clear();
+                self.selected_thread = None;
+                self.thread_detail = None;
+                self.thread_hits.clear();
+                self.chats_ui = ChatsState::default();
                 self.ticket_panel = TicketPanelState::default();
                 if self.view != View::Settings {
                     self.view = View::Board;
@@ -469,6 +497,66 @@ impl App {
                     self.inbox = items;
                 }
             }
+            Response::Chats { project, chats } => {
+                if Some(project) == self.current {
+                    self.chats = chats;
+                    // Chats are pushed on every event; keep what is open fresh.
+                    if let Some(chat) = self.selected_chat {
+                        self.send(Request::LoadThreads {
+                            project,
+                            chat,
+                            include_archived: self.chats_ui.show_archived,
+                        });
+                    }
+                    if let Some(thread) = self.selected_thread {
+                        self.send(Request::LoadThread { project, thread });
+                    }
+                }
+            }
+            Response::Threads {
+                project,
+                chat,
+                threads,
+            } => {
+                if Some(project) == self.current && Some(chat) == self.selected_chat {
+                    self.threads = threads;
+                }
+            }
+            Response::ThreadDetail { project, detail } => {
+                if Some(project) == self.current && Some(detail.thread.id) == self.selected_thread {
+                    // Opened from the inbox: the thread may live in another chat.
+                    if self.selected_chat != Some(detail.thread.chat_id) {
+                        self.selected_chat = Some(detail.thread.chat_id);
+                        self.threads.clear();
+                        self.send(Request::LoadThreads {
+                            project,
+                            chat: detail.thread.chat_id,
+                            include_archived: self.chats_ui.show_archived,
+                        });
+                    }
+                    self.thread_detail = Some(detail);
+                }
+            }
+            Response::ThreadSearch {
+                project,
+                query,
+                hits,
+            } => {
+                if Some(project) == self.current && query == self.chats_ui.search {
+                    self.thread_hits = hits;
+                }
+            }
+            Response::ChatOpened { project, chat } => {
+                if Some(project) == self.current {
+                    self.view = View::Chats;
+                    self.actions.push(Action::SelectChat(Some(chat)));
+                }
+            }
+            Response::ThreadOpened { project, thread } => {
+                if Some(project) == self.current {
+                    self.actions.push(Action::SelectThread(Some(thread)));
+                }
+            }
             Response::Error(msg) => self.toast(msg, true),
             Response::Info(msg) => self.toast(msg, false),
         }
@@ -530,6 +618,30 @@ impl App {
                     }
                 }
                 Action::CloseAgent => self.team = None,
+                Action::SelectChat(chat) => {
+                    self.selected_chat = chat;
+                    self.selected_thread = None;
+                    self.thread_detail = None;
+                    self.threads.clear();
+                    self.chats_ui.compose.clear();
+                    self.chats_ui.new_thread = None;
+                    if let (Some(project), Some(chat)) = (self.current, chat) {
+                        self.send(Request::LoadThreads {
+                            project,
+                            chat,
+                            include_archived: self.chats_ui.show_archived,
+                        });
+                    }
+                }
+                Action::SelectThread(thread) => {
+                    self.selected_thread = thread;
+                    self.thread_detail = None;
+                    self.chats_ui.compose.clear();
+                    self.view = View::Chats;
+                    if let (Some(project), Some(thread)) = (self.current, thread) {
+                        self.send(Request::LoadThread { project, thread });
+                    }
+                }
                 Action::ProbeClaude => {
                     if !self.probing {
                         self.probing = true;
@@ -610,6 +722,12 @@ impl App {
                 .clicked()
             {
                 self.actions.push(Action::SwitchView(View::Inbox));
+            }
+            if ui
+                .selectable_label(self.view == View::Chats, "Chats")
+                .clicked()
+            {
+                self.actions.push(Action::SwitchView(View::Chats));
             }
             let agents = self.board.active_agents().count();
             let label = if agents > 0 {
@@ -761,6 +879,7 @@ impl eframe::App for App {
             match self.view {
                 View::Board => crate::board_view::draw(self, ui),
                 View::Inbox => crate::inbox_view::draw(self, ui),
+                View::Chats => crate::chats_view::draw(self, ui),
                 View::Team => crate::team_view::draw(self, ui),
                 View::Settings => unreachable!(),
             }

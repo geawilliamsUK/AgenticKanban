@@ -4,6 +4,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::chat::ChatKind;
 use crate::event::{Event, EventKind};
 use crate::ids::{ActorId, EventId, NotificationId, RunId};
 use crate::Timestamp;
@@ -11,11 +12,13 @@ use crate::Timestamp;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum NotificationKind {
-    /// Informational: something happened on a ticket you watch.
+    /// Informational: something happened on a ticket or thread you follow.
     Activity,
     Moved,
     Commented,
     Replied,
+    /// A message in a thread you are in, or a direct message.
+    Messaged,
     Assigned,
     Mentioned,
     Unfrozen,
@@ -30,6 +33,7 @@ impl NotificationKind {
             NotificationKind::Moved => "moved",
             NotificationKind::Commented => "commented",
             NotificationKind::Replied => "replied",
+            NotificationKind::Messaged => "messaged",
             NotificationKind::Assigned => "assigned",
             NotificationKind::Mentioned => "mentioned",
             NotificationKind::Unfrozen => "unfrozen",
@@ -43,6 +47,7 @@ impl NotificationKind {
             "moved" => Some(NotificationKind::Moved),
             "commented" => Some(NotificationKind::Commented),
             "replied" => Some(NotificationKind::Replied),
+            "messaged" => Some(NotificationKind::Messaged),
             "assigned" => Some(NotificationKind::Assigned),
             "mentioned" => Some(NotificationKind::Mentioned),
             "unfrozen" => Some(NotificationKind::Unfrozen),
@@ -56,7 +61,8 @@ impl NotificationKind {
 #[serde(rename_all = "snake_case")]
 pub enum NotificationState {
     Pending,
-    /// Created while the subject ticket was frozen. Released to Pending on unfreeze.
+    /// Created while the subject was frozen or paused. Released to Pending
+    /// on unfreeze or unpause.
     Held,
     Seen,
     Handled,
@@ -112,6 +118,18 @@ pub struct NotificationDraft {
     pub state: NotificationState,
 }
 
+/// The chat an event happened in, for thread events.
+#[derive(Debug, Clone, Default)]
+pub struct ChatRouting {
+    pub direct: bool,
+    pub members: Vec<ActorId>,
+    /// Everyone who has posted in the thread so far.
+    pub participants: Vec<ActorId>,
+    /// Informed of direct messages without being woken: the human, when
+    /// not a member of the chat.
+    pub observers: Vec<ActorId>,
+}
+
 /// Everything the router needs to know about the event's subject.
 #[derive(Debug, Clone, Default)]
 pub struct RoutingContext {
@@ -119,13 +137,17 @@ pub struct RoutingContext {
     pub reporter_id: Option<ActorId>,
     /// Watchers other than reporter and assignee; the router unions them.
     pub watchers: Vec<ActorId>,
-    /// Whether the subject ticket is frozen after this event was applied.
+    /// Whether the subject is frozen (ticket) or paused (thread) after this
+    /// event was applied.
     pub frozen: bool,
+    pub chat: Option<ChatRouting>,
+    /// A human's message in a thread wakes the agents in it.
+    pub actor_is_human: bool,
 }
 
 /// Decide recipients for an event. Never notifies the actor who caused it,
 /// collapses to one draft per recipient, and holds notifications on frozen
-/// tickets except for the unfreeze itself.
+/// tickets and paused threads except for the unfreeze or unpause itself.
 pub fn route(event: &Event, ctx: &RoutingContext) -> Vec<NotificationDraft> {
     let actor = event.actor_id;
     let mut drafts: Vec<NotificationDraft> = Vec::new();
@@ -230,9 +252,68 @@ pub fn route(event: &Event, ctx: &RoutingContext) -> Vec<NotificationDraft> {
         EventKind::MentionCreated { mentioned_id, .. } => {
             push(*mentioned_id, NotificationKind::Mentioned, true);
         }
+        // A direct chat is silent until a message arrives; a group is announced.
+        EventKind::ChatCreated {
+            kind: ChatKind::Group,
+            member_ids,
+            ..
+        } => {
+            for m in member_ids {
+                push(*m, NotificationKind::Activity, false);
+            }
+        }
+        EventKind::ChatCreated { .. } => {}
+        EventKind::ChatMemberAdded { member_id, .. } => {
+            push(*member_id, NotificationKind::Activity, false);
+        }
+        EventKind::ThreadCreated { .. } => {
+            // The first message routes on its own; a new group thread is
+            // announced to the members without waking them.
+            if let Some(c) = &ctx.chat {
+                if !c.direct {
+                    for m in &c.members {
+                        push(*m, NotificationKind::Activity, false);
+                    }
+                }
+            }
+        }
+        EventKind::ThreadMessagePosted { .. } => {
+            if let Some(c) = &ctx.chat {
+                if c.direct {
+                    for m in &c.members {
+                        push(*m, NotificationKind::Messaged, true);
+                    }
+                    for o in &c.observers {
+                        push(*o, NotificationKind::Messaged, false);
+                    }
+                } else {
+                    for p in &c.participants {
+                        push(*p, NotificationKind::Messaged, ctx.actor_is_human);
+                    }
+                }
+            }
+        }
+        EventKind::ThreadPaused { .. } => {
+            if let Some(c) = &ctx.chat {
+                for p in &c.participants {
+                    push(*p, NotificationKind::Activity, false);
+                }
+            }
+        }
+        EventKind::ThreadUnpaused { .. } => {
+            if let Some(c) = &ctx.chat {
+                for p in &c.participants {
+                    push(*p, NotificationKind::Unfrozen, true);
+                }
+            }
+        }
     }
 
-    let hold = ctx.frozen && !matches!(event.kind, EventKind::TicketUnfrozen { .. });
+    let hold = ctx.frozen
+        && !matches!(
+            event.kind,
+            EventKind::TicketUnfrozen { .. } | EventKind::ThreadUnpaused { .. }
+        );
     if hold {
         for d in &mut drafts {
             d.state = NotificationState::Held;
@@ -244,11 +325,20 @@ pub fn route(event: &Event, ctx: &RoutingContext) -> Vec<NotificationDraft> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ids::{ColumnId, CommentId, TicketId};
+    use crate::ids::{ChatId, ColumnId, CommentId, MessageId, ThreadId, TicketId};
     use chrono::Utc;
 
     fn ev(actor: ActorId, kind: EventKind) -> Event {
         Event::new(actor, Utc::now(), kind)
+    }
+
+    fn posted() -> EventKind {
+        EventKind::ThreadMessagePosted {
+            chat_id: ChatId::new(),
+            thread_id: ThreadId::new(),
+            message_id: MessageId::new(),
+            title: "t".into(),
+        }
     }
 
     #[test]
@@ -268,7 +358,7 @@ mod tests {
             assignee_id: Some(agent),
             reporter_id: Some(human),
             watchers: vec![watcher],
-            frozen: false,
+            ..Default::default()
         };
         let drafts = route(&e, &ctx);
         let to_agent = drafts.iter().find(|d| d.recipient_id == agent).unwrap();
@@ -297,10 +387,8 @@ mod tests {
         );
         // parent author is also a watcher: must get exactly one draft, with wake.
         let ctx = RoutingContext {
-            assignee_id: None,
-            reporter_id: None,
             watchers: vec![parent_author],
-            frozen: false,
+            ..Default::default()
         };
         let drafts = route(&e, &ctx);
         assert_eq!(drafts.len(), 1);
@@ -314,9 +402,8 @@ mod tests {
         let agent = ActorId::new();
         let ctx = RoutingContext {
             assignee_id: Some(agent),
-            reporter_id: None,
-            watchers: vec![],
             frozen: true,
+            ..Default::default()
         };
         let moved = ev(
             human,
@@ -358,5 +445,109 @@ mod tests {
             },
         );
         assert!(route(&e, &RoutingContext::default()).is_empty());
+    }
+
+    #[test]
+    fn direct_messages_wake_the_other_member_and_inform_the_observer() {
+        let a = ActorId::new();
+        let b = ActorId::new();
+        let human = ActorId::new();
+        let ctx = RoutingContext {
+            chat: Some(ChatRouting {
+                direct: true,
+                members: vec![a, b],
+                participants: vec![a],
+                observers: vec![human],
+            }),
+            ..Default::default()
+        };
+        let drafts = route(&ev(a, posted()), &ctx);
+        assert_eq!(drafts.len(), 2);
+        let to_b = drafts.iter().find(|d| d.recipient_id == b).unwrap();
+        assert_eq!(to_b.kind, NotificationKind::Messaged);
+        assert!(to_b.wake);
+        let to_human = drafts.iter().find(|d| d.recipient_id == human).unwrap();
+        assert!(!to_human.wake);
+    }
+
+    #[test]
+    fn group_posts_reach_participants_and_wake_only_for_the_human() {
+        let a = ActorId::new();
+        let b = ActorId::new();
+        let c = ActorId::new();
+        let human = ActorId::new();
+        let ctx = RoutingContext {
+            chat: Some(ChatRouting {
+                direct: false,
+                members: vec![a, b, c],
+                participants: vec![a, b],
+                observers: vec![],
+            }),
+            ..Default::default()
+        };
+        let drafts = route(&ev(a, posted()), &ctx);
+        assert_eq!(drafts.len(), 1, "only the other participant");
+        assert_eq!(drafts[0].recipient_id, b);
+        assert!(!drafts[0].wake);
+
+        let ctx_human = RoutingContext {
+            actor_is_human: true,
+            ..ctx.clone()
+        };
+        let drafts = route(&ev(human, posted()), &ctx_human);
+        assert_eq!(drafts.len(), 2);
+        assert!(drafts.iter().all(|d| d.wake), "the human's post wakes them");
+
+        // A new group thread is announced to members without waking them.
+        let created = ev(
+            a,
+            EventKind::ThreadCreated {
+                chat_id: ChatId::new(),
+                thread_id: ThreadId::new(),
+                title: "t".into(),
+            },
+        );
+        let drafts = route(&created, &ctx);
+        assert_eq!(drafts.len(), 2);
+        assert!(drafts.iter().all(|d| !d.wake));
+    }
+
+    #[test]
+    fn paused_threads_hold_until_unpaused() {
+        let a = ActorId::new();
+        let b = ActorId::new();
+        let human = ActorId::new();
+        let chat = ChatRouting {
+            direct: true,
+            members: vec![a, b],
+            participants: vec![a, b],
+            observers: vec![human],
+        };
+        let ctx = RoutingContext {
+            frozen: true,
+            chat: Some(chat.clone()),
+            actor_is_human: true,
+            ..Default::default()
+        };
+        let drafts = route(&ev(human, posted()), &ctx);
+        assert!(drafts.iter().all(|d| d.state == NotificationState::Held));
+
+        let unpaused = ev(
+            human,
+            EventKind::ThreadUnpaused {
+                chat_id: ChatId::new(),
+                thread_id: ThreadId::new(),
+                title: "t".into(),
+            },
+        );
+        let ctx_after = RoutingContext {
+            frozen: false,
+            ..ctx.clone()
+        };
+        let drafts = route(&unpaused, &ctx_after);
+        assert_eq!(drafts.len(), 2);
+        assert!(drafts
+            .iter()
+            .all(|d| d.wake && d.kind == NotificationKind::Unfrozen));
     }
 }

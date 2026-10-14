@@ -5,6 +5,7 @@
 mod app;
 mod backend;
 mod board_view;
+mod chats_view;
 mod dialogs;
 mod diff_view;
 mod inbox_view;

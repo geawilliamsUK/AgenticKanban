@@ -18,10 +18,12 @@ use tokio::sync::broadcast;
 use ak_core::agent::{Agent, AgentState};
 use ak_core::approval::{Approval, ApprovalState};
 use ak_core::board::{Column, Comment, Ticket};
+use ak_core::chat::{Chat, Message, Thread, ThreadHit};
 use ak_core::commands::{NewTicket, TicketPatch};
 use ak_core::config::ProjectPolicy;
 use ak_core::ids::{
-    ActorId, ApprovalId, CallId, ColumnId, CommentId, NotificationId, RunId, TicketId,
+    ActorId, ApprovalId, CallId, ChatId, ColumnId, CommentId, NotificationId, RunId, ThreadId,
+    TicketId,
 };
 use ak_core::run::{AgentRun, RunEvent};
 use ak_core::utility::{UtilityCall, UtilityKind};
@@ -151,6 +153,55 @@ pub trait Store: Send + Sync {
     ) -> Result<Vec<UtilityCall>>;
     /// Total recorded cost of calls started at or after `since`.
     async fn utility_cost_since(&self, since: Timestamp) -> Result<f64>;
+
+    // Chats and threads.
+    /// Every chat, for the human, who observes all of them.
+    async fn chats(&self) -> Result<Vec<Chat>>;
+    /// Chats the actor is a member of.
+    async fn chats_for(&self, actor: ActorId) -> Result<Vec<Chat>>;
+    async fn chat(&self, id: ChatId) -> Result<Chat>;
+    async fn chat_members(&self, id: ChatId) -> Result<Vec<ActorId>>;
+    /// The direct chat between two actors, created on first use.
+    async fn direct_chat(&self, a: ActorId, b: ActorId, actor: ActorId) -> Result<Chat>;
+    async fn create_group_chat(
+        &self,
+        name: String,
+        members: Vec<ActorId>,
+        actor: ActorId,
+    ) -> Result<Chat>;
+    async fn add_chat_member(&self, chat: ChatId, member: ActorId, actor: ActorId) -> Result<()>;
+    /// Threads in a chat, most recent activity first.
+    async fn threads(&self, chat: ChatId, include_archived: bool) -> Result<Vec<Thread>>;
+    async fn thread(&self, id: ThreadId) -> Result<Thread>;
+    /// Everyone who has posted in the thread.
+    async fn thread_participants(&self, id: ThreadId) -> Result<Vec<ActorId>>;
+    async fn messages(&self, thread: ThreadId) -> Result<Vec<Message>>;
+    async fn create_thread(
+        &self,
+        chat: ChatId,
+        title: String,
+        body: String,
+        actor: ActorId,
+    ) -> Result<(Thread, Message)>;
+    /// Posts in a thread. Reopens an archived thread.
+    async fn post_message(&self, thread: ThreadId, body: String, actor: ActorId)
+        -> Result<Message>;
+    async fn set_thread_paused(
+        &self,
+        thread: ThreadId,
+        paused: bool,
+        actor: ActorId,
+    ) -> Result<Thread>;
+    /// Full-text search over titles and bodies. With an actor, scoped to the
+    /// chats that actor is a member of.
+    async fn search_threads(
+        &self,
+        actor: Option<ActorId>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ThreadHit>>;
+    /// Archives threads with no activity since the given time. Returns how many.
+    async fn archive_idle_threads(&self, idle_since: Timestamp) -> Result<u64>;
 
     // Used by the bridge on behalf of agent runs.
 

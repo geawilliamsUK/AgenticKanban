@@ -389,6 +389,21 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             }
                             ui.end_row();
 
+                            ui.label("Archive idle threads after");
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .add(
+                                        egui::DragValue::new(&mut policy.thread_archive_days)
+                                            .range(1..=365),
+                                    )
+                                    .changed()
+                                {
+                                    editor.project_dirty = true;
+                                }
+                                ui.weak("days without activity. Posting reopens a thread.");
+                            });
+                            ui.end_row();
+
                             ui.label("Push policy");
                             egui::ComboBox::from_id_salt("push_policy")
                                 .selected_text(match policy.push_policy {

@@ -4,7 +4,8 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::ids::{ActorId, ColumnId, CommentId, EventId, TicketId};
+use crate::chat::ChatKind;
+use crate::ids::{ActorId, ChatId, ColumnId, CommentId, EventId, MessageId, ThreadId, TicketId};
 use crate::Timestamp;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -37,18 +38,24 @@ impl Event {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Subject {
     Ticket(TicketId),
+    Thread(ThreadId),
+    Chat(ChatId),
 }
 
 impl Subject {
     pub fn kind_str(&self) -> &'static str {
         match self {
             Subject::Ticket(_) => "ticket",
+            Subject::Thread(_) => "thread",
+            Subject::Chat(_) => "chat",
         }
     }
 
     pub fn id_string(&self) -> String {
         match self {
             Subject::Ticket(id) => id.to_string(),
+            Subject::Thread(id) => id.to_string(),
+            Subject::Chat(id) => id.to_string(),
         }
     }
 }
@@ -72,13 +79,25 @@ pub enum MentionSource {
         ticket_id: TicketId,
         comment_id: CommentId,
     },
+    Message {
+        thread_id: ThreadId,
+        message_id: MessageId,
+    },
 }
 
 impl MentionSource {
-    pub fn ticket_id(&self) -> TicketId {
+    pub fn ticket_id(&self) -> Option<TicketId> {
         match self {
-            MentionSource::TicketDescription { ticket_id } => *ticket_id,
-            MentionSource::Comment { ticket_id, .. } => *ticket_id,
+            MentionSource::TicketDescription { ticket_id } => Some(*ticket_id),
+            MentionSource::Comment { ticket_id, .. } => Some(*ticket_id),
+            MentionSource::Message { .. } => None,
+        }
+    }
+
+    pub fn thread_id(&self) -> Option<ThreadId> {
+        match self {
+            MentionSource::Message { thread_id, .. } => Some(*thread_id),
+            _ => None,
         }
     }
 }
@@ -128,6 +147,39 @@ pub enum EventKind {
         source: MentionSource,
         mentioned_id: ActorId,
     },
+    ChatCreated {
+        chat_id: ChatId,
+        kind: ChatKind,
+        name: Option<String>,
+        member_ids: Vec<ActorId>,
+    },
+    ChatMemberAdded {
+        chat_id: ChatId,
+        member_id: ActorId,
+    },
+    ThreadCreated {
+        chat_id: ChatId,
+        thread_id: ThreadId,
+        title: String,
+    },
+    /// Titles are repeated on thread events so timelines need no lookup;
+    /// threads are never renamed.
+    ThreadMessagePosted {
+        chat_id: ChatId,
+        thread_id: ThreadId,
+        message_id: MessageId,
+        title: String,
+    },
+    ThreadPaused {
+        chat_id: ChatId,
+        thread_id: ThreadId,
+        title: String,
+    },
+    ThreadUnpaused {
+        chat_id: ChatId,
+        thread_id: ThreadId,
+        title: String,
+    },
 }
 
 impl EventKind {
@@ -143,6 +195,12 @@ impl EventKind {
             EventKind::TicketFrozen { .. } => "ticket.frozen",
             EventKind::TicketUnfrozen { .. } => "ticket.unfrozen",
             EventKind::MentionCreated { .. } => "mention.created",
+            EventKind::ChatCreated { .. } => "chat.created",
+            EventKind::ChatMemberAdded { .. } => "chat.member_added",
+            EventKind::ThreadCreated { .. } => "thread.created",
+            EventKind::ThreadMessagePosted { .. } => "thread.message_posted",
+            EventKind::ThreadPaused { .. } => "thread.paused",
+            EventKind::ThreadUnpaused { .. } => "thread.unpaused",
         }
     }
 
@@ -156,13 +214,43 @@ impl EventKind {
             | EventKind::TicketReplied { ticket_id, .. }
             | EventKind::TicketFrozen { ticket_id, .. }
             | EventKind::TicketUnfrozen { ticket_id } => Subject::Ticket(*ticket_id),
-            EventKind::MentionCreated { source, .. } => Subject::Ticket(source.ticket_id()),
+            EventKind::MentionCreated { source, .. } => match source {
+                MentionSource::Message { thread_id, .. } => Subject::Thread(*thread_id),
+                other => Subject::Ticket(other.ticket_id().expect("ticket mention")),
+            },
+            EventKind::ChatCreated { chat_id, .. } | EventKind::ChatMemberAdded { chat_id, .. } => {
+                Subject::Chat(*chat_id)
+            }
+            EventKind::ThreadCreated { thread_id, .. }
+            | EventKind::ThreadMessagePosted { thread_id, .. }
+            | EventKind::ThreadPaused { thread_id, .. }
+            | EventKind::ThreadUnpaused { thread_id, .. } => Subject::Thread(*thread_id),
         }
     }
 
     pub fn ticket_id(&self) -> Option<TicketId> {
         match self.subject() {
             Subject::Ticket(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    pub fn thread_id(&self) -> Option<ThreadId> {
+        match self.subject() {
+            Subject::Thread(id) => Some(id),
+            _ => None,
+        }
+    }
+
+    pub fn chat_id(&self) -> Option<ChatId> {
+        match self {
+            EventKind::ChatCreated { chat_id, .. }
+            | EventKind::ChatMemberAdded { chat_id, .. }
+            | EventKind::ThreadCreated { chat_id, .. }
+            | EventKind::ThreadMessagePosted { chat_id, .. }
+            | EventKind::ThreadPaused { chat_id, .. }
+            | EventKind::ThreadUnpaused { chat_id, .. } => Some(*chat_id),
+            _ => None,
         }
     }
 }
@@ -182,5 +270,27 @@ mod tests {
         assert!(json.contains("\"type\":\"ticket_moved\""));
         let back: EventKind = serde_json::from_str(&json).unwrap();
         assert_eq!(kind, back);
+    }
+
+    #[test]
+    fn subjects_follow_the_kind() {
+        let thread_id = ThreadId::new();
+        let posted = EventKind::ThreadMessagePosted {
+            chat_id: ChatId::new(),
+            thread_id,
+            message_id: MessageId::new(),
+            title: "t".into(),
+        };
+        assert_eq!(posted.subject(), Subject::Thread(thread_id));
+        assert_eq!(posted.thread_id(), Some(thread_id));
+        assert_eq!(posted.ticket_id(), None);
+        let mention = EventKind::MentionCreated {
+            source: MentionSource::Message {
+                thread_id,
+                message_id: MessageId::new(),
+            },
+            mentioned_id: ActorId::new(),
+        };
+        assert_eq!(mention.subject().kind_str(), "thread");
     }
 }

@@ -1,5 +1,6 @@
 //! SQLite implementation of `Store`.
 
+mod chats;
 mod rows;
 
 use std::path::Path;
@@ -16,6 +17,7 @@ use tokio::sync::broadcast;
 use ak_core::agent::{Agent, AgentState};
 use ak_core::approval::{Approval, ApprovalState};
 use ak_core::board::{Column, Comment, Ticket};
+use ak_core::chat::{Chat, Message, Thread, ThreadHit};
 use ak_core::commands::{self, NewTicket, TicketPatch};
 use ak_core::config::ProjectPolicy;
 use ak_core::event::{EventKind, MentionSource};
@@ -267,7 +269,19 @@ impl SqliteStore {
             reporter_id: Some(ticket.reporter_id),
             watchers,
             frozen: ticket.frozen,
+            ..Default::default()
         };
+        Self::append_events_with(tx, actor, now, kinds, &ctx).await
+    }
+
+    /// Appends events and routes notifications with a ready routing context.
+    async fn append_events_with(
+        tx: &mut Transaction<'_, Sqlite>,
+        actor: &Actor,
+        now: Timestamp,
+        kinds: Vec<EventKind>,
+        ctx: &RoutingContext,
+    ) -> Result<Vec<Event>> {
         let mut persisted = Vec::with_capacity(kinds.len());
         for kind in kinds {
             let mut event = Event::new(actor.id, now, kind);
@@ -287,7 +301,7 @@ impl SqliteStore {
             .await?;
             event.seq = result.last_insert_rowid();
 
-            for draft in notification::route(&event, &ctx) {
+            for draft in notification::route(&event, ctx) {
                 sqlx::query(
                     "INSERT INTO notifications (id, recipient_id, event_id, kind, wake, state, created_at) \
                      VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -918,6 +932,96 @@ impl Store for SqliteStore {
         .fetch_all(&self.pool)
         .await?;
         rows.iter().map(utility_call_from_row).collect()
+    }
+
+    async fn chats(&self) -> Result<Vec<Chat>> {
+        self.chats_impl().await
+    }
+
+    async fn chats_for(&self, actor: ActorId) -> Result<Vec<Chat>> {
+        self.chats_for_impl(actor).await
+    }
+
+    async fn chat(&self, id: ChatId) -> Result<Chat> {
+        self.chat_impl(id).await
+    }
+
+    async fn chat_members(&self, id: ChatId) -> Result<Vec<ActorId>> {
+        self.chat_members_impl(id).await
+    }
+
+    async fn direct_chat(&self, a: ActorId, b: ActorId, actor: ActorId) -> Result<Chat> {
+        self.direct_chat_impl(a, b, actor).await
+    }
+
+    async fn create_group_chat(
+        &self,
+        name: String,
+        members: Vec<ActorId>,
+        actor: ActorId,
+    ) -> Result<Chat> {
+        self.create_group_chat_impl(name, members, actor).await
+    }
+
+    async fn add_chat_member(&self, chat: ChatId, member: ActorId, actor: ActorId) -> Result<()> {
+        self.add_chat_member_impl(chat, member, actor).await
+    }
+
+    async fn threads(&self, chat: ChatId, include_archived: bool) -> Result<Vec<Thread>> {
+        self.threads_impl(chat, include_archived).await
+    }
+
+    async fn thread(&self, id: ThreadId) -> Result<Thread> {
+        self.thread_impl(id).await
+    }
+
+    async fn thread_participants(&self, id: ThreadId) -> Result<Vec<ActorId>> {
+        self.thread_participants_impl(id).await
+    }
+
+    async fn messages(&self, thread: ThreadId) -> Result<Vec<Message>> {
+        self.messages_impl(thread).await
+    }
+
+    async fn create_thread(
+        &self,
+        chat: ChatId,
+        title: String,
+        body: String,
+        actor: ActorId,
+    ) -> Result<(Thread, Message)> {
+        self.create_thread_impl(chat, title, body, actor).await
+    }
+
+    async fn post_message(
+        &self,
+        thread: ThreadId,
+        body: String,
+        actor: ActorId,
+    ) -> Result<Message> {
+        self.post_message_impl(thread, body, actor).await
+    }
+
+    async fn set_thread_paused(
+        &self,
+        thread: ThreadId,
+        paused: bool,
+        actor: ActorId,
+    ) -> Result<Thread> {
+        self.set_thread_paused_impl(thread, paused, actor).await
+    }
+
+    async fn search_threads(
+        &self,
+        actor: Option<ActorId>,
+        query: &str,
+        limit: usize,
+    ) -> Result<Vec<ThreadHit>> {
+        self.search_threads_impl(actor, query, limit).await
+    }
+
+    async fn archive_idle_threads(&self, idle_since: Timestamp) -> Result<u64> {
+        self.archive_idle_threads_impl(idle_since).await
     }
 
     async fn utility_cost_since(&self, since: Timestamp) -> Result<f64> {
