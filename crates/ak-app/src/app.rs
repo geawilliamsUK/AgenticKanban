@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use ak_core::approval::Approval;
 use ak_core::chat::{Thread, ThreadHit};
-use ak_core::config::{GlobalSettings, ProjectEntry, ProjectPolicy};
+use ak_core::config::{GlobalSettings, ProjectEntry, ProjectPolicy, ThemeMode};
 use ak_core::ids::{ActorId, ChatId, ProjectId, RunId, ThreadId, TicketId};
 use ak_core::run::RunEvent;
 use ak_core::{Actor, NotificationState};
@@ -124,6 +124,8 @@ pub struct App {
     pub actions: Vec<Action>,
     toast: Option<(Instant, String, bool)>,
     backdrop: Backdrop,
+    /// The UI context, kept so settings can change the theme as they arrive.
+    egui: egui::Context,
 }
 
 impl App {
@@ -133,6 +135,7 @@ impl App {
         let ctx = cc.egui_ctx.clone();
         theme::install(&ctx);
         let backdrop = Backdrop::new(&ctx);
+        let egui = ctx.clone();
 
         let mut instance = None;
         let startup_error = match HomePaths::resolve()
@@ -210,6 +213,7 @@ impl App {
             actions: Vec::new(),
             toast: None,
             backdrop,
+            egui,
         }
     }
 
@@ -378,6 +382,7 @@ impl App {
                 if let Some(e) = self.settings_editor.as_mut() {
                     e.refresh_global(&settings);
                 }
+                apply_theme(&self.egui, settings.theme);
                 self.settings = Some(settings);
             }
             Response::ClaudeProbe(probe) => {
@@ -542,7 +547,7 @@ impl App {
                         self.send(Request::LoadThreads {
                             project,
                             chat,
-                            include_archived: self.chats_ui.show_archived,
+                            include_archived: true,
                         });
                     }
                     if let Some(thread) = self.selected_thread {
@@ -568,7 +573,7 @@ impl App {
                         self.send(Request::LoadThreads {
                             project,
                             chat: detail.thread.chat_id,
-                            include_archived: self.chats_ui.show_archived,
+                            include_archived: true,
                         });
                     }
                     self.thread_detail = Some(detail);
@@ -705,7 +710,7 @@ impl App {
                         self.send(Request::LoadThreads {
                             project,
                             chat,
-                            include_archived: self.chats_ui.show_archived,
+                            include_archived: true,
                         });
                     }
                 }
@@ -817,7 +822,33 @@ impl App {
             if widgets::nav_item(ui, "Settings", self.view == View::Settings).clicked() {
                 self.actions.push(Action::SwitchView(View::Settings));
             }
+            if let Some(current) = self.settings.as_ref().map(|s| s.theme) {
+                let mut mode = current;
+                ui.horizontal(|ui| {
+                    for (m, label) in [
+                        (ThemeMode::System, "Auto"),
+                        (ThemeMode::Light, "Light"),
+                        (ThemeMode::Dark, "Dark"),
+                    ] {
+                        ui.selectable_value(&mut mode, m, label)
+                            .on_hover_text("Auto follows the Windows setting.");
+                    }
+                });
+                if mode != current {
+                    self.set_theme(mode);
+                }
+            }
         });
+    }
+
+    /// Applies a theme now and saves it with the other global settings.
+    fn set_theme(&mut self, mode: ThemeMode) {
+        apply_theme(&self.egui, mode);
+        if let Some(s) = self.settings.as_mut() {
+            s.theme = mode;
+            let settings = s.clone();
+            self.send(Request::SaveGlobalSettings(settings));
+        }
     }
 
     fn draw_toast(&mut self, ctx: &egui::Context) {
@@ -974,4 +1005,13 @@ impl eframe::App for App {
         self.draw_toast(ctx);
         self.dispatch_actions();
     }
+}
+
+/// Tells egui which of the two installed styles to draw with.
+fn apply_theme(ctx: &egui::Context, mode: ThemeMode) {
+    ctx.set_theme(match mode {
+        ThemeMode::System => egui::ThemePreference::System,
+        ThemeMode::Light => egui::ThemePreference::Light,
+        ThemeMode::Dark => egui::ThemePreference::Dark,
+    });
 }

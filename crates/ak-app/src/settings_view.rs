@@ -2,7 +2,7 @@
 
 use std::path::PathBuf;
 
-use ak_core::config::{GlobalSettings, ProjectPolicy, PushPolicy};
+use ak_core::config::{GlobalSettings, ProjectPolicy, PushPolicy, ThemeMode};
 
 use crate::app::{Action, App};
 use crate::backend::Request;
@@ -176,6 +176,23 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 
                         ui.label("Agent bridge");
                         ui.label(bridge_line.clone());
+                        ui.end_row();
+
+                        ui.label("Appearance");
+                        ui.horizontal(|ui| {
+                            for (m, label) in [
+                                (ThemeMode::System, "Follow Windows"),
+                                (ThemeMode::Light, "Light"),
+                                (ThemeMode::Dark, "Dark"),
+                            ] {
+                                if ui
+                                    .selectable_value(&mut editor.global.theme, m, label)
+                                    .changed()
+                                {
+                                    editor.global_dirty = true;
+                                }
+                            }
+                        });
                         ui.end_row();
 
                         ui.label("Claude Code binary");

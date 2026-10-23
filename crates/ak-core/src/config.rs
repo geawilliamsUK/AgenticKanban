@@ -30,6 +30,17 @@ impl HomeConfig {
     }
 }
 
+/// Which look the app uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeMode {
+    /// Follow the operating system's setting.
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GlobalSettings {
@@ -49,6 +60,7 @@ pub struct GlobalSettings {
     pub authoring_model: Option<String>,
     /// Days to keep per-run directories.
     pub run_retention_days: u32,
+    pub theme: ThemeMode,
 }
 
 impl Default for GlobalSettings {
@@ -62,6 +74,7 @@ impl Default for GlobalSettings {
             global_daily_budget_usd: 100.0,
             authoring_model: None,
             run_retention_days: 30,
+            theme: ThemeMode::System,
         }
     }
 }
@@ -121,7 +134,7 @@ impl ProjectPolicy {
             guardrails: GuardrailThresholds::default(),
             push_policy: PushPolicy::Never,
             allow_project_mcp: false,
-            thread_archive_days: 7,
+            thread_archive_days: 30,
             integration_branch: None,
             default_model: None,
             authoring_model: None,

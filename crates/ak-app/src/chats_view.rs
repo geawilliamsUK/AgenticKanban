@@ -188,16 +188,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         if ui.small_button("New thread").clicked() {
                             app.chats_ui.new_thread = Some((String::new(), String::new()));
                         }
-                        if ui
-                            .checkbox(&mut app.chats_ui.show_archived, "archived")
-                            .changed()
-                        {
-                            app.actions.push(Action::Request(Request::LoadThreads {
-                                project,
-                                chat: chat_id,
-                                include_archived: app.chats_ui.show_archived,
-                            }));
-                        }
+                        ui.checkbox(&mut app.chats_ui.show_archived, "archived")
+                            .on_hover_text("Threads with no activity for the project's archive period. Posting in one reopens it.");
                     });
                 });
                 if let Some(c) = &chat {
@@ -250,9 +242,21 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     app.chats_ui.new_thread = None;
                 }
 
-                let threads = app.threads.clone();
+                let hidden = app.threads.iter().filter(|t| t.archived).count();
+                let threads: Vec<_> = app
+                    .threads
+                    .iter()
+                    .filter(|t| app.chats_ui.show_archived || !t.archived)
+                    .cloned()
+                    .collect();
                 if threads.is_empty() {
-                    ui.weak("No threads yet. Every message lives in a thread with a title.");
+                    if hidden > 0 {
+                        ui.weak(format!(
+                            "{hidden} archived thread(s) are hidden. Tick \"archived\" to see them; posting in one reopens it."
+                        ));
+                    } else {
+                        ui.weak("No threads yet. Every message lives in a thread with a title.");
+                    }
                 }
                 egui::ScrollArea::vertical()
                     .id_salt("thread_list_scroll")
