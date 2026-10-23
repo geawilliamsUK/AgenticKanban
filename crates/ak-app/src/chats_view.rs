@@ -8,6 +8,8 @@ use ak_core::ids::ActorId;
 use crate::app::{Action, App};
 use crate::backend::Request;
 use crate::model::format_time;
+use crate::theme::{self, Tone};
+use crate::widgets;
 
 /// Transient state for the Chats view: drafts and toggles.
 #[derive(Default)]
@@ -31,8 +33,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         .resizable(true)
         .default_width(240.0)
         .show_inside(ui, |ui| {
+            ui.heading("Chats");
             ui.horizontal(|ui| {
-                ui.heading("Chats");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .small_button("New group…")
@@ -85,6 +87,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             if let Some((name, members)) = app.chats_ui.new_group.as_mut() {
                 ui.add(
                     egui::TextEdit::singleline(name)
+                        .id_salt("new_group_name")
                         .hint_text("Group name")
                         .desired_width(f32::INFINITY),
                 );
@@ -98,7 +101,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         .map(|(id, _)| *id)
                         .collect();
                     let ok = !name.trim().is_empty() && !chosen.is_empty();
-                    if ui.add_enabled(ok, egui::Button::new("Create")).clicked() {
+                    if widgets::filled_button_if(ui, ok, "Create", Tone::Accent).clicked() {
                         submit_group = Some((name.clone(), chosen));
                     }
                     if ui.button("Cancel").clicked() {
@@ -121,6 +124,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 
             let search = ui.add(
                 egui::TextEdit::singleline(&mut app.chats_ui.search)
+                    .id_salt("thread_search")
                     .hint_text("Search threads…")
                     .desired_width(f32::INFINITY),
             );
@@ -174,12 +178,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             .resizable(true)
             .default_width(280.0)
             .show_inside(ui, |ui| {
+                let title = chat
+                    .as_ref()
+                    .map(|c| c.label(&app.board, human))
+                    .unwrap_or_default();
+                ui.heading(title);
                 ui.horizontal(|ui| {
-                    let title = chat
-                        .as_ref()
-                        .map(|c| c.label(&app.board, human))
-                        .unwrap_or_default();
-                    ui.heading(title);
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.small_button("New thread").clicked() {
                             app.chats_ui.new_thread = Some((String::new(), String::new()));
@@ -209,6 +213,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 if let Some((title, body)) = app.chats_ui.new_thread.as_mut() {
                     ui.add(
                         egui::TextEdit::singleline(title)
+                            .id_salt("new_thread_title")
                             .hint_text("Thread title")
                             .desired_width(f32::INFINITY),
                     );
@@ -222,9 +227,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     );
                     ui.horizontal(|ui| {
                         let ok = !title.trim().is_empty() && !body.trim().is_empty();
-                        if ui
-                            .add_enabled(ok, egui::Button::new("Start thread"))
-                            .clicked()
+                        if widgets::filled_button_if(ui, ok, "Start thread", Tone::Accent).clicked()
                         {
                             submit = Some((title.clone(), body.clone()));
                         }
@@ -289,10 +292,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             });
             return;
         };
+        ui.heading(&detail.thread.title);
         ui.horizontal(|ui| {
-            ui.heading(&detail.thread.title);
             if detail.thread.paused {
-                ui.colored_label(egui::Color32::from_rgb(240, 120, 120), "paused");
+                widgets::chip(ui, Tone::Red, "paused");
             }
             if detail.thread.archived {
                 ui.weak("archived");
@@ -336,26 +339,21 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             .show(ui, |ui| {
                 for m in &detail.messages {
                     let mine = human == Some(m.author_id);
-                    let fill = if mine {
-                        ui.visuals().faint_bg_color
+                    let frame = theme::card(ui.style());
+                    let frame = if mine {
+                        frame.fill(theme::palette(ui.style()).tone_fill(Tone::Accent))
                     } else {
-                        ui.visuals().window_fill
+                        frame
                     };
-                    egui::Frame::new()
-                        .fill(fill)
-                        .corner_radius(4.0)
-                        .inner_margin(8.0)
-                        .show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    egui::RichText::new(app.board.handle(m.author_id)).strong(),
-                                );
-                                ui.weak(format_time(&m.created_at));
-                            });
-                            app.markdown.show(ui, &m.body);
+                    theme::glass(ui, frame, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(app.board.handle(m.author_id)).strong());
+                            ui.weak(format_time(&m.created_at));
                         });
-                    ui.add_space(4.0);
+                        app.markdown.show(ui, &m.body);
+                    });
+                    ui.add_space(8.0);
                 }
             });
 
@@ -372,9 +370,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             && ui.input(|i| i.modifiers.command && i.key_pressed(egui::Key::Enter));
         ui.horizontal(|ui| {
             let can_send = !app.chats_ui.compose.trim().is_empty();
-            let clicked = ui
-                .add_enabled(can_send, egui::Button::new("Send"))
-                .clicked();
+            let clicked = widgets::filled_button_if(ui, can_send, "Send", Tone::Accent).clicked();
             if can_send && (clicked || shortcut) {
                 let body = std::mem::take(&mut app.chats_ui.compose);
                 app.actions.push(Action::Request(Request::PostMessage {

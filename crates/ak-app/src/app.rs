@@ -28,7 +28,9 @@ use crate::model::{
 use crate::settings_view::SettingsEditor;
 use crate::snapshot_view::{ExportDialog, ImportDialog};
 use crate::team_view::{AgentEditor, ProposalView, RefineStatus};
+use crate::theme::{self, Backdrop, Tone};
 use crate::ticket_view::TicketPanelState;
+use crate::widgets;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
@@ -121,6 +123,7 @@ pub struct App {
 
     pub actions: Vec<Action>,
     toast: Option<(Instant, String, bool)>,
+    backdrop: Backdrop,
 }
 
 impl App {
@@ -128,6 +131,8 @@ impl App {
         let (req_tx, req_rx) = tokio::sync::mpsc::unbounded_channel();
         let (resp_tx, resp_rx) = std::sync::mpsc::channel();
         let ctx = cc.egui_ctx.clone();
+        theme::install(&ctx);
+        let backdrop = Backdrop::new(&ctx);
 
         let mut instance = None;
         let startup_error = match HomePaths::resolve()
@@ -204,6 +209,7 @@ impl App {
             markdown: Markdown::default(),
             actions: Vec::new(),
             toast: None,
+            backdrop,
         }
     }
 
@@ -724,12 +730,12 @@ impl App {
     }
 
     fn draw_sidebar(&mut self, ui: &mut egui::Ui) {
-        ui.add_space(6.0);
+        ui.add_space(4.0);
         ui.heading("AgenticKanban");
-        ui.add_space(8.0);
+        ui.add_space(14.0);
 
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new("Projects").strong());
+            widgets::caption(ui, "Projects");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
                     .small_button("Add…")
@@ -753,8 +759,7 @@ impl App {
         }
         for p in &projects {
             let selected = Some(p.id) == current;
-            let resp = ui
-                .selectable_label(selected, &p.name)
+            let resp = widgets::nav_item(ui, &p.name, selected)
                 .on_hover_text(p.path.display().to_string());
             if resp.clicked() {
                 self.actions.push(Action::OpenProject(p.id));
@@ -767,22 +772,16 @@ impl App {
             });
         }
 
-        ui.add_space(12.0);
-        ui.separator();
+        ui.add_space(14.0);
+        widgets::caption(ui, "Workspace");
         ui.add_space(4.0);
 
-        if ui
-            .selectable_label(self.view == View::Overview, "Overview")
-            .clicked()
-        {
+        if widgets::nav_item(ui, "Overview", self.view == View::Overview).clicked() {
             self.actions.push(Action::SwitchView(View::Overview));
         }
         let enabled = self.current.is_some();
         ui.add_enabled_ui(enabled, |ui| {
-            if ui
-                .selectable_label(self.view == View::Board, "Board")
-                .clicked()
-            {
+            if widgets::nav_item(ui, "Board", self.view == View::Board).clicked() {
                 self.actions.push(Action::SwitchView(View::Board));
             }
             let unread = self.unread_count() + self.approvals.len();
@@ -793,16 +792,10 @@ impl App {
             } else {
                 "Inbox".to_string()
             };
-            if ui
-                .selectable_label(self.view == View::Inbox, label)
-                .clicked()
-            {
+            if widgets::nav_item(ui, label, self.view == View::Inbox).clicked() {
                 self.actions.push(Action::SwitchView(View::Inbox));
             }
-            if ui
-                .selectable_label(self.view == View::Chats, "Chats")
-                .clicked()
-            {
+            if widgets::nav_item(ui, "Chats", self.view == View::Chats).clicked() {
                 self.actions.push(Action::SwitchView(View::Chats));
             }
             let agents = self.board.active_agents().count();
@@ -811,10 +804,7 @@ impl App {
             } else {
                 "Team".to_string()
             };
-            if ui
-                .selectable_label(self.view == View::Team, label)
-                .clicked()
-            {
+            if widgets::nav_item(ui, label, self.view == View::Team).clicked() {
                 self.actions.push(Action::SwitchView(View::Team));
             }
         });
@@ -824,10 +814,7 @@ impl App {
             if let Some(h) = &self.human {
                 ui.weak(format!("You are @{}", h.handle));
             }
-            if ui
-                .selectable_label(self.view == View::Settings, "Settings")
-                .clicked()
-            {
+            if widgets::nav_item(ui, "Settings", self.view == View::Settings).clicked() {
                 self.actions.push(Action::SwitchView(View::Settings));
             }
         });
@@ -842,22 +829,26 @@ impl App {
             return;
         }
         ctx.request_repaint_after(Duration::from_millis(500));
-        egui::TopBottomPanel::bottom("toast").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let color = if is_error {
-                    egui::Color32::from_rgb(220, 80, 80)
-                } else {
-                    egui::Color32::from_rgb(80, 160, 90)
-                };
-                ui.colored_label(color, if is_error { "Error" } else { "OK" });
-                ui.label(&text);
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if ui.small_button("Dismiss").clicked() {
-                        self.toast = None;
-                    }
+        // A capsule that floats over the bottom centre, like a system notice.
+        egui::Area::new(egui::Id::new("toast"))
+            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -24.0])
+            .order(egui::Order::Foreground)
+            .show(ctx, |ui| {
+                let frame = theme::panel(ui.style())
+                    .inner_margin(egui::Margin::symmetric(14, 8))
+                    .outer_margin(egui::Margin::same(0))
+                    .corner_radius(255);
+                theme::glass(ui, frame, |ui| {
+                    ui.horizontal(|ui| {
+                        let tone = if is_error { Tone::Red } else { Tone::Green };
+                        widgets::chip(ui, tone, if is_error { "Error" } else { "OK" });
+                        ui.label(&text);
+                        if ui.small_button("Dismiss").clicked() {
+                            self.toast = None;
+                        }
+                    });
                 });
             });
-        });
     }
 
     fn draw_remove_confirm(&mut self, ctx: &egui::Context) {
@@ -886,11 +877,7 @@ impl App {
                     if ui.button("Remove, keep local data").clicked() {
                         decided = Some(Some(false));
                     }
-                    if ui
-                        .button(
-                            egui::RichText::new("Remove and delete local board")
-                                .color(egui::Color32::from_rgb(220, 80, 80)),
-                        )
+                    if widgets::tinted_button(ui, "Remove and delete local board", Tone::Red)
                         .clicked()
                     {
                         decided = Some(Some(true));
@@ -914,6 +901,7 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        self.backdrop.paint(ctx);
         self.drain_responses();
 
         if self.view == View::Overview
@@ -936,7 +924,8 @@ impl eframe::App for App {
 
         egui::SidePanel::left("sidebar")
             .resizable(true)
-            .default_width(220.0)
+            .default_width(232.0)
+            .frame(theme::panel(&ctx.style()))
             .show(ctx, |ui| {
                 self.draw_sidebar(ui);
             });
@@ -946,34 +935,38 @@ impl eframe::App for App {
                 .resizable(true)
                 .default_width(460.0)
                 .width_range(360.0..=820.0)
+                .frame(theme::panel(&ctx.style()))
                 .show(ctx, |ui| {
                     crate::ticket_view::draw(self, ui);
                 });
         }
 
-        egui::CentralPanel::default().show(ctx, |ui| {
-            if self.view == View::Settings {
-                crate::settings_view::draw(self, ui);
-                return;
-            }
-            if self.view == View::Overview {
-                crate::overview_view::draw(self, ui);
-                return;
-            }
-            if self.current.is_none() {
-                ui.centered_and_justified(|ui| {
-                    ui.label("Add a project from the sidebar to get started.");
-                });
-                return;
-            }
-            match self.view {
-                View::Board => crate::board_view::draw(self, ui),
-                View::Inbox => crate::inbox_view::draw(self, ui),
-                View::Chats => crate::chats_view::draw(self, ui),
-                View::Team => crate::team_view::draw(self, ui),
-                View::Settings | View::Overview => unreachable!(),
-            }
-        });
+        let content = egui::Frame::new().inner_margin(egui::Margin::symmetric(20, 16));
+        egui::CentralPanel::default()
+            .frame(content)
+            .show(ctx, |ui| {
+                if self.view == View::Settings {
+                    crate::settings_view::draw(self, ui);
+                    return;
+                }
+                if self.view == View::Overview {
+                    crate::overview_view::draw(self, ui);
+                    return;
+                }
+                if self.current.is_none() {
+                    ui.centered_and_justified(|ui| {
+                        ui.label("Add a project from the sidebar to get started.");
+                    });
+                    return;
+                }
+                match self.view {
+                    View::Board => crate::board_view::draw(self, ui),
+                    View::Inbox => crate::inbox_view::draw(self, ui),
+                    View::Chats => crate::chats_view::draw(self, ui),
+                    View::Team => crate::team_view::draw(self, ui),
+                    View::Settings | View::Overview => unreachable!(),
+                }
+            });
 
         crate::dialogs::draw(self, ctx);
         crate::snapshot_view::draw(self, ctx);

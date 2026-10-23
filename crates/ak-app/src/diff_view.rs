@@ -2,6 +2,9 @@
 
 use similar::{ChangeTag, TextDiff};
 
+use crate::theme::{self, Tone};
+use crate::widgets;
+
 pub fn draw(ui: &mut egui::Ui, id_salt: &str, old: &str, new: &str) {
     let diff = TextDiff::from_lines(old, new);
     let (insertions, deletions) = diff
@@ -12,14 +15,8 @@ pub fn draw(ui: &mut egui::Ui, id_salt: &str, old: &str, new: &str) {
             ChangeTag::Equal => (i, d),
         });
     ui.horizontal(|ui| {
-        ui.colored_label(
-            egui::Color32::from_rgb(120, 220, 130),
-            format!("+{insertions}"),
-        );
-        ui.colored_label(
-            egui::Color32::from_rgb(240, 120, 120),
-            format!("-{deletions}"),
-        );
+        widgets::chip(ui, Tone::Green, format!("+{insertions}"));
+        widgets::chip(ui, Tone::Red, format!("-{deletions}"));
         if insertions == 0 && deletions == 0 {
             ui.weak("No changes.");
         }
@@ -33,25 +30,23 @@ pub fn draw(ui: &mut egui::Ui, id_salt: &str, old: &str, new: &str) {
             ui.spacing_mut().item_spacing.y = 0.0;
             for change in diff.iter_all_changes() {
                 let line = change.value().trim_end_matches(['\r', '\n']);
-                let (sign, color, fill) = match change.tag() {
-                    ChangeTag::Insert => (
-                        "+",
-                        egui::Color32::from_rgb(120, 220, 130),
-                        egui::Color32::from_rgb(22, 58, 32),
-                    ),
-                    ChangeTag::Delete => (
-                        "-",
-                        egui::Color32::from_rgb(240, 120, 120),
-                        egui::Color32::from_rgb(70, 26, 26),
-                    ),
-                    ChangeTag::Equal => (
-                        " ",
-                        ui.visuals().weak_text_color(),
-                        egui::Color32::TRANSPARENT,
-                    ),
+                let (sign, tone) = match change.tag() {
+                    ChangeTag::Insert => ("+", Some(Tone::Green)),
+                    ChangeTag::Delete => ("-", Some(Tone::Red)),
+                    ChangeTag::Equal => (" ", None),
                 };
-                egui::Frame::new()
-                    .fill(fill)
+                let color = match tone {
+                    Some(tone) => theme::tone(ui.style(), tone),
+                    None => ui.visuals().weak_text_color(),
+                };
+                // A run of changed lines reads as one block, so each line is a flat wash.
+                let frame = match tone {
+                    Some(tone) => theme::tinted(ui.style(), tone),
+                    None => egui::Frame::new(),
+                };
+                frame
+                    .stroke(egui::Stroke::NONE)
+                    .corner_radius(egui::CornerRadius::ZERO)
                     .inner_margin(egui::Margin::symmetric(4, 1))
                     .show(ui, |ui| {
                         ui.set_width(ui.available_width());

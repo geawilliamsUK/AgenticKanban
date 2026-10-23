@@ -11,6 +11,8 @@ use ak_core::Timestamp;
 use crate::app::{Action, App};
 use crate::backend::{PendingProposal, Request};
 use crate::model::{describe_event, format_time, kind_label, InboxItem};
+use crate::theme::{self, Tone};
+use crate::widgets;
 
 #[allow(clippy::large_enum_variant)]
 pub enum RefineStatus {
@@ -295,14 +297,14 @@ impl AgentEditor {
     }
 }
 
-fn state_color(state: AgentState) -> egui::Color32 {
+fn state_tone(state: AgentState) -> Tone {
     match state {
-        AgentState::Idle => egui::Color32::from_rgb(130, 140, 150),
-        AgentState::Scheduled | AgentState::Starting => egui::Color32::from_rgb(230, 190, 80),
-        AgentState::Running => egui::Color32::from_rgb(120, 220, 130),
-        AgentState::Stopping => egui::Color32::from_rgb(230, 150, 80),
-        AgentState::Errored | AgentState::Halted => egui::Color32::from_rgb(240, 120, 120),
-        AgentState::Cooldown => egui::Color32::from_rgb(90, 160, 230),
+        AgentState::Idle => Tone::Gray,
+        AgentState::Scheduled | AgentState::Starting => Tone::Yellow,
+        AgentState::Running => Tone::Green,
+        AgentState::Stopping => Tone::Orange,
+        AgentState::Errored | AgentState::Halted => Tone::Red,
+        AgentState::Cooldown => Tone::Accent,
     }
 }
 
@@ -313,8 +315,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         .resizable(true)
         .default_width(260.0)
         .show_inside(ui, |ui| {
+            ui.heading("Team");
             ui.horizontal(|ui| {
-                ui.heading("Team");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("New agent").clicked() {
                         app.actions.push(Action::OpenAgent(None));
@@ -347,43 +349,44 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     }
                 });
             });
-            ui.add_space(4.0);
+            ui.add_space(8.0);
             if !app.drift.is_empty() {
                 let n = app.drift.len();
-                ui.horizontal_wrapped(|ui| {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(230, 190, 80),
-                        format!("{n} agent(s) differ from the repository snapshot."),
-                    );
-                    if ui
-                        .small_button("Review…")
-                        .on_hover_text("Compare with, and import from, this repository's .agentic/")
-                        .clicked()
-                    {
-                        if let Some(path) = app
-                            .projects
-                            .iter()
-                            .find(|p| p.id == project)
-                            .map(|p| p.path.clone())
+                let notice = theme::tinted(ui.style(), Tone::Yellow);
+                theme::glass(ui, notice, |ui| {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.colored_label(
+                            theme::tone(ui.style(), Tone::Yellow),
+                            format!("{n} agent(s) differ from the repository snapshot."),
+                        );
+                        if ui
+                            .small_button("Review…")
+                            .on_hover_text(
+                                "Compare with, and import from, this repository's .agentic/",
+                            )
+                            .clicked()
                         {
-                            app.actions.push(Action::Request(Request::ReviewImport {
-                                project,
-                                source: path,
-                            }));
+                            if let Some(path) = app
+                                .projects
+                                .iter()
+                                .find(|p| p.id == project)
+                                .map(|p| p.path.clone())
+                            {
+                                app.actions.push(Action::Request(Request::ReviewImport {
+                                    project,
+                                    source: path,
+                                }));
+                            }
                         }
-                    }
+                    });
                 });
-                ui.add_space(4.0);
+                ui.add_space(8.0);
             }
             ui.horizontal(|ui| {
                 let paused = app.scheduler_paused;
                 let label = if paused { "Agents paused" } else { "Agents active" };
-                let color = if paused {
-                    egui::Color32::from_rgb(240, 120, 120)
-                } else {
-                    egui::Color32::from_rgb(120, 220, 130)
-                };
-                ui.colored_label(color, label);
+                let tone = if paused { Tone::Red } else { Tone::Green };
+                widgets::chip(ui, tone, label);
                 let button = if paused { "Resume all" } else { "Pause all" };
                 if ui
                     .small_button(button)
@@ -403,13 +406,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     app.actions.push(Action::Request(Request::StopAllAgents { project }));
                 }
             });
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             if let Some(h) = &app.human {
                 ui.horizontal(|ui| {
                     ui.label(egui::RichText::new(format!("@{}", h.handle)).strong());
                     ui.weak("you");
                 });
-                ui.add_space(4.0);
+                ui.add_space(8.0);
             }
             if app.board.agents.is_empty() {
                 ui.weak("No agents yet. Create one to give the board its first teammate.");
@@ -444,7 +447,11 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 let resp = ui.horizontal(|ui| {
                     let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
                     if !a.is_retired() {
-                        ui.painter().circle_filled(rect.center(), 4.0, state_color(a.state));
+                        ui.painter().circle_filled(
+                            rect.center(),
+                            4.0,
+                            theme::tone(ui.style(), state_tone(a.state)),
+                        );
                     }
                     ui.selectable_label(is_selected, rich)
                 });
@@ -520,20 +527,17 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
             ui.heading(format!("@{}", editor.handle));
         }
         if let Some(a) = &agent_row {
-            ui.colored_label(state_color(a.state), a.state.label());
+            widgets::chip(ui, state_tone(a.state), a.state.label());
         }
         if editor.cost_today > 0.0 {
             ui.weak(format!("${:.2} today", editor.cost_today));
         }
         if editor.dirty {
-            ui.weak("unsaved");
+            widgets::chip(ui, Tone::Orange, "unsaved");
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             let can_save = editor.dirty && editor.retired_since.is_none();
-            if ui
-                .add_enabled(can_save, egui::Button::new("Save"))
-                .clicked()
-            {
+            if widgets::filled_button_if(ui, can_save, "Save", Tone::Accent).clicked() {
                 match editor.to_definition() {
                     Ok(definition) => {
                         actions.push(Action::Request(Request::SaveAgent {
@@ -547,13 +551,7 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
             }
             if !editor.is_new && editor.retired_since.is_none() {
                 if editor.confirm_retire {
-                    if ui
-                        .button(
-                            egui::RichText::new("Confirm retire")
-                                .color(egui::Color32::from_rgb(220, 80, 80)),
-                        )
-                        .clicked()
-                    {
+                    if widgets::tinted_button(ui, "Confirm retire", Tone::Red).clicked() {
                         actions.push(Action::Request(Request::RetireAgent {
                             project,
                             handle: editor.handle.clone(),
@@ -634,31 +632,28 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
                     }
                 }
             });
-            ui.add_space(4.0);
+            ui.add_space(8.0);
         }
     }
 
     if let Some(since) = editor.retired_since {
-        egui::Frame::new()
-            .fill(egui::Color32::from_rgb(70, 50, 30))
-            .corner_radius(4.0)
-            .inner_margin(8.0)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new("Retired").strong());
-                ui.label(format!(
-                    "The definition file disappeared on {}. History is kept. Recreate the agent to bring it back.",
-                    format_time(&since)
-                ));
-                if ui.button("Recreate from template").clicked() {
-                    let def = AgentDefinition::template(&editor.handle, &editor.description);
-                    actions.push(Action::Request(Request::SaveAgent {
-                        project,
-                        definition: def,
-                    }));
-                }
-            });
-        ui.add_space(6.0);
+        let notice = theme::tinted(ui.style(), Tone::Yellow);
+        theme::glass(ui, notice, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new("Retired").strong());
+            ui.label(format!(
+                "The definition file disappeared on {}. History is kept. Recreate the agent to bring it back.",
+                format_time(&since)
+            ));
+            if ui.button("Recreate from template").clicked() {
+                let def = AgentDefinition::template(&editor.handle, &editor.description);
+                actions.push(Action::Request(Request::SaveAgent {
+                    project,
+                    definition: def,
+                }));
+            }
+        });
+        ui.add_space(8.0);
     }
 
     let editable = editor.retired_since.is_none();
@@ -679,6 +674,7 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
                         if editor.is_new {
                             let r = ui.add(
                                 egui::TextEdit::singleline(&mut editor.handle)
+                                    .id_salt("agent_handle")
                                     .hint_text("backend, dba, qa…")
                                     .desired_width(240.0),
                             );
@@ -693,6 +689,7 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
                         ui.label("Description");
                         let r = ui.add(
                             egui::TextEdit::multiline(&mut editor.description)
+                                .id_salt("agent_description")
                                 .desired_rows(3)
                                 .desired_width(f32::INFINITY)
                                 .hint_text("What this agent owns and when to involve it. Other agents see this."),
@@ -707,7 +704,7 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
                             .clone()
                             .map(|m| format!("project default ({m})"))
                             .unwrap_or_else(|| "project default (Claude Code default)".into());
-                        if crate::widgets::model_picker(
+                        if widgets::model_picker(
                             ui,
                             "agent_model",
                             &mut editor.model,
@@ -744,6 +741,7 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
                                 ui.weak(label);
                                 let r = ui.add(
                                     egui::TextEdit::singleline(field)
+                                        .id_salt(("budget", label))
                                         .hint_text("default")
                                         .desired_width(60.0),
                                 );
@@ -755,9 +753,9 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
                         ui.end_row();
                     });
 
-                ui.add_space(8.0);
+                ui.add_space(12.0);
                 ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Definition").strong());
+                    widgets::caption(ui, "Definition");
                     ui.weak("markdown, Claude Code subagent format");
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let busy = !editor.integrate.running.is_empty();
@@ -830,7 +828,7 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
                 }
             });
 
-            ui.add_space(8.0);
+            ui.add_space(12.0);
             egui::CollapsingHeader::new("Memory")
                 .id_salt("agent_memory")
                 .show(ui, |ui| {
@@ -856,7 +854,7 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
                                 egui::RichText::new(kind_label(item.notification.kind)).strong(),
                             );
                             if item.notification.wake {
-                                ui.weak("wake");
+                                widgets::chip(ui, Tone::Teal, "wake");
                             }
                             ui.weak(format_time(&item.notification.created_at));
                             match &item.event {
@@ -908,43 +906,47 @@ fn draw_runs(
                         .request_repaint_after(std::time::Duration::from_millis(500));
                 }
                 if let Some(err) = &live.run.error {
-                    ui.colored_label(egui::Color32::from_rgb(240, 120, 120), err);
+                    ui.colored_label(theme::tone(ui.style(), Tone::Red), err);
                 }
-                egui::ScrollArea::vertical()
-                    .id_salt("live_events")
-                    .max_height(260.0)
-                    .stick_to_bottom(true)
-                    .show(ui, |ui| {
-                        ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
-                        for e in &live.events {
-                            let color = match e.kind {
-                                RunEventKind::ToolCall => egui::Color32::from_rgb(120, 180, 255),
-                                RunEventKind::ToolResult => ui.visuals().weak_text_color(),
-                                RunEventKind::AssistantText => ui.visuals().text_color(),
-                                RunEventKind::Result | RunEventKind::SystemInit => {
-                                    egui::Color32::from_rgb(120, 220, 130)
-                                }
-                                RunEventKind::Stderr => egui::Color32::from_rgb(240, 120, 120),
-                                RunEventKind::Supervisor | RunEventKind::Other => {
-                                    egui::Color32::from_rgb(230, 190, 80)
-                                }
-                            };
-                            ui.add(
-                                egui::Label::new(
-                                    egui::RichText::new(format!(
-                                        "{} {:<14} {}",
-                                        e.at.with_timezone(&chrono::Local).format("%H:%M:%S"),
-                                        e.kind.as_str(),
-                                        e.summary()
-                                    ))
-                                    .color(color),
-                                )
-                                .wrap(),
-                            );
-                        }
-                    });
+                let card = theme::card(ui.style());
+                theme::glass(ui, card, |ui| {
+                    ui.set_width(ui.available_width());
+                    egui::ScrollArea::vertical()
+                        .id_salt("live_events")
+                        .max_height(260.0)
+                        .stick_to_bottom(true)
+                        .show(ui, |ui| {
+                            ui.style_mut().override_text_style = Some(egui::TextStyle::Monospace);
+                            for e in &live.events {
+                                let color = match e.kind {
+                                    RunEventKind::ToolCall => theme::tone(ui.style(), Tone::Accent),
+                                    RunEventKind::ToolResult => ui.visuals().weak_text_color(),
+                                    RunEventKind::AssistantText => ui.visuals().text_color(),
+                                    RunEventKind::Result | RunEventKind::SystemInit => {
+                                        theme::tone(ui.style(), Tone::Green)
+                                    }
+                                    RunEventKind::Stderr => theme::tone(ui.style(), Tone::Red),
+                                    RunEventKind::Supervisor | RunEventKind::Other => {
+                                        theme::tone(ui.style(), Tone::Yellow)
+                                    }
+                                };
+                                ui.add(
+                                    egui::Label::new(
+                                        egui::RichText::new(format!(
+                                            "{} {:<14} {}",
+                                            e.at.with_timezone(&chrono::Local).format("%H:%M:%S"),
+                                            e.kind.as_str(),
+                                            e.summary()
+                                        ))
+                                        .color(color),
+                                    )
+                                    .wrap(),
+                                );
+                            }
+                        });
+                });
             });
-        ui.add_space(6.0);
+        ui.add_space(8.0);
     }
 
     if !editor.runs.is_empty() {
@@ -963,7 +965,7 @@ fn draw_runs(
                         ));
                         if let Some(err) = &r.error {
                             ui.colored_label(
-                                egui::Color32::from_rgb(240, 120, 120),
+                                theme::tone(ui.style(), Tone::Red),
                                 err.chars().take(80).collect::<String>(),
                             );
                         }
@@ -976,36 +978,34 @@ fn draw_runs(
                     });
                     if let Some((id, events)) = run_events {
                         if *id == r.id {
-                            egui::Frame::new()
-                                .fill(ui.visuals().faint_bg_color)
-                                .inner_margin(6.0)
-                                .show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    egui::ScrollArea::vertical()
-                                        .id_salt(("transcript", r.id))
-                                        .max_height(300.0)
-                                        .show(ui, |ui| {
-                                            ui.style_mut().override_text_style =
-                                                Some(egui::TextStyle::Monospace);
-                                            for e in events {
-                                                ui.add(
-                                                    egui::Label::new(format!(
-                                                        "{} {:<14} {}",
-                                                        e.at.with_timezone(&chrono::Local)
-                                                            .format("%H:%M:%S"),
-                                                        e.kind.as_str(),
-                                                        e.summary()
-                                                    ))
-                                                    .wrap(),
-                                                );
-                                            }
-                                        });
-                                });
+                            let card = theme::card(ui.style());
+                            theme::glass(ui, card, |ui| {
+                                ui.set_width(ui.available_width());
+                                egui::ScrollArea::vertical()
+                                    .id_salt(("transcript", r.id))
+                                    .max_height(300.0)
+                                    .show(ui, |ui| {
+                                        ui.style_mut().override_text_style =
+                                            Some(egui::TextStyle::Monospace);
+                                        for e in events {
+                                            ui.add(
+                                                egui::Label::new(format!(
+                                                    "{} {:<14} {}",
+                                                    e.at.with_timezone(&chrono::Local)
+                                                        .format("%H:%M:%S"),
+                                                    e.kind.as_str(),
+                                                    e.summary()
+                                                ))
+                                                .wrap(),
+                                            );
+                                        }
+                                    });
+                            });
                         }
                     }
                 }
             });
-        ui.add_space(6.0);
+        ui.add_space(8.0);
     }
 }
 
@@ -1030,14 +1030,17 @@ fn draw_refine_panel(
             });
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(500));
-            ui.add_space(6.0);
+            ui.add_space(8.0);
         }
         RefineStatus::Failed(msg) => {
-            ui.horizontal_wrapped(|ui| {
-                ui.colored_label(egui::Color32::from_rgb(220, 80, 80), "Refine failed:");
-                ui.label(msg);
+            let notice = theme::tinted(ui.style(), Tone::Red);
+            theme::glass(ui, notice, |ui| {
+                ui.horizontal_wrapped(|ui| {
+                    ui.colored_label(theme::tone(ui.style(), Tone::Red), "Refine failed:");
+                    ui.label(msg);
+                });
             });
-            ui.add_space(6.0);
+            ui.add_space(8.0);
         }
         RefineStatus::Proposed(_) => {}
     }
@@ -1045,48 +1048,44 @@ fn draw_refine_panel(
     let mut decision: Option<Decision> = None;
     if let RefineStatus::Proposed(view) = &editor.refine {
         let pending = &view.pending;
-        egui::Frame::new()
-            .fill(egui::Color32::from_rgb(30, 45, 60))
-            .corner_radius(4.0)
-            .inner_margin(10.0)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new("Refine proposal").strong());
-                    if let Some(cost) = pending.call.cost_usd {
-                        ui.weak(format!("${cost:.3}"));
-                    }
-                    if let Some(model) = &pending.call.model {
-                        ui.weak(model);
-                    }
-                    ui.weak(format_time(&pending.call.started_at));
-                });
-                for w in &pending.call.warnings {
-                    ui.colored_label(egui::Color32::from_rgb(230, 190, 80), format!("Note: {w}"));
+        let card = theme::tinted(ui.style(), Tone::Accent);
+        theme::glass(ui, card, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("Refine proposal").strong());
+                if let Some(cost) = pending.call.cost_usd {
+                    ui.weak(format!("${cost:.3}"));
                 }
-                ui.add_space(4.0);
-                crate::diff_view::draw(ui, "refine_diff", &pending.original, &view.proposed_text);
-                ui.add_space(6.0);
-                ui.horizontal(|ui| {
-                    if ui
-                        .button("Accept and save")
-                        .on_hover_text("Writes the proposed definition to the file.")
-                        .clicked()
-                    {
-                        decision = Some(Decision::AcceptSave);
-                    }
-                    if ui
-                        .button("Edit first")
-                        .on_hover_text("Loads the proposal into the editor without saving.")
-                        .clicked()
-                    {
-                        decision = Some(Decision::AcceptEdit);
-                    }
-                    if ui.button("Discard").clicked() {
-                        decision = Some(Decision::Reject);
-                    }
-                });
+                if let Some(model) = &pending.call.model {
+                    ui.weak(model);
+                }
+                ui.weak(format_time(&pending.call.started_at));
             });
+            for w in &pending.call.warnings {
+                ui.colored_label(theme::tone(ui.style(), Tone::Yellow), format!("Note: {w}"));
+            }
+            ui.add_space(8.0);
+            crate::diff_view::draw(ui, "refine_diff", &pending.original, &view.proposed_text);
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if widgets::tinted_button(ui, "Accept and save", Tone::Green)
+                    .on_hover_text("Writes the proposed definition to the file.")
+                    .clicked()
+                {
+                    decision = Some(Decision::AcceptSave);
+                }
+                if ui
+                    .button("Edit first")
+                    .on_hover_text("Loads the proposal into the editor without saving.")
+                    .clicked()
+                {
+                    decision = Some(Decision::AcceptEdit);
+                }
+                if widgets::tinted_button(ui, "Discard", Tone::Red).clicked() {
+                    decision = Some(Decision::Reject);
+                }
+            });
+        });
         ui.add_space(8.0);
     }
 
@@ -1144,50 +1143,48 @@ fn draw_integrate_panel(
     project: ak_core::ids::ProjectId,
     runner_description: &str,
 ) {
-    let red = egui::Color32::from_rgb(220, 80, 80);
+    let red = theme::tone(ui.style(), Tone::Red);
     let own = editor.handle.clone();
 
     // Picker.
     let mut send: Option<Vec<String>> = None;
     let mut close = false;
     if let Some(list) = editor.integrate.picker.as_mut() {
-        egui::Frame::new()
-            .fill(egui::Color32::from_rgb(30, 45, 60))
-            .corner_radius(4.0)
-            .inner_margin(10.0)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(egui::RichText::new("Integrate with").strong());
-                ui.weak("Each chosen teammate gets a proposed edit about this agent. Choosing this agent itself rewrites its Team section from the roster.");
-                for (handle, on) in list.iter_mut() {
-                    let label = if *handle == own {
-                        format!("@{handle} (its own Team section)")
-                    } else {
-                        format!("@{handle}")
-                    };
-                    ui.checkbox(on, label);
+        let card = theme::tinted(ui.style(), Tone::Accent);
+        theme::glass(ui, card, |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new("Integrate with").strong());
+            ui.weak("Each chosen teammate gets a proposed edit about this agent. Choosing this agent itself rewrites its Team section from the roster.");
+            for (handle, on) in list.iter_mut() {
+                let label = if *handle == own {
+                    format!("@{handle} (its own Team section)")
+                } else {
+                    format!("@{handle}")
+                };
+                ui.checkbox(on, label);
+            }
+            ui.horizontal(|ui| {
+                let chosen: Vec<String> = list
+                    .iter()
+                    .filter(|(_, on)| *on)
+                    .map(|(h, _)| h.clone())
+                    .collect();
+                if widgets::filled_button_if(
+                    ui,
+                    !chosen.is_empty(),
+                    format!("Integrate {} agent(s)", chosen.len()),
+                    Tone::Accent,
+                )
+                .on_hover_text(runner_description)
+                .clicked()
+                {
+                    send = Some(chosen);
                 }
-                ui.horizontal(|ui| {
-                    let chosen: Vec<String> = list
-                        .iter()
-                        .filter(|(_, on)| *on)
-                        .map(|(h, _)| h.clone())
-                        .collect();
-                    if ui
-                        .add_enabled(
-                            !chosen.is_empty(),
-                            egui::Button::new(format!("Integrate {} agent(s)", chosen.len())),
-                        )
-                        .on_hover_text(runner_description)
-                        .clicked()
-                    {
-                        send = Some(chosen);
-                    }
-                    if ui.button("Cancel").clicked() {
-                        close = true;
-                    }
-                });
+                if ui.button("Cancel").clicked() {
+                    close = true;
+                }
             });
+        });
         ui.add_space(8.0);
     }
     if let Some(targets) = send {
@@ -1221,16 +1218,17 @@ fn draw_integrate_panel(
         });
         ui.ctx()
             .request_repaint_after(std::time::Duration::from_millis(500));
-        ui.add_space(6.0);
+        ui.add_space(8.0);
     }
     for (target, error) in &editor.integrate.failures {
-        ui.horizontal_wrapped(|ui| {
-            ui.colored_label(red, format!("Integrate @{target} failed:"));
-            ui.label(error);
+        let notice = theme::tinted(ui.style(), Tone::Red);
+        theme::glass(ui, notice, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.colored_label(red, format!("Integrate @{target} failed:"));
+                ui.label(error);
+            });
         });
-    }
-    if !editor.integrate.failures.is_empty() {
-        ui.add_space(6.0);
+        ui.add_space(8.0);
     }
 
     // Proposals.
@@ -1240,63 +1238,59 @@ fn draw_integrate_panel(
     let count = editor.integrate.proposals.len();
     let mut decisions: Vec<(usize, Decision)> = Vec::new();
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(format!("Integrate proposals ({count})")).strong());
+        widgets::caption(ui, &format!("Integrate proposals ({count})"));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.small_button("Discard all").clicked() {
+            if widgets::tinted_button(ui, "Discard all", Tone::Red).clicked() {
                 decisions.extend((0..count).map(|i| (i, Decision::Reject)));
             }
-            if ui.small_button("Accept all and save").clicked() {
+            if widgets::tinted_button(ui, "Accept all and save", Tone::Green).clicked() {
                 decisions.extend((0..count).map(|i| (i, Decision::AcceptSave)));
             }
         });
     });
     for (i, item) in editor.integrate.proposals.iter().enumerate() {
         let pending = &item.view.pending;
-        egui::Frame::new()
-            .fill(egui::Color32::from_rgb(30, 45, 60))
-            .corner_radius(4.0)
-            .inner_margin(10.0)
-            .show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    let what = if item.target == own {
-                        format!("@{}: its own Team section", item.target)
-                    } else {
-                        format!("@{}", item.target)
-                    };
-                    ui.label(egui::RichText::new(what).strong());
-                    if let Some(cost) = pending.call.cost_usd {
-                        ui.weak(format!("${cost:.3}"));
-                    }
-                    if let Some(model) = &pending.call.model {
-                        ui.weak(model);
-                    }
-                    ui.weak(format_time(&pending.call.started_at));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.button("Discard").clicked() {
-                            decisions.push((i, Decision::Reject));
-                        }
-                        if ui
-                            .button("Accept and save")
-                            .on_hover_text("Writes the proposed definition to that agent's file.")
-                            .clicked()
-                        {
-                            decisions.push((i, Decision::AcceptSave));
-                        }
-                    });
-                });
-                for w in &pending.call.warnings {
-                    ui.colored_label(egui::Color32::from_rgb(230, 190, 80), format!("Note: {w}"));
+        let card = theme::tinted(ui.style(), Tone::Accent);
+        theme::glass(ui, card, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                let what = if item.target == own {
+                    format!("@{}: its own Team section", item.target)
+                } else {
+                    format!("@{}", item.target)
+                };
+                ui.label(egui::RichText::new(what).strong());
+                if let Some(cost) = pending.call.cost_usd {
+                    ui.weak(format!("${cost:.3}"));
                 }
-                ui.add_space(4.0);
-                crate::diff_view::draw(
-                    ui,
-                    &format!("integrate_diff_{}", item.target),
-                    &pending.original,
-                    &item.view.proposed_text,
-                );
+                if let Some(model) = &pending.call.model {
+                    ui.weak(model);
+                }
+                ui.weak(format_time(&pending.call.started_at));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if widgets::tinted_button(ui, "Discard", Tone::Red).clicked() {
+                        decisions.push((i, Decision::Reject));
+                    }
+                    if widgets::tinted_button(ui, "Accept and save", Tone::Green)
+                        .on_hover_text("Writes the proposed definition to that agent's file.")
+                        .clicked()
+                    {
+                        decisions.push((i, Decision::AcceptSave));
+                    }
+                });
             });
-        ui.add_space(6.0);
+            for w in &pending.call.warnings {
+                ui.colored_label(theme::tone(ui.style(), Tone::Yellow), format!("Note: {w}"));
+            }
+            ui.add_space(8.0);
+            crate::diff_view::draw(
+                ui,
+                &format!("integrate_diff_{}", item.target),
+                &pending.original,
+                &item.view.proposed_text,
+            );
+        });
+        ui.add_space(8.0);
     }
 
     // Apply from the highest index down so removals keep the rest valid.

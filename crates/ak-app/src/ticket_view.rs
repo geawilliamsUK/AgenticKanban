@@ -9,6 +9,8 @@ use ak_core::ids::CommentId;
 use crate::app::{Action, App};
 use crate::backend::Request;
 use crate::model::{describe_event, format_time, priority_color};
+use crate::theme::{self, Tone};
+use crate::widgets;
 
 #[derive(Default)]
 pub struct TicketPanelState {
@@ -45,7 +47,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.label(egui::RichText::new(&t.key).monospace().strong());
         if t.frozen {
-            ui.colored_label(egui::Color32::from_rgb(90, 160, 230), "FROZEN");
+            widgets::chip(ui, Tone::Accent, "FROZEN");
         }
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui.small_button("✕").on_hover_text("Close").clicked() {
@@ -70,6 +72,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             if let Some(draft) = app.ticket_panel.editing.as_mut() {
                 ui.add(
                     egui::TextEdit::singleline(&mut draft.title)
+                        .id_salt("ticket_title")
                         .desired_width(f32::INFINITY)
                         .hint_text("Title"),
                 );
@@ -82,7 +85,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     8,
                 );
                 ui.horizontal(|ui| {
-                    ui.label("Priority");
+                    ui.weak("Priority");
                     egui::ComboBox::from_id_salt("edit_priority")
                         .selected_text(draft.priority.label())
                         .show_ui(ui, |ui| {
@@ -92,13 +95,15 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         });
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Labels");
+                    ui.weak("Labels");
                     ui.add(
-                        egui::TextEdit::singleline(&mut draft.labels).hint_text("comma, separated"),
+                        egui::TextEdit::singleline(&mut draft.labels)
+                            .id_salt("ticket_labels")
+                            .hint_text("comma, separated"),
                     );
                 });
                 ui.horizontal(|ui| {
-                    if ui.button("Save").clicked() {
+                    if widgets::filled_button(ui, "Save", Tone::Accent).clicked() {
                         let labels: Vec<String> = draft
                             .labels
                             .split(',')
@@ -124,7 +129,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 });
             } else {
                 ui.heading(&t.title);
-                ui.add_space(4.0);
+                ui.add_space(8.0);
                 app.markdown.show(ui, &t.description);
             }
             if finish_editing {
@@ -137,9 +142,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             // Column, assignee, priority, labels, reporter.
             egui::Grid::new("ticket_fields")
                 .num_columns(2)
-                .spacing([12.0, 6.0])
+                .spacing([12.0, 8.0])
                 .show(ui, |ui| {
-                    ui.label("Column");
+                    ui.weak("Column");
                     let current_col = app
                         .board
                         .column(t.column_id)
@@ -163,7 +168,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         });
                     ui.end_row();
 
-                    ui.label("Assignee");
+                    ui.weak("Assignee");
                     let current_assignee = t
                         .assignee_id
                         .map(|a| app.board.handle(a))
@@ -199,31 +204,31 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         });
                     ui.end_row();
 
-                    ui.label("Priority");
+                    ui.weak("Priority");
                     ui.horizontal(|ui| {
                         let (rect, _) =
                             ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                        ui.painter()
-                            .circle_filled(rect.center(), 4.0, priority_color(t.priority));
+                        let color = priority_color(ui.style(), t.priority);
+                        ui.painter().circle_filled(rect.center(), 4.0, color);
                         ui.label(t.priority.label());
                     });
                     ui.end_row();
 
                     if !t.labels.is_empty() {
-                        ui.label("Labels");
+                        ui.weak("Labels");
                         ui.horizontal_wrapped(|ui| {
                             for l in &t.labels {
-                                ui.small(format!("#{l}"));
+                                widgets::chip(ui, Tone::Gray, format!("#{l}"));
                             }
                         });
                         ui.end_row();
                     }
 
-                    ui.label("Reporter");
+                    ui.weak("Reporter");
                     ui.label(app.board.handle(t.reporter_id));
                     ui.end_row();
 
-                    ui.label("Watchers");
+                    ui.weak("Watchers");
                     ui.horizontal_wrapped(|ui| {
                         for w in &detail.watchers {
                             ui.small(app.board.handle(*w));
@@ -231,8 +236,8 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     });
                     ui.end_row();
 
-                    ui.label("Updated");
-                    ui.label(format!("{}  (v{})", format_time(&t.updated_at), t.version));
+                    ui.weak("Updated");
+                    ui.weak(format!("{}  (v{})", format_time(&t.updated_at), t.version));
                     ui.end_row();
                 });
 
@@ -240,26 +245,24 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
 
             // Freeze controls.
             if t.frozen {
-                egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(35, 60, 90))
-                    .corner_radius(4.0)
-                    .inner_margin(8.0)
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(egui::RichText::new("Frozen").strong());
-                        ui.label(t.freeze_reason.clone().unwrap_or_default());
-                        ui.weak("Agents cannot change this ticket until you unfreeze it.");
-                        if ui.button("Unfreeze").clicked() {
-                            app.actions
-                                .push(Action::Request(Request::Unfreeze { project, id: t.id }));
-                        }
-                    });
+                let frame = theme::tinted(ui.style(), Tone::Accent);
+                theme::glass(ui, frame, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.label(egui::RichText::new("Frozen").strong());
+                    ui.label(t.freeze_reason.clone().unwrap_or_default());
+                    ui.weak("Agents cannot change this ticket until you unfreeze it.");
+                    if ui.button("Unfreeze").clicked() {
+                        app.actions
+                            .push(Action::Request(Request::Unfreeze { project, id: t.id }));
+                    }
+                });
             } else {
                 egui::CollapsingHeader::new("Freeze")
                     .id_salt("freeze_header")
                     .show(ui, |ui| {
                         ui.add(
                             egui::TextEdit::singleline(&mut app.ticket_panel.freeze_reason)
+                                .id_salt("freeze_reason")
                                 .hint_text("Reason")
                                 .desired_width(f32::INFINITY),
                         );
@@ -280,7 +283,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             ui.separator();
 
             // Comments as a tree.
-            ui.label(egui::RichText::new(format!("Comments ({})", detail.comments.len())).strong());
+            widgets::caption(ui, &format!("Comments ({})", detail.comments.len()));
             let mut children: HashMap<Option<CommentId>, Vec<&Comment>> = HashMap::new();
             for c in &detail.comments {
                 children.entry(c.parent_comment_id).or_default().push(c);
@@ -294,7 +297,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 ui.weak("No comments yet.");
             }
 
-            ui.add_space(6.0);
+            ui.add_space(8.0);
             if let Some(reply) = app.ticket_panel.reply_to {
                 let author = detail
                     .comments
@@ -302,11 +305,14 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     .find(|c| c.id == reply)
                     .map(|c| app.board.handle(c.author_id))
                     .unwrap_or_default();
-                ui.horizontal(|ui| {
-                    ui.weak(format!("Replying to {author}"));
-                    if ui.small_button("cancel").clicked() {
-                        app.ticket_panel.reply_to = None;
-                    }
+                let frame = theme::tinted(ui.style(), Tone::Accent);
+                theme::glass(ui, frame, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.weak(format!("Replying to {author}"));
+                        if ui.small_button("cancel").clicked() {
+                            app.ticket_panel.reply_to = None;
+                        }
+                    });
                 });
             }
             crate::mention_edit::multiline(
@@ -322,7 +328,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             } else {
                 "Comment"
             };
-            if ui.button(send_label).clicked() && !app.ticket_panel.compose.trim().is_empty() {
+            if widgets::filled_button(ui, send_label, Tone::Accent).clicked()
+                && !app.ticket_panel.compose.trim().is_empty()
+            {
                 app.actions.push(Action::Request(Request::Comment {
                     project,
                     ticket: t.id,
@@ -369,30 +377,23 @@ fn draw_comment_tree(
         ui.horizontal(|ui| {
             ui.add_space(depth as f32 * 18.0);
             ui.vertical(|ui| {
-                egui::Frame::new()
-                    .fill(ui.visuals().faint_bg_color)
-                    .corner_radius(4.0)
-                    .inner_margin(6.0)
-                    .show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new(app.board.handle(c.author_id)).strong());
-                            ui.weak(format_time(&c.created_at));
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if depth < 6 && ui.small_button("Reply").clicked() {
-                                        *reply_clicked = Some(c.id);
-                                    }
-                                },
-                            );
+                let frame = theme::card(ui.style());
+                theme::glass(ui, frame, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new(app.board.handle(c.author_id)).strong());
+                        ui.weak(format_time(&c.created_at));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if depth < 6 && ui.small_button("Reply").clicked() {
+                                *reply_clicked = Some(c.id);
+                            }
                         });
-                        let body = crate::mention_edit::highlighted(ui, &c.body, &app.board.actors);
-                        ui.add(egui::Label::new(body).wrap());
                     });
+                    let body = crate::mention_edit::highlighted(ui, &c.body, &app.board.actors);
+                    ui.add(egui::Label::new(body).wrap());
+                });
             });
         });
-        ui.add_space(3.0);
         draw_comment_tree(ui, app, children, Some(c.id), depth + 1, reply_clicked);
     }
 }

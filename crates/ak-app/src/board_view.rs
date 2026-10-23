@@ -7,6 +7,8 @@ use crate::app::{Action, App};
 use crate::backend::Request;
 use crate::dialogs::NewTicketDialog;
 use crate::model::{priority_color, BoardModel};
+use crate::theme::{self, Tone};
+use crate::widgets;
 
 const COLUMN_WIDTH: f32 = 270.0;
 
@@ -16,13 +18,13 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     ui.horizontal(|ui| {
         ui.heading(&app.project_name);
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            if ui.button("New ticket").clicked() {
+            if widgets::filled_button(ui, "New ticket", Tone::Accent).clicked() {
                 app.new_ticket = Some(NewTicketDialog::new(&app.board));
             }
             ui.weak(format!("{} tickets", app.board.tickets.len()));
         });
     });
-    ui.add_space(6.0);
+    ui.add_space(8.0);
 
     let board = &app.board;
     let selected = app.selected;
@@ -41,16 +43,16 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             ui.set_width(COLUMN_WIDTH);
                             ui.horizontal(|ui| {
                                 ui.label(egui::RichText::new(&column.name).strong());
-                                ui.weak(format!("{}", tickets.len()));
+                                widgets::chip(ui, Tone::Gray, format!("{}", tickets.len()));
                             });
-                            ui.add_space(4.0);
+                            ui.add_space(8.0);
 
-                            let frame = egui::Frame::group(ui.style())
-                                .inner_margin(6.0)
-                                .fill(ui.visuals().faint_bg_color);
+                            // The drop zone sets its own fill and stroke for the drop highlight,
+                            // so the card supplies only the shape and padding.
+                            let frame = theme::card(ui.style());
                             let (_, dropped) = ui.dnd_drop_zone::<TicketId, ()>(frame, |ui| {
                                 ui.set_min_height(ui.available_height() - 12.0);
-                                ui.set_width(COLUMN_WIDTH - 14.0);
+                                ui.set_width(COLUMN_WIDTH - 26.0);
                                 egui::ScrollArea::vertical()
                                     .id_salt(("col", column.id))
                                     .show(ui, |ui| {
@@ -58,7 +60,7 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                             if card(ui, t, board, selected == Some(t.id)) {
                                                 actions.push(Action::SelectTicket(Some(t.id)));
                                             }
-                                            ui.add_space(4.0);
+                                            ui.add_space(8.0);
                                         }
                                         if tickets.is_empty() {
                                             ui.weak("Drop tickets here");
@@ -104,43 +106,46 @@ fn card(ui: &mut egui::Ui, t: &Ticket, board: &BoardModel, selected: bool) -> bo
     } else {
         ui.visuals().widgets.noninteractive.bg_stroke
     };
+    // Tiles sit raised on the column, and brighten under the pointer.
+    let palette = theme::palette(ui.style());
     let fill = if dragging_this {
         ui.visuals().widgets.active.bg_fill
+    } else if hovered {
+        palette.control_hover
     } else {
-        ui.visuals().extreme_bg_color
+        palette.card_hover
     };
 
-    let frame = egui::Frame::new()
+    let base = theme::card(ui.style())
         .fill(fill)
         .stroke(stroke)
-        .corner_radius(4.0)
-        .inner_margin(8.0)
-        .show(ui, |ui| {
-            ui.style_mut().interaction.selectable_labels = false;
-            ui.set_width(ui.available_width());
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new(&t.key).monospace().weak());
-                let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
-                ui.painter()
-                    .circle_filled(rect.center(), 4.0, priority_color(t.priority));
-                if t.frozen {
-                    ui.colored_label(egui::Color32::from_rgb(90, 160, 230), "FROZEN");
-                }
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    if let Some(a) = t.assignee_id {
-                        ui.weak(board.handle(a));
-                    }
-                });
-            });
-            ui.add(egui::Label::new(&t.title).wrap());
-            if !t.labels.is_empty() {
-                ui.horizontal_wrapped(|ui| {
-                    for l in &t.labels {
-                        ui.small(format!("#{l}"));
-                    }
-                });
+        .corner_radius(theme::CONTROL_RADIUS);
+    let frame = theme::glass(ui, base, |ui| {
+        ui.style_mut().interaction.selectable_labels = false;
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(&t.key).monospace().weak());
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
+            ui.painter()
+                .circle_filled(rect.center(), 4.0, priority_color(ui.style(), t.priority));
+            if t.frozen {
+                widgets::chip(ui, Tone::Accent, "FROZEN");
             }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if let Some(a) = t.assignee_id {
+                    ui.weak(board.handle(a));
+                }
+            });
         });
+        ui.add(egui::Label::new(&t.title).wrap());
+        if !t.labels.is_empty() {
+            ui.horizontal_wrapped(|ui| {
+                for l in &t.labels {
+                    widgets::chip(ui, Tone::Gray, format!("#{l}"));
+                }
+            });
+        }
+    });
 
     let response = ui
         .interact(frame.response.rect, id, egui::Sense::click_and_drag())
@@ -165,7 +170,11 @@ fn ghost(ctx: &egui::Context, t: &Ticket) {
         .fixed_pos(pos + egui::vec2(14.0, 14.0))
         .interactable(false)
         .show(ctx, |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
+            let sheet = theme::palette(ui.style()).sheet;
+            let base = theme::card(ui.style())
+                .fill(sheet)
+                .corner_radius(theme::CONTROL_RADIUS);
+            theme::glass(ui, base, |ui| {
                 ui.set_max_width(COLUMN_WIDTH - 40.0);
                 ui.label(egui::RichText::new(&t.key).monospace().weak());
                 ui.label(&t.title);

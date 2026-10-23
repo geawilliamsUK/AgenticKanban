@@ -1,6 +1,6 @@
 # Status
 
-Last updated 2026-10-14. The design is [DESIGN.md](DESIGN.md); milestones are its section 19.
+Last updated 2026-10-23. The design is [DESIGN.md](DESIGN.md); milestones are its section 19.
 
 ## Done
 
@@ -28,6 +28,8 @@ Verified by the user in the running app: creating, opening, editing and moving t
 
 **Milestone 2, slice 10: hardening (first pass).** A single-instance lock: `~/.agentic-kanban/instance.lock` is held with an OS file lock for the life of the process, so a second AgenticKanban on the same home directory shows a startup error and a crash never leaves a stale lock behind. Crash recovery: when a project is first opened in a session, runs still open in its store are closed as Crashed with an explanatory error and agents stuck in Starting, Running or Stopping return to Idle. Run retention: the hourly housekeeping pass drops the transcripts (run events and run directories) of runs that ended before the global retention period, keeping the run rows for cost history. The Postgres store is deferred until a second machine needs the same project; the trait boundary is in place.
 
+**Visual overhaul: liquid-glass theme.** The whole UI now uses one look in both light and dark, following the system setting: translucent panels and cards with a hairline rim, floating over a soft colour backdrop, with continuous rounding, capsule controls, the iOS system colours and Segoe UI. Colours and frames come from `crates/ak-app/src/theme.rs`, and the shared controls from `widgets.rs`. The sidebar and ticket panel float inset from the window edge, and toasts are capsules. No behaviour changed. Text fields have explicit ids, so a card appearing above one cannot drop its focus.
+
 ## Known gaps and deliberate choices
 
 - Dragging a card moves a small ghost label, not the card itself. Cosmetic; egui's built-in drag source broke clicking, so the card uses its own click-and-drag handling.
@@ -38,6 +40,7 @@ Verified by the user in the running app: creating, opening, editing and moving t
 - Agents sometimes call a board tool before loading its schema and get a missing-field error; the error now says to read the version from ticket_get, and they recover.
 - Every registered project opens at startup, so agents in all of them can wake as soon as the app starts. Pause all in a project's Team view holds that project; the global daily budget holds everything.
 - Turn, cost and wall-clock limits end runs without recording a guardrail trip; the run's exit reason is the only record.
+- The glass is simulated. egui has no backdrop blur, so the backdrop is a pre-blurred texture and each surface is a translucent fill with a rim and a top highlight. Real refraction would need a custom render pass.
 - The default permission profiles were rewritten after the first real team run (2026-10-14): 122 of 129 approval requests were commands prefixed with `cd "<worktree>" &&`, and the rest were pipes to `tail` or `head`, `ls`, `cat`, `mkdir`, `git -c user.name=... commit` and Claude Code's task-list tools. Every part of a compound command must be covered, so the profiles now list the everyday shell verbs, the read-only git commands, cargo and rustup, and Claude Code's bookkeeping tools; trusted adds editing, file management and the git commands that change the worktree's own branches; a third preset, integrator, adds merging. Pushing is never listed, so it always asks; force pushes, hard resets, `git clean` and recursive `rm` are denied. `git -c key=value` and `--no-pager` are ignored when matching, and `2>&1` is a redirection, not an operator.
 - Projects have an integration branch setting (default: the repository's default branch). The prompt tells agents to branch from it and to leave their worktree on `agent/<handle>` when they finish, so an integrator agent can merge and delete ticket branches without fighting checkouts.
 - The Team view has Stop all runs beside Pause all; Pause all only prevents new runs, which the first team run showed is not what a person reaching for a brake expects.

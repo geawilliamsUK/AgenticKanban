@@ -11,6 +11,8 @@ use ak_core::ids::{ActorId, ColumnId, ProjectId, TicketId};
 use ak_core::run::{AgentRun, RunEvent};
 use ak_core::{Actor, ActorKind, Notification, NotificationKind};
 
+use crate::theme::Tone;
+
 #[derive(Default, Clone)]
 pub struct BoardModel {
     pub columns: Vec<Column>,
@@ -158,13 +160,15 @@ pub struct ThreadDetail {
     pub participants: Vec<ActorId>,
 }
 
-pub fn priority_color(p: Priority) -> egui::Color32 {
-    match p {
-        Priority::Low => egui::Color32::from_rgb(120, 130, 140),
-        Priority::Medium => egui::Color32::from_rgb(70, 130, 220),
-        Priority::High => egui::Color32::from_rgb(235, 150, 40),
-        Priority::Urgent => egui::Color32::from_rgb(220, 60, 60),
-    }
+/// The colour of a priority in the mode a style is drawn in.
+pub fn priority_color(style: &egui::Style, p: Priority) -> egui::Color32 {
+    let tone = match p {
+        Priority::Low => Tone::Gray,
+        Priority::Medium => Tone::Accent,
+        Priority::High => Tone::Orange,
+        Priority::Urgent => Tone::Red,
+    };
+    crate::theme::tone(style, tone)
 }
 
 pub fn kind_label(k: NotificationKind) -> &'static str {

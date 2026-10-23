@@ -5,6 +5,9 @@ use egui::text::{CCursor, CCursorRange, LayoutJob, TextFormat};
 
 use ak_core::{Actor, ActorKind};
 
+use crate::theme::{self, Tone};
+use crate::widgets;
+
 const MAX_SUGGESTIONS: usize = 6;
 
 /// A multiline text edit that offers a completion popup while the text before
@@ -50,9 +53,10 @@ pub fn multiline(
         .order(egui::Order::Foreground)
         .fixed_pos(response.rect.left_bottom() + egui::vec2(0.0, 2.0))
         .show(ui.ctx(), |ui| {
-            egui::Frame::popup(ui.style()).show(ui, |ui| {
+            let frame = egui::Frame::popup(ui.style());
+            theme::glass(ui, frame, |ui| {
                 ui.set_min_width(220.0);
-                ui.weak("Mention");
+                widgets::caption(ui, "Mention");
                 for a in &matches {
                     let label = format!("@{}   {}", a.handle, a.display_name);
                     if ui.selectable_label(false, label).clicked() {
@@ -118,7 +122,7 @@ pub fn highlighted(ui: &egui::Ui, text: &str, actors: &[Actor]) -> LayoutJob {
     };
     let accent = TextFormat {
         font_id,
-        color: egui::Color32::from_rgb(120, 180, 255),
+        color: theme::tone(ui.style(), Tone::Accent),
         ..Default::default()
     };
 

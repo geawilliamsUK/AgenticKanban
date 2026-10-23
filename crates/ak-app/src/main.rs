@@ -16,6 +16,7 @@ mod overview_view;
 mod settings_view;
 mod snapshot_view;
 mod team_view;
+mod theme;
 mod ticket_view;
 mod widgets;
 
