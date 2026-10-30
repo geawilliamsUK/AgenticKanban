@@ -18,6 +18,7 @@ use ak_core::{Actor, NotificationState};
 use ak_runtime::snapshot::DriftEntry;
 use ak_runtime::{ClaudeCodeRunner, ClaudeProbe, HomePaths, ProjectRegistry, UtilityRunner};
 
+use crate::approvals_view::ApprovalTray;
 use crate::backend::{Backend, Request, Response, RunnerFactory};
 use crate::chats_view::ChatsState;
 use crate::dialogs::{AddProjectDialog, NewTicketDialog};
@@ -113,6 +114,8 @@ pub struct App {
     /// A transcript loaded on demand from the run history.
     pub run_events: Option<(RunId, Vec<RunEvent>)>,
     pub approvals: Vec<Approval>,
+    /// The bottom panel that shows `approvals` on every view.
+    pub tray: ApprovalTray,
     pub scheduler_paused: bool,
 
     pub new_ticket: Option<NewTicketDialog>,
@@ -204,6 +207,7 @@ impl App {
             live_runs: HashMap::new(),
             run_events: None,
             approvals: Vec::new(),
+            tray: ApprovalTray::default(),
             scheduler_paused: true,
             new_ticket: None,
             add_project: None,
@@ -789,10 +793,8 @@ impl App {
             if widgets::nav_item(ui, "Board", self.view == View::Board).clicked() {
                 self.actions.push(Action::SwitchView(View::Board));
             }
-            let unread = self.unread_count() + self.approvals.len();
-            let label = if !self.approvals.is_empty() {
-                format!("Inbox  ({unread}) ⚠")
-            } else if unread > 0 {
+            let unread = self.unread_count();
+            let label = if unread > 0 {
                 format!("Inbox  ({unread})")
             } else {
                 "Inbox".to_string()
@@ -860,9 +862,11 @@ impl App {
             return;
         }
         ctx.request_repaint_after(Duration::from_millis(500));
-        // A capsule that floats over the bottom centre, like a system notice.
+        // A capsule that floats over the bottom centre, like a system notice,
+        // above the approval tray when that is showing.
+        let lift = 24.0 + self.tray.shown_height();
         egui::Area::new(egui::Id::new("toast"))
-            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -24.0])
+            .anchor(egui::Align2::CENTER_BOTTOM, [0.0, -lift])
             .order(egui::Order::Foreground)
             .show(ctx, |ui| {
                 let frame = theme::panel(ui.style())
@@ -960,6 +964,10 @@ impl eframe::App for App {
             .show(ctx, |ui| {
                 self.draw_sidebar(ui);
             });
+
+        // Below the content and the ticket panel, spanning both, so an
+        // agent's request is in view whatever is open.
+        crate::approvals_view::draw(self, ctx);
 
         if self.current.is_some() && self.selected.is_some() {
             egui::SidePanel::right("ticket")

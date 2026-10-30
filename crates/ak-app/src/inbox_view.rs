@@ -1,5 +1,5 @@
-//! The human's inbox: approvals that block an agent, then every notification
-//! addressed to the human, newest first.
+//! The human's inbox: every notification addressed to the human, newest
+//! first. Approvals live in the tray along the bottom of the window.
 
 use ak_core::NotificationState;
 
@@ -11,55 +11,6 @@ use crate::widgets;
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     let Some(project) = app.current else { return };
-
-    let approvals = app.approvals.clone();
-    if !approvals.is_empty() {
-        ui.horizontal(|ui| {
-            ui.heading("Approvals");
-            widgets::chip(ui, Tone::Yellow, format!("{} waiting", approvals.len()));
-        });
-        ui.weak("An agent wants to do something its permission profile does not cover. The agent is paused until you answer.");
-        ui.add_space(8.0);
-        for a in &approvals {
-            let base = theme::tinted(ui.style(), Tone::Orange);
-            theme::glass(ui, base, |ui| {
-                ui.set_width(ui.available_width());
-                ui.horizontal(|ui| {
-                    ui.label(egui::RichText::new(app.board.handle(a.agent_id)).strong());
-                    ui.weak(format_time(&a.created_at));
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if widgets::tinted_button(ui, "Deny", Tone::Red).clicked() {
-                            app.actions.push(Action::Request(Request::DecideApproval {
-                                project,
-                                id: a.id,
-                                approve: false,
-                            }));
-                        }
-                        if widgets::tinted_button(ui, "Approve", Tone::Green).clicked() {
-                            app.actions.push(Action::Request(Request::DecideApproval {
-                                project,
-                                id: a.id,
-                                approve: true,
-                            }));
-                        }
-                    });
-                });
-                ui.add(egui::Label::new(egui::RichText::new(&a.summary).monospace()).wrap());
-                egui::CollapsingHeader::new("Full input")
-                    .id_salt(("approval_input", a.id))
-                    .show(ui, |ui| {
-                        let pretty = serde_json::to_string_pretty(&a.input).unwrap_or_default();
-                        ui.add(
-                            egui::Label::new(egui::RichText::new(pretty).monospace().small())
-                                .wrap(),
-                        );
-                    });
-            });
-            ui.add_space(8.0);
-        }
-        ui.add_space(8.0);
-        ui.separator();
-    }
 
     ui.horizontal(|ui| {
         ui.heading("Inbox");

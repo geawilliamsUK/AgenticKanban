@@ -480,8 +480,8 @@ The UI gives the human the same verbs as agents plus oversight.
 - **Agent editor**: create and edit agents, with Refine and Integrate behind diff review, model, permission profile, budgets, and a memory viewer with per-run diffs (section 14).
 - **Team sharing**: Export to project and Import from project, with per-agent diff review and drift indicators (section 14).
 - **Chats**: chat list, thread list, thread view, compose, search, pause and unpause.
-- **Inbox**: the human's own notifications: mentions, direct messages, approvals, guardrail trips.
-- **Approvals**: pending permission requests showing the tool, its input, the agent and the ticket, with approve or deny.
+- **Inbox**: the human's own notifications: mentions, direct messages, guardrail trips.
+- **Approvals**: a tray along the bottom of the window, on every view, showing the open project's pending permission requests (the tool, its input, the agent) with approve or deny. Oldest at the bottom, newer stacked above, two visible at a time.
 - **Run inspector**: the full transcript of any run, token and cost totals, exit reason.
 - **Projects**: a switcher in the sidebar. Add picks a folder, checks that it is a git repository, registers it in the home config and, if the repository already contains `.agentic/agents/`, opens the import review. Remove unregisters it and leaves the repository untouched, with an option to delete the project's home directory.
 - **Overview**: the cross-project view. The human's inbox from every project in one list, every agent running anywhere, approvals waiting, guardrail trips, and cost today per project.

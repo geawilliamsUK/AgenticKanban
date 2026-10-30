@@ -3,6 +3,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
+mod approvals_view;
 mod backend;
 mod board_view;
 mod chats_view;
