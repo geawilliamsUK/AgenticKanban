@@ -26,7 +26,7 @@ use ak_core::ids::{
     ActorId, ApprovalId, CallId, ChatId, ColumnId, CommentId, NotificationId, RunId, ThreadId,
     TicketId,
 };
-use ak_core::run::{AgentRun, RunEvent};
+use ak_core::run::{AgentRun, RunEvent, SchedulerDecision};
 use ak_core::utility::{UtilityCall, UtilityKind};
 use ak_core::{Actor, Event, Notification, NotificationState, Timestamp};
 
@@ -255,6 +255,18 @@ pub trait Store: Send + Sync {
     /// Cost of runs started at or after `since`, for one agent or all.
     async fn run_cost_since(&self, since: Timestamp, agent: Option<ActorId>) -> Result<f64>;
     async fn set_agent_cooldown(&self, actor_id: ActorId, until: Option<Timestamp>) -> Result<()>;
+
+    // For the team analyst: everything in a time window.
+
+    /// Runs started at or after `since`, oldest first.
+    async fn runs_since(&self, since: Timestamp) -> Result<Vec<AgentRun>>;
+    /// Approvals created at or after `since`, in any state, oldest first.
+    async fn approvals_since(&self, since: Timestamp) -> Result<Vec<Approval>>;
+    /// Events that occurred at or after `since`, oldest first, at most `limit`.
+    async fn events_after(&self, since: Timestamp, limit: u32) -> Result<Vec<Event>>;
+    async fn record_scheduler_decision(&self, decision: &SchedulerDecision) -> Result<()>;
+    /// Decisions at or after `since`, oldest first.
+    async fn scheduler_decisions_since(&self, since: Timestamp) -> Result<Vec<SchedulerDecision>>;
 }
 
 pub type SharedStore = Arc<dyn Store>;

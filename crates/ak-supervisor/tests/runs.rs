@@ -12,7 +12,7 @@ use ak_bridge::Bridge;
 use ak_core::agent::{AgentDefinition, AgentState};
 use ak_core::commands::NewTicket;
 use ak_core::config::{GlobalSettings, PermissionProfile};
-use ak_core::run::{ExitReason, RunEventKind, RunTrigger};
+use ak_core::run::{ExitReason, RunEventKind, RunTrigger, SkipReason};
 use ak_core::NotificationKind;
 use ak_runtime::{HomePaths, OpenProject, ProjectRegistry};
 use ak_supervisor::supervisor::{RunNotice, StopReason};
@@ -159,6 +159,11 @@ async fn a_run_completes_and_is_recorded() {
     assert_eq!(stored.num_turns, run.num_turns);
     assert_eq!(stored.cost_usd, run.cost_usd);
     assert!(stored.ended_at.is_some());
+    let outcome = stored.outcome.expect("an outcome is tallied");
+    assert_eq!(outcome.tool_calls["mcp__board__inbox_list"], 1);
+    assert_eq!(outcome.board_tool_calls(), 1);
+    assert_eq!(outcome.tool_errors, 0);
+    assert!(outcome.result.is_some(), "the final text is kept");
     let events = store.run_events(run.id).await.unwrap();
     let kinds: Vec<RunEventKind> = events.iter().map(|e| e.kind).collect();
     assert!(kinds.contains(&RunEventKind::SystemInit));
@@ -353,6 +358,20 @@ async fn scheduler_wakes_on_assignment_and_cools_down_on_no_progress() {
         store.active_runs().await.unwrap().is_empty(),
         "no run while cooling down"
     );
+    let since = Utc::now() - chrono::Duration::hours(1);
+    let decisions = store.scheduler_decisions_since(since).await.unwrap();
+    assert!(
+        decisions.iter().any(|d| d.reason == SkipReason::Cooldown
+            && d.agent_id == f.agent.actor_id
+            && d.detail.contains("wake item")),
+        "the cooldown skip is recorded: {decisions:?}"
+    );
+    // A second tick with the same reason records nothing new.
+    scheduler.tick().await.unwrap();
+    assert_eq!(
+        store.scheduler_decisions_since(since).await.unwrap().len(),
+        decisions.len()
+    );
     assert_eq!(
         store
             .runs_for_agent(f.agent.actor_id, 10)
@@ -383,6 +402,15 @@ async fn scheduler_wakes_on_assignment_and_cools_down_on_no_progress() {
     assert_eq!(
         store.agent(f.agent.actor_id).await.unwrap().state,
         AgentState::Halted
+    );
+    assert!(
+        store
+            .scheduler_decisions_since(since)
+            .await
+            .unwrap()
+            .iter()
+            .any(|d| d.reason == SkipReason::Halted),
+        "the halted skip is recorded"
     );
     scheduler.resume(f.agent.actor_id).await.unwrap();
     assert_eq!(

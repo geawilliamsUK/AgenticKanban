@@ -35,7 +35,10 @@ pub use ids::*;
 pub use notification::{
     Notification, NotificationDraft, NotificationKind, NotificationState, RoutingContext,
 };
-pub use run::{AgentRun, ExitReason, RunEvent, RunEventKind, RunTrigger};
+pub use run::{
+    AgentRun, ExitReason, RunEvent, RunEventKind, RunOutcome, RunTrigger, SchedulerDecision,
+    SkipReason,
+};
 pub use utility::{UtilityCall, UtilityKind, UtilityState};
 
 /// Re-exports so downstream crates share one version of each.

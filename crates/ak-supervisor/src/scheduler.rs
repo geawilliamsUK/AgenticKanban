@@ -6,6 +6,10 @@
 //! not over their wake rate, and within budget, as long as a slot is free.
 //! When a run ends with the same wake items still pending, the agent cools
 //! down instead of waking again straight away.
+//!
+//! Every tick that leaves an agent with pending work unstarted records why,
+//! once per reason and then every so often, so the analyst can see what
+//! held the team back.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -20,13 +24,16 @@ use ak_core::config::{GlobalSettings, PermissionProfile};
 use ak_core::event::Subject;
 use ak_core::guardrails::{GuardrailAction, GuardrailRule, Trip};
 use ak_core::ids::{ActorId, NotificationId, RunId};
-use ak_core::run::RunTrigger;
+use ak_core::run::{RunTrigger, SchedulerDecision, SkipReason};
 use ak_runtime::OpenProject;
 use ak_store::Store;
 
 use crate::supervisor::{RunHandle, RunNotice, RunSpec, StopReason, Supervisor};
 use crate::workspace;
 use crate::SupervisorError;
+
+/// How long a persisting skip reason waits before it is recorded again.
+const SKIP_REPEAT: Duration = Duration::from_secs(15 * 60);
 
 struct ActiveRun {
     handle: RunHandle,
@@ -45,6 +52,8 @@ struct State {
     churn: HashMap<ActorId, u32>,
     /// When the human was last told about a wake storm, per agent.
     storm_notified: HashMap<ActorId, Instant>,
+    /// The last skip reason recorded per agent, and when.
+    last_skip: HashMap<ActorId, (SkipReason, Instant)>,
 }
 
 struct Inner {
@@ -87,6 +96,7 @@ impl Scheduler {
                     activations: HashMap::new(),
                     churn: HashMap::new(),
                     storm_notified: HashMap::new(),
+                    last_skip: HashMap::new(),
                 }),
                 nudge,
                 tick_lock: tokio::sync::Mutex::new(()),
@@ -249,38 +259,74 @@ impl Scheduler {
             if agent.is_retired() || self.is_running(agent.actor_id) {
                 continue;
             }
-            match agent.state {
-                AgentState::Halted => continue,
-                AgentState::Cooldown => match agent.cooldown_until {
-                    Some(until) if until > now => continue,
-                    _ => {
-                        store
-                            .set_agent_state(agent.actor_id, AgentState::Idle, None)
-                            .await?;
-                        store.set_agent_cooldown(agent.actor_id, None).await?;
-                    }
-                },
-                AgentState::Idle | AgentState::Scheduled => {}
-                // Starting/Running/Stopping/Errored without an active handle: a
-                // leftover from a crash. Treat as idle.
-                _ => {
+            let mut state = agent.state;
+            match state {
+                // An expired cooldown ends here, pending work or not.
+                AgentState::Cooldown if agent.cooldown_until.is_none_or(|until| until <= now) => {
                     store
                         .set_agent_state(agent.actor_id, AgentState::Idle, None)
                         .await?;
+                    store.set_agent_cooldown(agent.actor_id, None).await?;
+                    state = AgentState::Idle;
                 }
+                // Starting/Running/Stopping/Errored without an active handle: a
+                // leftover from a crash. Treat as idle.
+                AgentState::Starting
+                | AgentState::Running
+                | AgentState::Stopping
+                | AgentState::Errored => {
+                    store
+                        .set_agent_state(agent.actor_id, AgentState::Idle, None)
+                        .await?;
+                    state = AgentState::Idle;
+                }
+                _ => {}
             }
 
+            // Anything to do? An activation stays queued until its run starts.
             let activation = self
                 .inner
                 .state
                 .lock()
                 .expect("state")
                 .activations
-                .remove(&agent.actor_id);
+                .get(&agent.actor_id)
+                .cloned();
             let open = store.notifications(agent.actor_id, true).await?;
             let wake: Vec<_> = open.iter().filter(|n| n.wake).collect();
             if wake.is_empty() && activation.is_none() {
                 continue;
+            }
+            let waiting = if wake.is_empty() {
+                "a direct activation is waiting".to_string()
+            } else {
+                format!("{} wake item(s) waiting", wake.len())
+            };
+
+            match state {
+                AgentState::Halted => {
+                    self.skip(
+                        &agent,
+                        SkipReason::Halted,
+                        format!("{waiting}; the agent is halted"),
+                    )
+                    .await;
+                    continue;
+                }
+                AgentState::Cooldown => {
+                    let until = agent
+                        .cooldown_until
+                        .map(|t| t.format("%H:%M UTC").to_string())
+                        .unwrap_or_default();
+                    self.skip(
+                        &agent,
+                        SkipReason::Cooldown,
+                        format!("{waiting}; cooling down until {until}"),
+                    )
+                    .await;
+                    continue;
+                }
+                _ => {}
             }
 
             // Wake rate: past the storm threshold, wakes wait and the human
@@ -294,7 +340,8 @@ impl Scheduler {
                 {
                     times.pop_front();
                 }
-                let exceeded = times.len() as u32 >= policy.guardrails.wake_storm_per_hour;
+                let count = times.len() as u32;
+                let exceeded = count >= policy.guardrails.wake_storm_per_hour;
                 if exceeded {
                     let notify = !matches!(
                         state.storm_notified.get(&agent.actor_id),
@@ -303,13 +350,21 @@ impl Scheduler {
                     if notify {
                         state.storm_notified.insert(agent.actor_id, Instant::now());
                     }
-                    Some(notify)
+                    Some((notify, count))
                 } else {
                     None
                 }
             };
-            if let Some(notify) = storm {
-                tracing::warn!(handle = %agent.handle, "wake rate exceeded; not starting a run");
+            if let Some((notify, count)) = storm {
+                self.skip(
+                    &agent,
+                    SkipReason::WakeStorm,
+                    format!(
+                        "{waiting}; {count} wakes in the last hour, limit {}",
+                        policy.guardrails.wake_storm_per_hour
+                    ),
+                )
+                .await;
                 if notify {
                     let _ = store
                         .record_guardrail_trip(&Trip {
@@ -335,7 +390,15 @@ impl Scheduler {
             let spent_today = store.run_cost_since(midnight, None).await?
                 + store.utility_cost_since(midnight).await?;
             if spent_today >= settings.global_daily_budget_usd {
-                tracing::warn!("daily budget reached; not starting runs");
+                self.skip(
+                    &agent,
+                    SkipReason::DailyBudget,
+                    format!(
+                        "{waiting}; ${spent_today:.2} of the ${:.2} daily budget is spent",
+                        settings.global_daily_budget_usd
+                    ),
+                )
+                .await;
                 return Ok(());
             }
             let agent_today = store.run_cost_since(midnight, Some(agent.actor_id)).await?;
@@ -345,7 +408,12 @@ impl Scheduler {
                 .and_then(|b| b.max_usd_per_day)
                 .unwrap_or(policy.guardrails.max_usd_per_agent_per_day);
             if agent_today >= agent_cap {
-                tracing::warn!(handle = %agent.handle, "agent daily budget reached");
+                self.skip(
+                    &agent,
+                    SkipReason::AgentBudget,
+                    format!("{waiting}; ${agent_today:.2} of the agent's ${agent_cap:.2} daily cap is spent"),
+                )
+                .await;
                 continue;
             }
 
@@ -354,6 +422,15 @@ impl Scheduler {
                 store
                     .set_agent_state(agent.actor_id, AgentState::Scheduled, None)
                     .await?;
+                self.skip(
+                    &agent,
+                    SkipReason::NoSlot,
+                    format!(
+                        "{waiting}; all {} run slots are busy",
+                        settings.max_concurrent_runs
+                    ),
+                )
+                .await;
                 return Ok(());
             };
 
@@ -402,7 +479,8 @@ impl Scheduler {
             let ws = match workspace::ensure(&project.entry.path, &base, &agent.handle).await {
                 Ok(ws) => ws,
                 Err(e) => {
-                    tracing::error!(handle = %agent.handle, "workspace failed: {e}");
+                    self.skip(&agent, SkipReason::WorkspaceFailed, e.to_string())
+                        .await;
                     continue;
                 }
             };
@@ -431,6 +509,8 @@ impl Scheduler {
             match self.inner.supervisor.start_run(spec).await {
                 Ok(handle) => {
                     let mut state = self.inner.state.lock().expect("state");
+                    state.activations.remove(&agent.actor_id);
+                    state.last_skip.remove(&agent.actor_id);
                     state
                         .wake_times
                         .entry(agent.actor_id)
@@ -448,7 +528,8 @@ impl Scheduler {
                     self.watch_run(agent);
                 }
                 Err(e) => {
-                    tracing::error!(handle = %agent.handle, "could not start run: {e}");
+                    self.skip(&agent, SkipReason::StartFailed, e.to_string())
+                        .await;
                     let _ = store
                         .set_agent_state(agent.actor_id, AgentState::Errored, None)
                         .await;
@@ -457,6 +538,41 @@ impl Scheduler {
             }
         }
         Ok(())
+    }
+
+    /// Records why an agent with pending work was not started: once per
+    /// reason, then again every `SKIP_REPEAT` while it persists.
+    async fn skip(&self, agent: &Agent, reason: SkipReason, detail: String) {
+        let record = {
+            let mut state = self.inner.state.lock().expect("state");
+            match state.last_skip.get(&agent.actor_id) {
+                Some((r, at)) if *r == reason && at.elapsed() < SKIP_REPEAT => false,
+                _ => {
+                    state
+                        .last_skip
+                        .insert(agent.actor_id, (reason, Instant::now()));
+                    true
+                }
+            }
+        };
+        if !record {
+            return;
+        }
+        tracing::warn!(handle = %agent.handle, "not starting a run ({}): {detail}", reason.label());
+        if let Err(e) = self
+            .inner
+            .project
+            .store()
+            .record_scheduler_decision(&SchedulerDecision {
+                at: Utc::now(),
+                agent_id: agent.actor_id,
+                reason,
+                detail,
+            })
+            .await
+        {
+            tracing::warn!("could not record a scheduler decision: {e}");
+        }
     }
 
     /// Waits for the agent's run to end, then decides what happens next.

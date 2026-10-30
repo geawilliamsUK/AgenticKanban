@@ -24,7 +24,7 @@ use ak_core::event::{EventKind, MentionSource};
 use ak_core::guardrails::Trip;
 use ak_core::ids::*;
 use ak_core::notification::{self, RoutingContext};
-use ak_core::run::{AgentRun, RunEvent};
+use ak_core::run::{AgentRun, RunEvent, SchedulerDecision, SkipReason};
 use ak_core::utility::{UtilityCall, UtilityKind};
 use ak_core::{Actor, ActorKind, Event, Notification, NotificationState, Timestamp};
 
@@ -1216,7 +1216,7 @@ impl Store for SqliteStore {
         sqlx::query(
             "INSERT INTO runs (id, agent_actor_id, trigger, claude_session_id, workspace_path, \
              started_at, ended_at, exit_reason, num_turns, input_tokens, output_tokens, cost_usd, \
-             error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             error, outcome) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(run.id.to_string())
         .bind(run.agent_id.to_string())
@@ -1231,6 +1231,7 @@ impl Store for SqliteStore {
         .bind(run.output_tokens as i64)
         .bind(run.cost_usd)
         .bind(&run.error)
+        .bind(outcome_json(run)?)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1239,7 +1240,7 @@ impl Store for SqliteStore {
     async fn update_run(&self, run: &AgentRun) -> Result<()> {
         let result = sqlx::query(
             "UPDATE runs SET claude_session_id = ?, ended_at = ?, exit_reason = ?, num_turns = ?, \
-             input_tokens = ?, output_tokens = ?, cost_usd = ?, error = ? WHERE id = ?",
+             input_tokens = ?, output_tokens = ?, cost_usd = ?, error = ?, outcome = ? WHERE id = ?",
         )
         .bind(&run.claude_session_id)
         .bind(run.ended_at.as_ref().map(fmt_ts))
@@ -1249,6 +1250,7 @@ impl Store for SqliteStore {
         .bind(run.output_tokens as i64)
         .bind(run.cost_usd)
         .bind(&run.error)
+        .bind(outcome_json(run)?)
         .bind(run.id.to_string())
         .execute(&self.pool)
         .await?;
@@ -1341,4 +1343,73 @@ impl Store for SqliteStore {
         }
         Ok(())
     }
+
+    async fn runs_since(&self, since: Timestamp) -> Result<Vec<AgentRun>> {
+        let rows = sqlx::query("SELECT * FROM runs WHERE started_at >= ? ORDER BY started_at")
+            .bind(fmt_ts(&since))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(run_from_row).collect()
+    }
+
+    async fn approvals_since(&self, since: Timestamp) -> Result<Vec<Approval>> {
+        let rows = sqlx::query("SELECT * FROM approvals WHERE created_at >= ? ORDER BY created_at")
+            .bind(fmt_ts(&since))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(approval_from_row).collect()
+    }
+
+    async fn events_after(&self, since: Timestamp, limit: u32) -> Result<Vec<Event>> {
+        let rows = sqlx::query("SELECT * FROM events WHERE occurred_at >= ? ORDER BY seq LIMIT ?")
+            .bind(fmt_ts(&since))
+            .bind(limit as i64)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter().map(event_from_row).collect()
+    }
+
+    async fn record_scheduler_decision(&self, decision: &SchedulerDecision) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO scheduler_decisions (at, agent_actor_id, reason, detail) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(fmt_ts(&decision.at))
+        .bind(decision.agent_id.to_string())
+        .bind(decision.reason.as_str())
+        .bind(&decision.detail)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn scheduler_decisions_since(&self, since: Timestamp) -> Result<Vec<SchedulerDecision>> {
+        let rows = sqlx::query("SELECT * FROM scheduler_decisions WHERE at >= ? ORDER BY seq")
+            .bind(fmt_ts(&since))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.iter()
+            .map(|row| {
+                let reason: String = sqlx::Row::try_get(row, "reason")?;
+                Ok(SchedulerDecision {
+                    at: parse_ts(&sqlx::Row::try_get::<String, _>(row, "at")?)?,
+                    agent_id: parse_id(
+                        &sqlx::Row::try_get::<String, _>(row, "agent_actor_id")?,
+                        "actor",
+                    )?,
+                    reason: SkipReason::parse(&reason)
+                        .ok_or_else(|| StoreError::corrupt(format!("skip reason {reason:?}")))?,
+                    detail: sqlx::Row::try_get(row, "detail")?,
+                })
+            })
+            .collect()
+    }
+}
+
+/// The outcome column: JSON, or NULL for a run that has not ended.
+fn outcome_json(run: &AgentRun) -> Result<Option<String>> {
+    run.outcome
+        .as_ref()
+        .map(|o| serde_json::to_string(o).map_err(StoreError::from))
+        .transpose()
 }

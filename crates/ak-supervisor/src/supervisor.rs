@@ -21,7 +21,7 @@ use ak_bridge::{Bridge, RunContext};
 use ak_core::agent::{Agent, AgentState};
 use ak_core::config::PermissionProfile;
 use ak_core::ids::{ProjectId, RunId};
-use ak_core::run::{AgentRun, ExitReason, RunEvent, RunEventKind, RunTrigger};
+use ak_core::run::{AgentRun, ExitReason, RunEvent, RunEventKind, RunOutcome, RunTrigger};
 use ak_core::ActorKind;
 use ak_runtime::{HomePaths, OpenProject};
 
@@ -386,6 +386,7 @@ impl Driver {
         let mut raw_stdout = String::new();
         let mut got_init = false;
         let mut result: Option<Value> = None;
+        let mut outcome = RunOutcome::default();
         let mut forced_exit: Option<(ExitReason, String)> = None;
         let mut stop_rx = stop_rx;
         let deadline = tokio::time::sleep(self.wall_clock);
@@ -425,6 +426,16 @@ impl Driver {
                             }
                             if kind == RunEventKind::Result {
                                 result = Some(payload.clone());
+                            }
+                            match kind {
+                                RunEventKind::ToolCall => outcome.note_tool_call(
+                                    payload.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                                    payload.get("input").unwrap_or(&Value::Null),
+                                ),
+                                RunEventKind::ToolResult => outcome.note_tool_result(
+                                    payload.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false),
+                                ),
+                                _ => {}
                             }
                             self.record(&mut seq, kind, payload).await;
                         }
@@ -483,6 +494,13 @@ impl Driver {
                 self.run.output_tokens = n("output_tokens");
             }
         }
+        outcome.result = result
+            .as_ref()
+            .and_then(|r| r.get("result"))
+            .and_then(|v| v.as_str())
+            .map(|t| truncate(t.trim(), 1000))
+            .filter(|t| !t.is_empty());
+        self.run.outcome = Some(outcome);
         self.run.ended_at = Some(Utc::now());
         self.run.exit_reason = Some(exit);
         self.run.error = error.clone();

@@ -1,9 +1,14 @@
 //! Run records and transcripts.
 
 use ak_core::agent::{Agent, AgentDefinition};
+use ak_core::approval::Approval;
+use ak_core::commands::NewTicket;
 use ak_core::config::ProjectPolicy;
 use ak_core::ids::{ActorId, NotificationId};
-use ak_core::run::{AgentRun, ExitReason, RunEvent, RunEventKind, RunTrigger};
+use ak_core::run::{
+    AgentRun, ExitReason, RunEvent, RunEventKind, RunOutcome, RunTrigger, SchedulerDecision,
+    SkipReason,
+};
 use ak_store::{HumanIdentity, SqliteStore, Store};
 use chrono::{Duration, Utc};
 use serde_json::json;
@@ -192,4 +197,126 @@ async fn recovery_closes_open_runs_and_pruning_drops_old_transcripts() {
             .is_empty(),
         "nothing left to prune"
     );
+}
+
+#[tokio::test]
+async fn windows_for_the_analyst() {
+    let (store, agent) = store_with_agent().await;
+    let now = Utc::now();
+    let since = now - Duration::hours(1);
+
+    // Runs: an old one outside the window, two inside, one with an outcome.
+    let mut old = AgentRun::start(
+        agent,
+        RunTrigger::Manual,
+        "ws".into(),
+        now - Duration::days(2),
+    );
+    old.ended_at = Some(now - Duration::days(2));
+    store.insert_run(&old).await.unwrap();
+    let mut done = AgentRun::start(
+        agent,
+        RunTrigger::Manual,
+        "ws".into(),
+        now - Duration::minutes(30),
+    );
+    let mut outcome = RunOutcome::default();
+    outcome.note_tool_call(
+        "mcp__board__ticket_move",
+        &json!({"key": "DEM-1", "column": "Done", "version": 1}),
+    );
+    outcome.note_tool_call("Bash", &json!({"command": "git commit -m x"}));
+    outcome.result = Some("Moved DEM-1".into());
+    done.outcome = Some(outcome.clone());
+    done.ended_at = Some(now - Duration::minutes(20));
+    done.exit_reason = Some(ExitReason::Completed);
+    store.insert_run(&done).await.unwrap();
+    let live = AgentRun::start(
+        agent,
+        RunTrigger::Manual,
+        "ws".into(),
+        now - Duration::minutes(5),
+    );
+    store.insert_run(&live).await.unwrap();
+
+    let runs = store.runs_since(since).await.unwrap();
+    assert_eq!(runs.len(), 2, "the old run is outside the window");
+    assert_eq!(runs[0].id, done.id, "oldest first");
+    assert_eq!(runs[0].outcome.as_ref(), Some(&outcome));
+    assert_eq!(runs[1].outcome, None);
+    // An outcome set later lands through update_run too.
+    let mut live = live;
+    live.outcome = Some(RunOutcome::default());
+    store.update_run(&live).await.unwrap();
+    assert!(store.run(live.id).await.unwrap().outcome.is_some());
+
+    // Approvals, any state.
+    let mut a = Approval::new(
+        done.id,
+        agent,
+        "Bash",
+        json!({"command": "rm -r x"}),
+        now - Duration::minutes(25),
+    );
+    store.insert_approval(&a).await.unwrap();
+    a = store
+        .decide_approval(a.id, ak_core::approval::ApprovalState::Denied, None)
+        .await
+        .unwrap();
+    assert_eq!(a.state, ak_core::approval::ApprovalState::Denied);
+    let approvals = store.approvals_since(since).await.unwrap();
+    assert_eq!(approvals.len(), 1);
+    assert_eq!(approvals[0].state, ak_core::approval::ApprovalState::Denied);
+    assert!(store.approvals_since(now).await.unwrap().is_empty());
+
+    // Events in the window.
+    let columns = store.columns().await.unwrap();
+    let human = store.human().await.unwrap();
+    store
+        .create_ticket(
+            NewTicket {
+                title: "T".into(),
+                column_id: columns[0].id,
+                ..Default::default()
+            },
+            human.id,
+        )
+        .await
+        .unwrap();
+    let events = store.events_after(since, 100).await.unwrap();
+    assert!(!events.is_empty());
+    assert!(store
+        .events_after(now + Duration::hours(1), 100)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // Scheduler decisions.
+    for (reason, detail) in [
+        (
+            SkipReason::NoSlot,
+            "2 wake item(s) waiting; all 3 run slots are busy",
+        ),
+        (SkipReason::Cooldown, "cooling down"),
+    ] {
+        store
+            .record_scheduler_decision(&SchedulerDecision {
+                at: now,
+                agent_id: agent,
+                reason,
+                detail: detail.into(),
+            })
+            .await
+            .unwrap();
+    }
+    let decisions = store.scheduler_decisions_since(since).await.unwrap();
+    assert_eq!(decisions.len(), 2);
+    assert_eq!(decisions[0].reason, SkipReason::NoSlot);
+    assert!(decisions[0].detail.contains("slots"));
+    assert_eq!(decisions[1].reason, SkipReason::Cooldown);
+    assert!(store
+        .scheduler_decisions_since(now + Duration::minutes(1))
+        .await
+        .unwrap()
+        .is_empty());
 }
