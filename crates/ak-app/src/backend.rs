@@ -32,6 +32,7 @@ use ak_core::run::{AgentRun, RunEvent};
 use ak_core::utility::{UtilityCall, UtilityKind, UtilityState};
 use ak_core::{Actor, ActorKind, Event, NotificationState, Timestamp};
 use ak_runtime::agents::{self, AgentWatcher};
+use ak_runtime::analyst::{self, Analysis, Decision, Target};
 use ak_runtime::authoring::{self, RosterEntry, TeamMember};
 use ak_runtime::claude::{self, ClaudeProbe};
 use ak_runtime::snapshot::{
@@ -209,6 +210,29 @@ pub enum Request {
     },
     /// The cross-project summary.
     LoadOverview,
+    // The team analyst.
+    LoadDigest {
+        project: ProjectId,
+        hours: u32,
+    },
+    /// Runs the analyst over the window. `notes` is what the human wants it
+    /// to look at.
+    Analyse {
+        project: ProjectId,
+        hours: u32,
+        notes: String,
+    },
+    LoadAnalyses {
+        project: ProjectId,
+    },
+    /// Applies or dismisses one recommendation and records the decision on
+    /// the call.
+    DecideRecommendation {
+        project: ProjectId,
+        call_id: CallId,
+        index: usize,
+        apply: bool,
+    },
     SaveGlobalSettings(GlobalSettings),
     SaveProjectPolicy {
         project: ProjectId,
@@ -249,6 +273,13 @@ pub enum Request {
         project: ProjectId,
         run_id: RunId,
     },
+}
+
+/// One analyst call with its parsed reply, for the Analyst view.
+#[derive(Clone)]
+pub struct AnalysisRecord {
+    pub call: UtilityCall,
+    pub analysis: Analysis,
 }
 
 /// A proposal awaiting review, with the text it would replace.
@@ -375,6 +406,23 @@ pub enum Response {
         entries: Vec<DriftEntry>,
     },
     Overview(Vec<ProjectOverview>),
+    Digest {
+        project: ProjectId,
+        digest: analyst::Digest,
+        markdown: String,
+    },
+    AnalysisStarted {
+        project: ProjectId,
+    },
+    /// Every analysis, newest first.
+    Analyses {
+        project: ProjectId,
+        items: Vec<AnalysisRecord>,
+    },
+    AnalysisFailed {
+        project: ProjectId,
+        error: String,
+    },
     RunStarted {
         project: ProjectId,
         run: AgentRun,
@@ -765,6 +813,7 @@ impl Backend {
                     let _ = push_inbox(&p, &self.tx, &self.ctx).await;
                 }
                 self.send(Response::RunEnded { project, run });
+                self.maybe_auto_analyse(project).await;
             }
             Internal::Bridge(BridgeEvent::ApprovalRequested(a)) => {
                 if let Some(p) = self.project_of_agent(a.agent_id).await {
@@ -1116,6 +1165,40 @@ impl Backend {
                     "Imported {} agent(s)",
                     written.len()
                 )));
+            }
+            Request::LoadDigest { project, hours } => {
+                let p = self.project(project)?;
+                let since = Utc::now() - chrono::Duration::hours(hours.max(1) as i64);
+                let digest = analyst::build_digest(&p, since)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let markdown = analyst::render_digest(&digest);
+                self.send(Response::Digest {
+                    project,
+                    digest,
+                    markdown,
+                });
+            }
+            Request::Analyse {
+                project,
+                hours,
+                notes,
+            } => {
+                let p = self.project(project)?;
+                self.start_analysis(p, hours, notes).await?;
+            }
+            Request::LoadAnalyses { project } => {
+                let p = self.project(project)?;
+                push_analyses(&p, &self.tx, &self.ctx).await?;
+            }
+            Request::DecideRecommendation {
+                project,
+                call_id,
+                index,
+                apply,
+            } => {
+                self.decide_recommendation(project, call_id, index, apply)
+                    .await?;
             }
             Request::LoadOverview => {
                 let list = self.overview().await;
@@ -1561,6 +1644,206 @@ impl Backend {
 
     /// Records the call, answers immediately, and runs the model call in its
     /// own task so the loop stays responsive.
+    /// One analyst call over the window: the digest, every live definition
+    /// and the human's notes go in; recommendations come back as a proposal
+    /// on a utility call owned by the system actor.
+    async fn start_analysis(
+        &self,
+        p: Arc<OpenProject>,
+        hours: u32,
+        notes: String,
+    ) -> Result<(), String> {
+        let store = p.store();
+        let newest = store
+            .utility_calls_of_kind(UtilityKind::Analyse, 1)
+            .await
+            .map_err(|e| e.to_string())?;
+        if newest
+            .first()
+            .is_some_and(|c| c.state == UtilityState::Running)
+        {
+            return Err("an analysis is already running".into());
+        }
+        self.check_utility_budget(store.as_ref()).await?;
+        let model = p
+            .policy()
+            .authoring_model
+            .clone()
+            .or_else(|| self.settings.authoring_model.clone());
+        let mut call = UtilityCall::start(
+            UtilityKind::Analyse,
+            ActorId::SYSTEM,
+            None,
+            model.clone(),
+            Utc::now(),
+        );
+        store
+            .insert_utility_call(&call)
+            .await
+            .map_err(|e| e.to_string())?;
+        self.send(Response::AnalysisStarted { project: p.id() });
+
+        let runner = self.runner.clone();
+        let tx = self.tx.clone();
+        let ctx = self.ctx.clone();
+        let project = p.id();
+        tokio::spawn(async move {
+            let outcome = run_analysis(&p, hours, &notes, model, runner.as_ref()).await;
+            let now = Utc::now();
+            let response = match outcome {
+                Ok((analysis, cost)) => {
+                    call.propose(analysis.to_json(), analysis.warnings.clone(), cost, now);
+                    if let Err(e) = p.store().update_utility_call(&call).await {
+                        tracing::warn!("could not record the analysis: {e}");
+                    }
+                    Response::Info(format!(
+                        "Analysis ready: {} recommendation(s)",
+                        analysis.recommendations.len()
+                    ))
+                }
+                Err(error) => {
+                    call.fail(error.clone(), None, now);
+                    if let Err(e) = p.store().update_utility_call(&call).await {
+                        tracing::warn!("could not record the failure: {e}");
+                    }
+                    Response::AnalysisFailed { project, error }
+                }
+            };
+            let _ = push_analyses(&p, &tx, &ctx).await;
+            if tx.send(response).is_ok() {
+                ctx.request_repaint();
+            }
+        });
+        Ok(())
+    }
+
+    /// Applies one recommendation, or records that the human passed on it.
+    async fn decide_recommendation(
+        &mut self,
+        project: ProjectId,
+        call_id: CallId,
+        index: usize,
+        apply: bool,
+    ) -> Result<(), String> {
+        let p = self.project(project)?;
+        let store = p.store();
+        let mut call = store
+            .utility_call(call_id)
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut analysis = call
+            .proposal
+            .as_deref()
+            .and_then(|t| Analysis::from_json(t).ok())
+            .ok_or_else(|| "the analysis could not be read".to_string())?;
+        let rec = analysis
+            .recommendations
+            .get_mut(index)
+            .ok_or_else(|| "no such recommendation".to_string())?;
+        if rec.decision.is_some() {
+            return Err("that recommendation is already decided".into());
+        }
+        let info = if apply {
+            match &rec.target {
+                Target::AgentSection {
+                    handle,
+                    section,
+                    text,
+                } => {
+                    let mut def = p
+                        .agents
+                        .read_definition(handle)
+                        .map_err(|e| e.to_string())?;
+                    def.body = analyst::replace_section(&def.body, section, text);
+                    save_definition(&p, &def).await?;
+                    push_board(&p, &self.tx, &self.ctx).await?;
+                    format!("Updated section {section} of @{handle}")
+                }
+                Target::Guardrail { field, value } => {
+                    let mut policy = p.policy();
+                    analyst::set_guardrail(&mut policy.guardrails, field, *value)?;
+                    self.apply_policy(project, policy)?;
+                    format!("Set guardrail {field} to {value}")
+                }
+                Target::ProfileAllow { profile, rules } => {
+                    let mut policy = p.policy();
+                    let prof = policy
+                        .permission_profiles
+                        .iter_mut()
+                        .find(|x| &x.name == profile)
+                        .ok_or_else(|| format!("no profile named {profile:?}"))?;
+                    let added = analyst::add_allow_rules(prof, rules);
+                    self.apply_policy(project, policy)?;
+                    format!("Added {added} allow rule(s) to {profile}")
+                }
+                Target::Human => format!("Marked done: {}", rec.title),
+            }
+        } else {
+            format!("Dismissed: {}", rec.title)
+        };
+        rec.decision = Some(if apply {
+            Decision::Applied
+        } else {
+            Decision::Dismissed
+        });
+        if analysis.undecided() == 0 {
+            call.state = if analysis
+                .recommendations
+                .iter()
+                .any(|r| r.decision == Some(Decision::Applied))
+            {
+                UtilityState::Accepted
+            } else {
+                UtilityState::Rejected
+            };
+        }
+        call.proposal = Some(analysis.to_json());
+        store
+            .update_utility_call(&call)
+            .await
+            .map_err(|e| e.to_string())?;
+        push_analyses(&p, &self.tx, &self.ctx).await?;
+        self.send(Response::Info(info));
+        Ok(())
+    }
+
+    /// Runs the analyst by itself when the project asks for one after every
+    /// so many runs, counting from the last analysis.
+    async fn maybe_auto_analyse(&self, project: ProjectId) {
+        let Some(p) = self.registry.opened(project) else {
+            return;
+        };
+        let every = p.policy().analyst_every_runs;
+        if every == 0 {
+            return;
+        }
+        let store = p.store();
+        let Ok(calls) = store.utility_calls_of_kind(UtilityKind::Analyse, 1).await else {
+            return;
+        };
+        let last = calls.first();
+        if last.is_some_and(|c| c.state == UtilityState::Running) {
+            return;
+        }
+        let since = last
+            .map(|c| c.started_at)
+            .unwrap_or_else(|| Utc::now() - chrono::Duration::days(7));
+        let Ok(runs) = store.runs_since(since).await else {
+            return;
+        };
+        let ended = runs.iter().filter(|r| r.ended_at.is_some()).count() as u32;
+        if ended < every {
+            return;
+        }
+        let hours = (Utc::now() - since).num_hours().clamp(1, 24 * 30) as u32;
+        match self.start_analysis(p, hours, String::new()).await {
+            Ok(()) => self.send(Response::Info(format!(
+                "Running the team analyst after {ended} runs"
+            ))),
+            Err(e) => tracing::warn!("automatic analysis not started: {e}"),
+        }
+    }
+
     async fn start_refine(
         &self,
         p: Arc<OpenProject>,
@@ -1917,6 +2200,72 @@ async fn push_drift(
     tx.send(Response::Drift {
         project: p.id(),
         entries,
+    })
+    .map_err(|_| "ui gone".to_string())?;
+    ctx.request_repaint();
+    Ok(())
+}
+
+/// The analyst call itself, off the backend loop: digest, definitions, the
+/// model, then the reply checked into an analysis.
+async fn run_analysis(
+    p: &OpenProject,
+    hours: u32,
+    notes: &str,
+    model: Option<String>,
+    runner: &dyn UtilityRunner,
+) -> Result<(Analysis, Option<f64>), String> {
+    let since = Utc::now() - chrono::Duration::hours(hours.max(1) as i64);
+    let digest = analyst::build_digest(p, since)
+        .await
+        .map_err(|e| e.to_string())?;
+    let markdown = analyst::render_digest(&digest);
+    let agents = p.store().agents().await.map_err(|e| e.to_string())?;
+    let mut definitions = Vec::new();
+    let mut handles = Vec::new();
+    for a in agents.iter().filter(|a| !a.is_retired()) {
+        match p.agents.read_definition(&a.handle) {
+            Ok(d) => {
+                handles.push(a.handle.clone());
+                definitions.push(d);
+            }
+            Err(e) => {
+                tracing::warn!(handle = %a.handle, "definition not read for the analyst: {e}")
+            }
+        }
+    }
+    let request = analyst::analyse_request(&markdown, &definitions, notes, model);
+    let out = runner.call(request).await.map_err(|e| e.to_string())?;
+    let analysis =
+        analyst::apply_analysis(&out.text, &handles, &p.policy()).map_err(|e| e.to_string())?;
+    Ok((analysis, out.cost_usd))
+}
+
+/// Every analyst call with its parsed reply, newest first.
+async fn push_analyses(
+    p: &OpenProject,
+    tx: &Sender<Response>,
+    ctx: &egui::Context,
+) -> Result<(), String> {
+    let calls = p
+        .store()
+        .utility_calls_of_kind(UtilityKind::Analyse, 20)
+        .await
+        .map_err(|e| e.to_string())?;
+    let items = calls
+        .into_iter()
+        .map(|call| AnalysisRecord {
+            analysis: call
+                .proposal
+                .as_deref()
+                .and_then(|t| Analysis::from_json(t).ok())
+                .unwrap_or_default(),
+            call,
+        })
+        .collect();
+    tx.send(Response::Analyses {
+        project: p.id(),
+        items,
     })
     .map_err(|_| "ui gone".to_string())?;
     ctx.request_repaint();

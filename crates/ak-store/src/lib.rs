@@ -154,6 +154,12 @@ pub trait Store: Send + Sync {
     ) -> Result<Vec<UtilityCall>>;
     /// Total recorded cost of calls started at or after `since`.
     async fn utility_cost_since(&self, since: Timestamp) -> Result<f64>;
+    /// The newest calls of a kind, any state, newest first.
+    async fn utility_calls_of_kind(
+        &self,
+        kind: UtilityKind,
+        limit: u32,
+    ) -> Result<Vec<UtilityCall>>;
 
     // Guardrails.
     /// Events on a thread, oldest first.

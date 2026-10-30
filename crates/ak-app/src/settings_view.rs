@@ -459,6 +459,21 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                 });
                                 ui.end_row();
 
+                                ui.label("Team analyst");
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .add(
+                                            egui::DragValue::new(&mut policy.analyst_every_runs)
+                                                .range(0..=500),
+                                        )
+                                        .changed()
+                                    {
+                                        editor.project_dirty = true;
+                                    }
+                                    ui.weak("runs between automatic analyses. 0 runs it only from the Analyst view.");
+                                });
+                                ui.end_row();
+
                                 ui.label("Push policy");
                                 egui::ComboBox::from_id_salt("push_policy")
                                     .selected_text(match policy.push_policy {

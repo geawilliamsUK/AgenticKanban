@@ -1,5 +1,6 @@
-//! Utility calls: Refine and Integrate. Each is a tool-less Claude Code call
-//! whose result is a proposed definition the human reviews. The record keeps
+//! Utility calls: Refine, Integrate and Analyse. Each is a tool-less Claude
+//! Code call whose result is a proposal the human reviews: a definition for
+//! the first two, a set of recommendations for the analyst. The record keeps
 //! the proposal, its cost and the decision.
 
 use serde::{Deserialize, Serialize};
@@ -12,6 +13,8 @@ use crate::Timestamp;
 pub enum UtilityKind {
     Refine,
     Integrate,
+    /// The team analyst. Its agent is the system actor.
+    Analyse,
 }
 
 impl UtilityKind {
@@ -19,6 +22,7 @@ impl UtilityKind {
         match self {
             UtilityKind::Refine => "refine",
             UtilityKind::Integrate => "integrate",
+            UtilityKind::Analyse => "analyse",
         }
     }
 
@@ -26,6 +30,7 @@ impl UtilityKind {
         match s {
             "refine" => Some(UtilityKind::Refine),
             "integrate" => Some(UtilityKind::Integrate),
+            "analyse" => Some(UtilityKind::Analyse),
             _ => None,
         }
     }
@@ -78,7 +83,7 @@ pub struct UtilityCall {
     pub ended_at: Option<Timestamp>,
     pub cost_usd: Option<f64>,
     pub state: UtilityState,
-    /// The proposed file, rendered.
+    /// The proposed file, rendered; for Analyse, the analysis as JSON.
     pub proposal: Option<String>,
     pub warnings: Vec<String>,
     pub error: Option<String>,

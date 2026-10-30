@@ -3,6 +3,7 @@
 //! config IO. The scheduler, supervisor and workspace manager follow.
 
 pub mod agents;
+pub mod analyst;
 pub mod authoring;
 pub mod claude;
 pub mod config;

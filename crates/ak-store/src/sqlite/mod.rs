@@ -935,6 +935,21 @@ impl Store for SqliteStore {
         rows.iter().map(utility_call_from_row).collect()
     }
 
+    async fn utility_calls_of_kind(
+        &self,
+        kind: UtilityKind,
+        limit: u32,
+    ) -> Result<Vec<UtilityCall>> {
+        let rows = sqlx::query(
+            "SELECT * FROM utility_calls WHERE kind = ? ORDER BY started_at DESC LIMIT ?",
+        )
+        .bind(kind.as_str())
+        .bind(limit as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.iter().map(utility_call_from_row).collect()
+    }
+
     async fn chats(&self) -> Result<Vec<Chat>> {
         self.chats_impl().await
     }

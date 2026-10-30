@@ -14,10 +14,12 @@ use ak_core::chat::{Thread, ThreadHit};
 use ak_core::config::{GlobalSettings, ProjectEntry, ProjectPolicy, ThemeMode};
 use ak_core::ids::{ActorId, ChatId, ProjectId, RunId, ThreadId, TicketId};
 use ak_core::run::RunEvent;
+use ak_core::utility::UtilityState;
 use ak_core::{Actor, NotificationState};
 use ak_runtime::snapshot::DriftEntry;
 use ak_runtime::{ClaudeCodeRunner, ClaudeProbe, HomePaths, ProjectRegistry, UtilityRunner};
 
+use crate::analyst_view::AnalystState;
 use crate::approvals_view::ApprovalTray;
 use crate::backend::{Backend, Request, Response, RunnerFactory};
 use crate::chats_view::ChatsState;
@@ -40,6 +42,7 @@ pub enum View {
     Chats,
     Overview,
     Team,
+    Analyst,
     Settings,
 }
 
@@ -93,6 +96,7 @@ pub struct App {
     pub import_dialog: Option<ImportDialog>,
 
     pub overview: Vec<ProjectOverview>,
+    pub analyst: AnalystState,
     pub overview_requested: Option<Instant>,
 
     /// Permission profile names and default model from the open project's policy.
@@ -192,6 +196,7 @@ impl App {
             export_dialog: None,
             import_dialog: None,
             overview: Vec::new(),
+            analyst: AnalystState::default(),
             overview_requested: None,
             view: View::Board,
             profiles: Vec::new(),
@@ -296,6 +301,7 @@ impl App {
                 self.live_runs.clear();
                 self.run_events = None;
                 self.approvals.clear();
+                self.analyst.reset();
                 self.chats.clear();
                 self.selected_chat = None;
                 self.threads.clear();
@@ -629,6 +635,39 @@ impl App {
                 }
             }
             Response::Overview(list) => self.overview = list,
+            Response::Digest {
+                project,
+                digest,
+                markdown,
+            } => {
+                if Some(project) == self.current {
+                    self.analyst.digest = Some((digest, markdown));
+                    self.analyst.loading = false;
+                }
+            }
+            Response::AnalysisStarted { project } => {
+                if Some(project) == self.current && self.analyst.running.is_none() {
+                    self.analyst.running = Some(Instant::now());
+                }
+            }
+            Response::Analyses { project, items } => {
+                if Some(project) == self.current {
+                    if !items
+                        .first()
+                        .is_some_and(|r| r.call.state == UtilityState::Running)
+                    {
+                        self.analyst.running = None;
+                    }
+                    self.analyst.analyses = items;
+                }
+            }
+            Response::AnalysisFailed { project, error } => {
+                if Some(project) == self.current {
+                    self.analyst.running = None;
+                    self.analyst.failure = Some(error.clone());
+                }
+                self.toast(format!("Analysis failed: {error}"), true);
+            }
             Response::Drift { project, entries } => {
                 if Some(project) == self.current {
                     self.drift = entries;
@@ -678,6 +717,13 @@ impl App {
                     if view == View::Inbox {
                         if let Some(project) = self.current {
                             self.send(Request::MarkInboxSeen { project });
+                        }
+                    }
+                    if view == View::Analyst {
+                        if let Some(project) = self.current {
+                            for r in self.analyst.load_requests(project) {
+                                self.send(r);
+                            }
                         }
                     }
                 }
@@ -813,6 +859,9 @@ impl App {
             };
             if widgets::nav_item(ui, label, self.view == View::Team).clicked() {
                 self.actions.push(Action::SwitchView(View::Team));
+            }
+            if widgets::nav_item(ui, "Analyst", self.view == View::Analyst).clicked() {
+                self.actions.push(Action::SwitchView(View::Analyst));
             }
         });
 
@@ -1003,6 +1052,7 @@ impl eframe::App for App {
                     View::Inbox => crate::inbox_view::draw(self, ui),
                     View::Chats => crate::chats_view::draw(self, ui),
                     View::Team => crate::team_view::draw(self, ui),
+                    View::Analyst => crate::analyst_view::draw(self, ui),
                     View::Settings | View::Overview => unreachable!(),
                 }
             });

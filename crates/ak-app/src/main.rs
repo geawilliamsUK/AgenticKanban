@@ -2,6 +2,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod analyst_view;
 mod app;
 mod approvals_view;
 mod backend;

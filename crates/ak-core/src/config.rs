@@ -116,6 +116,9 @@ pub struct ProjectPolicy {
     /// The branch ticket branches start from and the integrator merges into.
     /// None means the repository's default branch.
     pub integration_branch: Option<String>,
+    /// Run the team analyst by itself after this many completed runs. Zero
+    /// means only when asked.
+    pub analyst_every_runs: u32,
 }
 
 impl Default for ProjectPolicy {
@@ -136,6 +139,7 @@ impl ProjectPolicy {
             allow_project_mcp: false,
             thread_archive_days: 30,
             integration_branch: None,
+            analyst_every_runs: 0,
             default_model: None,
             authoring_model: None,
             permission_profiles: PermissionProfile::defaults(),

@@ -485,6 +485,7 @@ The UI gives the human the same verbs as agents plus oversight.
 - **Run inspector**: the full transcript of any run, token and cost totals, exit reason.
 - **Projects**: a switcher in the sidebar. Add picks a folder, checks that it is a git repository, registers it in the home config and, if the repository already contains `.agentic/agents/`, opens the import review. Remove unregisters it and leaves the repository untouched, with an option to delete the project's home directory.
 - **Overview**: the cross-project view. The human's inbox from every project in one list, every agent running anywhere, approvals waiting, guardrail trips, and cost today per project.
+- **Analyst**: the team analyst for the open project. A digest of a window (runs and outcomes, approvals, trips, scheduler skips, mentions, cost) as a table and as the text the model reads; Run analysis sends it with every definition to one tool-less call and shows the recommendations (a definition section, a guardrail value, profile allow rules, or a note) with Apply and Dismiss. Nothing is applied by itself; decisions are recorded so the next analysis knows.
 - **Settings**: global (Claude Code binary path, concurrency cap, global daily budget, default authoring model) and per project (columns, guardrail thresholds, push policy, worktree base, project MCP servers).
 
 ## 14. Agent authoring
