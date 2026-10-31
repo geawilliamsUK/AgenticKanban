@@ -5,7 +5,7 @@
 //! stream-json output into run events, enforces the wall clock, kills on
 //! request, and records how it ended.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -22,10 +22,12 @@ use ak_core::agent::{Agent, AgentState};
 use ak_core::config::PermissionProfile;
 use ak_core::ids::{ProjectId, RunId};
 use ak_core::run::{AgentRun, ExitReason, RunEvent, RunEventKind, RunOutcome, RunTrigger};
+use ak_core::usage::{RunUsage, UsageSnapshot, Window, WindowUsage};
 use ak_core::ActorKind;
 use ak_runtime::{HomePaths, OpenProject};
 
 use crate::prompts::{self, PromptContext, RosterLine};
+use crate::usage::UsageTracker;
 use crate::workspace::Workspace;
 use crate::SupervisorError;
 
@@ -95,16 +97,19 @@ pub struct Supervisor {
     paths: HomePaths,
     config: std::sync::RwLock<SupervisorConfig>,
     notices: broadcast::Sender<RunNotice>,
+    usage: Arc<UsageTracker>,
 }
 
 impl Supervisor {
     pub fn new(bridge: Bridge, paths: HomePaths, config: SupervisorConfig) -> Self {
         let (notices, _) = broadcast::channel(1024);
+        let usage = Arc::new(UsageTracker::load(paths.usage_file()));
         Self {
             bridge,
             paths,
             config: std::sync::RwLock::new(config),
             notices,
+            usage,
         }
     }
 
@@ -114,6 +119,11 @@ impl Supervisor {
 
     pub fn bridge(&self) -> &Bridge {
         &self.bridge
+    }
+
+    /// The account's subscription usage, fed by every run.
+    pub fn usage(&self) -> &Arc<UsageTracker> {
+        &self.usage
     }
 
     pub fn config(&self) -> SupervisorConfig {
@@ -247,6 +257,7 @@ impl Supervisor {
         };
         // Nothing goes in on stdin; close it so the process never waits on it.
         drop(child.stdin.take());
+        let usage_baseline = self.usage.begin(run.id, Utc::now());
 
         let _ = self.notices.send(RunNotice::Started {
             project: project_id,
@@ -265,6 +276,8 @@ impl Supervisor {
             token,
             wall_clock: spec.wall_clock,
             startup_timeout: self.config().startup_timeout,
+            usage: self.usage.clone(),
+            usage_baseline,
         };
         let done = tokio::spawn(driver.drive(child, stop_rx));
         Ok(RunHandle {
@@ -338,6 +351,9 @@ struct Driver {
     token: String,
     wall_clock: Duration,
     startup_timeout: Duration,
+    usage: Arc<UsageTracker>,
+    /// The windows when the run started, if the last report was recent.
+    usage_baseline: Option<BTreeMap<Window, WindowUsage>>,
 }
 
 enum Line {
@@ -387,6 +403,8 @@ impl Driver {
         let mut got_init = false;
         let mut result: Option<Value> = None;
         let mut outcome = RunOutcome::default();
+        let mut model: Option<String> = None;
+        let mut first_usage: Option<BTreeMap<Window, WindowUsage>> = None;
         let mut forced_exit: Option<(ExitReason, String)> = None;
         let mut stop_rx = stop_rx;
         let deadline = tokio::time::sleep(self.wall_clock);
@@ -407,9 +425,16 @@ impl Driver {
                     Some(Line::Out(l)) => {
                         raw_stdout.push_str(&l);
                         raw_stdout.push('\n');
+                        if let Some(snapshot) = rate_limit_snapshot(&l) {
+                            first_usage.get_or_insert_with(|| snapshot.windows.clone());
+                            self.usage.observe(snapshot);
+                        }
                         for (kind, payload) in parse_line(&l) {
                             if kind == RunEventKind::SystemInit {
                                 got_init = true;
+                                if let Some(m) = payload.get("model").and_then(|v| v.as_str()) {
+                                    model = Some(m.to_string());
+                                }
                                 if let Some(sid) = payload.get("session_id").and_then(|v| v.as_str()) {
                                     self.run.claude_session_id = Some(sid.to_string());
                                 }
@@ -501,6 +526,17 @@ impl Driver {
             .map(|t| truncate(t.trim(), 1000))
             .filter(|t| !t.is_empty());
         self.run.outcome = Some(outcome);
+        let (after, solo) = self.usage.end(self.run.id);
+        self.run.usage = Some(RunUsage {
+            model,
+            before: self
+                .usage_baseline
+                .take()
+                .or(first_usage)
+                .unwrap_or_default(),
+            after,
+            solo,
+        });
         self.run.ended_at = Some(Utc::now());
         self.run.exit_reason = Some(exit);
         self.run.error = error.clone();
@@ -620,6 +656,18 @@ fn classify(
     }
 }
 
+/// The usage windows a `rate_limit_event` line reports, if it is one.
+pub fn rate_limit_snapshot(line: &str) -> Option<UsageSnapshot> {
+    if !line.contains("\"rate_limit_event\"") {
+        return None;
+    }
+    let v: Value = serde_json::from_str(line.trim()).ok()?;
+    if v.get("type").and_then(|t| t.as_str()) != Some("rate_limit_event") {
+        return None;
+    }
+    UsageSnapshot::from_rate_limit_info(v.get("rate_limit_info")?, Utc::now())
+}
+
 /// Parses one stream-json line into zero or more run events.
 pub fn parse_line(line: &str) -> Vec<(RunEventKind, Value)> {
     let Ok(v) = serde_json::from_str::<Value>(line.trim()) else {
@@ -631,7 +679,8 @@ pub fn parse_line(line: &str) -> Vec<(RunEventKind, Value)> {
             json!({"message": truncate(line, 2000)}),
         )];
     };
-    // Rate-limit notices arrive under their own top-level type; nobody reads them.
+    // Rate-limit notices feed the usage meter (`rate_limit_snapshot`), not the
+    // transcript.
     if v.get("rate_limit_info").is_some() {
         return Vec::new();
     }

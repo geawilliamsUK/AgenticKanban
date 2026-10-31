@@ -6,9 +6,12 @@
 //! a scheduler that wakes agents. Run notices from the supervisor and
 //! approval events from the bridge are forwarded to the UI through an
 //! internal channel, so the loop stays the single owner of the registry.
+//! So are the subscription usage reports, which the loop pairs with rates
+//! learned from every project's runs.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,6 +32,7 @@ use ak_core::ids::{
     ThreadId, TicketId,
 };
 use ak_core::run::{AgentRun, RunEvent};
+use ak_core::usage::{Calibration, UsageSnapshot};
 use ak_core::utility::{UtilityCall, UtilityKind, UtilityState};
 use ak_core::{Actor, ActorKind, Event, NotificationState, Timestamp};
 use ak_runtime::agents::{self, AgentWatcher};
@@ -240,6 +244,8 @@ pub enum Request {
     },
     /// Locates the Claude Code binary and asks it about its login.
     ProbeClaude,
+    /// Reads the subscription's usage windows with `claude -p /usage`.
+    RefreshUsage,
     // Agent control.
     WakeAgent {
         project: ProjectId,
@@ -448,13 +454,21 @@ pub enum Response {
         project: ProjectId,
         paused: bool,
     },
+    /// The subscription's windows as last reported, and the rates that turn
+    /// a run's cost into a share of them.
+    Usage {
+        snapshot: Option<UsageSnapshot>,
+        calibration: Calibration,
+    },
     Error(String),
     Info(String),
 }
 
+#[allow(clippy::large_enum_variant)]
 enum Internal {
     Run(RunNotice),
     Bridge(BridgeEvent),
+    Usage,
 }
 
 struct ProjectWatchers {
@@ -496,6 +510,9 @@ pub struct Backend {
     utility_slots: Arc<Semaphore>,
     internal_tx: UnboundedSender<Internal>,
     internal_rx: UnboundedReceiver<Internal>,
+    calibration: Calibration,
+    /// A `/usage` refresh is in flight.
+    usage_refreshing: Arc<AtomicBool>,
 }
 
 impl Backend {
@@ -528,6 +545,8 @@ impl Backend {
             utility_slots,
             internal_tx,
             internal_rx,
+            calibration: Calibration::default(),
+            usage_refreshing: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -543,9 +562,24 @@ impl Backend {
         }
         self.send(Response::Projects(self.registry.projects().to_vec()));
         self.send_settings();
+        self.recalibrate().await;
         let mut housekeeping = tokio::time::interval(Duration::from_secs(3600));
+        // Fires at once, so the meter is fresh shortly after startup.
+        let mut usage_timer = tokio::time::interval(Duration::from_secs(5 * 60));
         loop {
             tokio::select! {
+                _ = usage_timer.tick() => {
+                    // Runs report usage as they go; refresh only when idle and stale.
+                    let stale = self.supervisor.as_ref().is_some_and(|s| {
+                        s.usage().active() == 0
+                            && s.usage().latest().is_none_or(|u| {
+                                Utc::now() - u.observed_at > chrono::Duration::minutes(15)
+                            })
+                    });
+                    if stale {
+                        self.refresh_usage(true);
+                    }
+                }
                 req = self.rx.recv() => match req {
                     Some(req) => {
                         if let Err(msg) = self.handle(req).await {
@@ -597,6 +631,15 @@ impl Backend {
                             }
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        }
+                    }
+                });
+                let mut usage = supervisor.usage().subscribe();
+                let tx = self.internal_tx.clone();
+                tokio::spawn(async move {
+                    while usage.changed().await.is_ok() {
+                        if tx.send(Internal::Usage).is_err() {
+                            return;
                         }
                     }
                 });
@@ -698,6 +741,7 @@ impl Backend {
                 Ok(run_cost),
                 Ok(utility_cost),
                 Ok(trips),
+                Ok(runs_today),
             ) = (
                 store.agents().await,
                 store.active_runs().await,
@@ -706,10 +750,19 @@ impl Backend {
                 store.run_cost_since(midnight, None).await,
                 store.utility_cost_since(midnight).await,
                 store.guardrail_trips_since(midnight).await,
+                store.runs_since(midnight).await,
             )
             else {
                 continue;
             };
+            let usage_today = self
+                .calibration
+                .estimate_total(runs_today.iter().filter_map(|r| {
+                    Some((
+                        r.usage.as_ref().and_then(|u| u.model.as_deref()),
+                        r.cost_usd?,
+                    ))
+                }));
             let live: Vec<Agent> = agents.into_iter().filter(|a| !a.is_retired()).collect();
             let running = live
                 .iter()
@@ -744,11 +797,86 @@ impl Backend {
                     .filter(|n| n.state == NotificationState::Pending)
                     .count(),
                 cost_today: run_cost + utility_cost,
+                usage_today,
                 paused,
                 trips,
             });
         }
         out
+    }
+
+    /// Learns the share-per-dollar rates from the last 30 days of runs in
+    /// every project, then sends the meter its state.
+    async fn recalibrate(&mut self) {
+        let since = Utc::now() - chrono::Duration::days(30);
+        let mut runs = Vec::new();
+        for entry in self.registry.projects() {
+            if let Some(p) = self.registry.opened(entry.id) {
+                match p.store().runs_since(since).await {
+                    Ok(rs) => runs.extend(rs),
+                    Err(e) => tracing::warn!(project = %entry.id, "could not read runs: {e}"),
+                }
+            }
+        }
+        self.calibration = Calibration::fit(
+            runs.iter()
+                .filter_map(|r| Some((r.usage.as_ref()?, r.cost_usd?))),
+        );
+        self.send_usage();
+    }
+
+    fn send_usage(&self) {
+        self.send(Response::Usage {
+            snapshot: self.supervisor.as_ref().and_then(|s| s.usage().latest()),
+            calibration: self.calibration.clone(),
+        });
+    }
+
+    /// Reads the windows with `claude -p /usage`, which calls no model. The
+    /// result reaches the UI through the tracker. `quiet` keeps a failure of
+    /// the periodic refresh out of the toasts.
+    fn refresh_usage(&self, quiet: bool) {
+        let Some(supervisor) = self.supervisor.clone() else {
+            return;
+        };
+        if self.usage_refreshing.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let binary = claude::locate(self.settings.claude_binary.as_deref());
+        let cwd = self.registry.paths().calls_dir().join("usage");
+        let (tx, ctx, flag) = (
+            self.tx.clone(),
+            self.ctx.clone(),
+            self.usage_refreshing.clone(),
+        );
+        tokio::spawn(async move {
+            let result = match binary {
+                Ok(b) => claude::usage_report(&b, &cwd)
+                    .await
+                    .map_err(|e| e.to_string()),
+                Err(e) => Err(e.to_string()),
+            }
+            .and_then(|text| {
+                UsageSnapshot::from_usage_text(&text, chrono::Local::now().fixed_offset())
+                    .ok_or_else(|| {
+                        let first = text.lines().find(|l| !l.trim().is_empty()).unwrap_or("");
+                        format!("Claude Code's /usage report had no windows in it: {first}")
+                    })
+            });
+            flag.store(false, Ordering::SeqCst);
+            match result {
+                Ok(snapshot) => supervisor.usage().observe(snapshot),
+                Err(e) if quiet => tracing::warn!("usage refresh failed: {e}"),
+                Err(e) => {
+                    if tx
+                        .send(Response::Error(format!("Usage refresh failed: {e}")))
+                        .is_ok()
+                    {
+                        ctx.request_repaint();
+                    }
+                }
+            }
+        });
     }
 
     fn supervisor_config(&self) -> SupervisorConfig {
@@ -813,8 +941,10 @@ impl Backend {
                     let _ = push_inbox(&p, &self.tx, &self.ctx).await;
                 }
                 self.send(Response::RunEnded { project, run });
+                self.recalibrate().await;
                 self.maybe_auto_analyse(project).await;
             }
+            Internal::Usage => self.send_usage(),
             Internal::Bridge(BridgeEvent::ApprovalRequested(a)) => {
                 if let Some(p) = self.project_of_agent(a.agent_id).await {
                     let _ = push_approvals(&p, &self.tx, &self.ctx).await;
@@ -1271,6 +1401,7 @@ impl Backend {
                 let probe = claude::probe(self.settings.claude_binary.as_deref()).await;
                 self.send(Response::ClaudeProbe(probe));
             }
+            Request::RefreshUsage => self.refresh_usage(false),
             Request::WakeAgent { project, handle } => {
                 let p = self.project(project)?;
                 let actor = self.agent_actor(&p, &handle).await?;

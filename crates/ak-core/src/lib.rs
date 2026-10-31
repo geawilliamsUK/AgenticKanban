@@ -21,6 +21,7 @@ pub mod mentions;
 pub mod notification;
 pub mod permissions;
 pub mod run;
+pub mod usage;
 pub mod utility;
 
 pub use actor::{Actor, ActorKind};
@@ -39,6 +40,7 @@ pub use run::{
     AgentRun, ExitReason, RunEvent, RunEventKind, RunOutcome, RunTrigger, SchedulerDecision,
     SkipReason,
 };
+pub use usage::{Calibration, RunUsage, UsageHolds, UsageSnapshot, Window, WindowUsage};
 pub use utility::{UtilityCall, UtilityKind, UtilityState};
 
 /// Re-exports so downstream crates share one version of each.

@@ -6,6 +6,7 @@ use ak_core::event::EventKind;
 use crate::app::{Action, App, View};
 use crate::model::format_time;
 use crate::theme::{self, Tone};
+use crate::usage_view;
 use crate::widgets;
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
@@ -33,6 +34,15 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
         stat(ui, "unread", unread.to_string());
         stat(ui, "guardrail trips today", trips.to_string());
         stat(ui, "cost today", format!("${cost:.2} of ${budget:.0}"));
+        let mut usage = std::collections::BTreeMap::new();
+        for p in &app.overview {
+            for (w, v) in &p.usage_today {
+                *usage.entry(*w).or_insert(0.0) += v;
+            }
+        }
+        if let Some(s) = usage_view::shares(&usage) {
+            stat(ui, "of your subscription today", s);
+        }
     });
     ui.add_space(8.0);
     ui.separator();
@@ -78,7 +88,10 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             widgets::chip(ui, Tone::Red, format!("{} halted", p.halted));
                         }
                         ui.weak(format!("{} unread", p.unread));
-                        ui.weak(format!("${:.2} today", p.cost_today));
+                        let shares = usage_view::shares(&p.usage_today)
+                            .map(|s| format!(" ({s})"))
+                            .unwrap_or_default();
+                        ui.weak(format!("${:.2} today{shares}", p.cost_today));
                     });
                     if p.running.is_empty() {
                         ui.weak("Nothing running.");

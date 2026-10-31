@@ -148,6 +148,8 @@ pub struct ProjectOverview {
     pub approvals: usize,
     pub unread: usize,
     pub cost_today: f64,
+    /// Estimated share of each subscription window today's runs used.
+    pub usage_today: std::collections::BTreeMap<ak_core::usage::Window, f64>,
     pub paused: bool,
     /// Today's guardrail trips, newest first.
     pub trips: Vec<Event>,

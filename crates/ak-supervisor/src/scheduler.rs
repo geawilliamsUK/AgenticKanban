@@ -3,7 +3,8 @@
 //!
 //! Wake notifications and direct activations put an agent on the list. A tick
 //! starts runs for listed agents that are idle, not halted, not cooling down,
-//! not over their wake rate, and within budget, as long as a slot is free.
+//! not over their wake rate, within budget, and clear of the subscription's
+//! usage holds, as long as a slot is free.
 //! When a run ends with the same wake items still pending, the agent cools
 //! down instead of waking again straight away.
 //!
@@ -417,6 +418,21 @@ impl Scheduler {
                 continue;
             }
 
+            // Subscription windows. The timer tick picks the agent up again
+            // once a window resets.
+            let model = agent.model.clone().or_else(|| policy.default_model.clone());
+            if let Some(why) = self
+                .inner
+                .supervisor
+                .usage()
+                .latest()
+                .and_then(|s| settings.usage_holds.hold_reason(&s, model.as_deref(), now))
+            {
+                self.skip(&agent, SkipReason::UsageLimit, format!("{waiting}; {why}"))
+                    .await;
+                continue;
+            }
+
             // A slot.
             let Ok(permit) = self.inner.slots.clone().try_acquire_owned() else {
                 store
@@ -487,7 +503,7 @@ impl Scheduler {
             let budgets = agent.budgets.clone().unwrap_or_default();
             let spec = RunSpec {
                 project: project.clone(),
-                model: agent.model.clone().or_else(|| policy.default_model.clone()),
+                model,
                 agent: agent.clone(),
                 trigger,
                 trigger_lines,

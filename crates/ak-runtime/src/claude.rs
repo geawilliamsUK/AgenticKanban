@@ -96,6 +96,40 @@ pub async fn version(binary: &Path) -> Result<String, RuntimeError> {
         .map(|s| s.trim().to_string())
 }
 
+/// The text of `claude -p /usage`: the subscription's windows, read from the
+/// account without a model call. Runs in `cwd` with hooks and MCP servers off
+/// so nothing of a project loads.
+pub async fn usage_report(binary: &Path, cwd: &Path) -> Result<String, RuntimeError> {
+    std::fs::create_dir_all(cwd).map_err(|e| RuntimeError::io(cwd, e))?;
+    let mut cmd = tokio::process::Command::new(binary);
+    cmd.args([
+        "-p",
+        "/usage",
+        "--no-session-persistence",
+        "--strict-mcp-config",
+        "--settings",
+        r#"{"disableAllHooks": true}"#,
+    ])
+    .current_dir(cwd)
+    .stdin(Stdio::null())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .env("DISABLE_AUTOUPDATER", "1")
+    .kill_on_drop(true);
+    cmd.env_remove("ANTHROPIC_API_KEY");
+    cmd.env_remove("ANTHROPIC_AUTH_TOKEN");
+    #[cfg(windows)]
+    {
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    let output = tokio::time::timeout(Duration::from_secs(45), cmd.output())
+        .await
+        .map_err(|_| RuntimeError::Utility("`claude -p /usage` timed out".into()))?
+        .map_err(|e| RuntimeError::Utility(format!("could not run {}: {e}", binary.display())))?;
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
 /// What the Settings screen shows about Claude Code.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ClaudeProbe {

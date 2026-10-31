@@ -8,6 +8,7 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 
 use crate::ids::{ActorId, NotificationId, RunId};
+use crate::usage::RunUsage;
 use crate::Timestamp;
 
 /// Why a run started.
@@ -87,6 +88,9 @@ pub struct AgentRun {
     /// What the run produced, tallied from its transcript. `None` for runs
     /// recorded before outcomes existed.
     pub outcome: Option<RunOutcome>,
+    /// The account's usage windows either side of the run. `None` for runs
+    /// recorded before usage was tracked.
+    pub usage: Option<RunUsage>,
 }
 
 impl AgentRun {
@@ -111,6 +115,7 @@ impl AgentRun {
             cost_usd: None,
             error: None,
             outcome: None,
+            usage: None,
         }
     }
 
@@ -207,6 +212,8 @@ pub enum SkipReason {
     WakeStorm,
     DailyBudget,
     AgentBudget,
+    /// A subscription window is past its hold threshold, or exhausted.
+    UsageLimit,
     NoSlot,
     WorkspaceFailed,
     StartFailed,
@@ -220,6 +227,7 @@ impl SkipReason {
             SkipReason::WakeStorm => "wake_storm",
             SkipReason::DailyBudget => "daily_budget",
             SkipReason::AgentBudget => "agent_budget",
+            SkipReason::UsageLimit => "usage_limit",
             SkipReason::NoSlot => "no_slot",
             SkipReason::WorkspaceFailed => "workspace_failed",
             SkipReason::StartFailed => "start_failed",
@@ -233,6 +241,7 @@ impl SkipReason {
             "wake_storm" => Some(SkipReason::WakeStorm),
             "daily_budget" => Some(SkipReason::DailyBudget),
             "agent_budget" => Some(SkipReason::AgentBudget),
+            "usage_limit" => Some(SkipReason::UsageLimit),
             "no_slot" => Some(SkipReason::NoSlot),
             "workspace_failed" => Some(SkipReason::WorkspaceFailed),
             "start_failed" => Some(SkipReason::StartFailed),
@@ -247,6 +256,7 @@ impl SkipReason {
             SkipReason::WakeStorm => "wake rate exceeded",
             SkipReason::DailyBudget => "daily budget reached",
             SkipReason::AgentBudget => "agent's daily budget reached",
+            SkipReason::UsageLimit => "subscription usage limit",
             SkipReason::NoSlot => "no free run slot",
             SkipReason::WorkspaceFailed => "worktree could not be prepared",
             SkipReason::StartFailed => "process could not start",
@@ -442,6 +452,7 @@ mod tests {
             SkipReason::WakeStorm,
             SkipReason::DailyBudget,
             SkipReason::AgentBudget,
+            SkipReason::UsageLimit,
             SkipReason::NoSlot,
             SkipReason::WorkspaceFailed,
             SkipReason::StartFailed,

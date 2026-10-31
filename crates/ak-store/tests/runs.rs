@@ -9,6 +9,7 @@ use ak_core::run::{
     AgentRun, ExitReason, RunEvent, RunEventKind, RunOutcome, RunTrigger, SchedulerDecision,
     SkipReason,
 };
+use ak_core::usage::{RunUsage, Window, WindowUsage};
 use ak_store::{HumanIdentity, SqliteStore, Store};
 use chrono::{Duration, Utc};
 use serde_json::json;
@@ -80,9 +81,24 @@ async fn run_lifecycle_and_transcript() {
     run.input_tokens = 1000;
     run.output_tokens = 200;
     run.cost_usd = Some(0.5);
+    let window = |used| WindowUsage {
+        used,
+        resets_at: Some(Utc::now() + Duration::hours(3)),
+    };
+    run.usage = Some(RunUsage {
+        model: Some("claude-sonnet-5-5".into()),
+        before: [(Window::FiveHour, window(0.10))].into(),
+        after: [
+            (Window::FiveHour, window(0.12)),
+            (Window::Week, window(0.5)),
+        ]
+        .into(),
+        solo: true,
+    });
     store.update_run(&run).await.unwrap();
 
     let loaded = store.run(run.id).await.unwrap();
+    assert_eq!(loaded.usage, run.usage);
     assert_eq!(loaded.id, run.id);
     assert_eq!(loaded.exit_reason, run.exit_reason);
     assert_eq!(loaded.num_turns, run.num_turns);

@@ -13,6 +13,7 @@ use ak_core::agent::{AgentDefinition, AgentState};
 use ak_core::commands::NewTicket;
 use ak_core::config::{GlobalSettings, PermissionProfile};
 use ak_core::run::{ExitReason, RunEventKind, RunTrigger, SkipReason};
+use ak_core::usage::{UsageSnapshot, Window};
 use ak_core::NotificationKind;
 use ak_runtime::{HomePaths, OpenProject, ProjectRegistry};
 use ak_supervisor::supervisor::{RunNotice, StopReason};
@@ -164,6 +165,23 @@ async fn a_run_completes_and_is_recorded() {
     assert_eq!(outcome.board_tool_calls(), 1);
     assert_eq!(outcome.tool_errors, 0);
     assert!(outcome.result.is_some(), "the final text is kept");
+    // The rate-limit event fed the tracker and the run's usage record.
+    let usage = stored.usage.expect("usage is recorded");
+    assert_eq!(usage.model.as_deref(), Some("fake-model"));
+    assert!(usage.solo, "nothing else was running");
+    assert_eq!(usage.after[&Window::FiveHour].used, 0.25);
+    assert_eq!(
+        usage.before[&Window::FiveHour].used,
+        0.25,
+        "first report as baseline"
+    );
+    let latest = f
+        .supervisor
+        .usage()
+        .latest()
+        .expect("the tracker has a report");
+    assert_eq!(latest.used(Window::Week, Utc::now()), Some(0.5));
+    assert!(f.paths.usage_file().exists(), "the report is saved");
     let events = store.run_events(run.id).await.unwrap();
     let kinds: Vec<RunEventKind> = events.iter().map(|e| e.kind).collect();
     assert!(kinds.contains(&RunEventKind::SystemInit));
@@ -417,6 +435,72 @@ async fn scheduler_wakes_on_assignment_and_cools_down_on_no_progress() {
         store.agent(f.agent.actor_id).await.unwrap().state,
         AgentState::Idle
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scheduler_holds_runs_past_a_usage_threshold() {
+    let f = fixture().await;
+    let store = f.project.store();
+    let scheduler = Scheduler::spawn(
+        f.project.clone(),
+        f.supervisor.clone(),
+        Arc::new(Semaphore::new(2)),
+        GlobalSettings::default(),
+    );
+    scheduler.set_paused(true);
+    // The 5-hour window at 93%, past the default 90% hold.
+    f.supervisor.usage().observe(
+        UsageSnapshot::from_rate_limit_info(
+            &serde_json::json!({"status": "allowed", "unifiedWindows": {
+                "five_hour": {"utilization": 0.93, "resetsAt": 1893456000}}}),
+            Utc::now(),
+        )
+        .unwrap(),
+    );
+    let columns = store.columns().await.unwrap();
+    store
+        .create_ticket(
+            NewTicket {
+                title: "Do it".into(),
+                column_id: columns[1].id,
+                assignee_id: Some(f.agent.actor_id),
+                ..Default::default()
+            },
+            f.project.human.id,
+        )
+        .await
+        .unwrap();
+    scheduler.set_paused(false);
+    scheduler.tick().await.unwrap();
+    assert!(store.active_runs().await.unwrap().is_empty(), "held");
+    let decisions = store
+        .scheduler_decisions_since(Utc::now() - chrono::Duration::hours(1))
+        .await
+        .unwrap();
+    let held = decisions
+        .iter()
+        .find(|d| d.reason == SkipReason::UsageLimit)
+        .expect("the hold is recorded");
+    assert!(
+        held.detail.contains("5-hour window is at 93%"),
+        "{}",
+        held.detail
+    );
+
+    // Turning the hold off lets the run start.
+    let mut settings = GlobalSettings::default();
+    settings.usage_holds.five_hour_pct = 0;
+    scheduler.update_settings(settings);
+    scheduler.tick().await.unwrap();
+    assert_eq!(
+        store
+            .runs_for_agent(f.agent.actor_id, 10)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    scheduler.stop_all();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

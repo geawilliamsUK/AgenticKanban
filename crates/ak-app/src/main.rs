@@ -20,6 +20,7 @@ mod snapshot_view;
 mod team_view;
 mod theme;
 mod ticket_view;
+mod usage_view;
 mod widgets;
 
 fn main() -> eframe::Result<()> {

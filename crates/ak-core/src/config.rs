@@ -12,6 +12,7 @@ use uuid::Uuid;
 
 use crate::board::ColumnKind;
 use crate::ids::ProjectId;
+use crate::usage::UsageHolds;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 #[serde(default)]
@@ -61,6 +62,8 @@ pub struct GlobalSettings {
     /// Days to keep per-run directories.
     pub run_retention_days: u32,
     pub theme: ThemeMode,
+    /// Subscription windows past which no new runs start.
+    pub usage_holds: UsageHolds,
 }
 
 impl Default for GlobalSettings {
@@ -75,6 +78,7 @@ impl Default for GlobalSettings {
             authoring_model: None,
             run_retention_days: 30,
             theme: ThemeMode::System,
+            usage_holds: UsageHolds::default(),
         }
     }
 }

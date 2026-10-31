@@ -85,6 +85,11 @@ impl HomePaths {
     pub fn calls_dir(&self) -> PathBuf {
         self.root.join("calls")
     }
+
+    /// The account's subscription usage windows as last reported.
+    pub fn usage_file(&self) -> PathBuf {
+        self.root.join("usage.json")
+    }
 }
 
 /// The directory a repository snapshot lives in, relative to the repo root.

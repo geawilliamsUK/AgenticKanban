@@ -12,6 +12,7 @@ use crate::app::{Action, App};
 use crate::backend::{PendingProposal, Request};
 use crate::model::{describe_event, format_time, kind_label, InboxItem};
 use crate::theme::{self, Tone};
+use crate::usage_view;
 use crate::widgets;
 
 #[allow(clippy::large_enum_variant)]
@@ -496,6 +497,7 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
         .as_ref()
         .and_then(|a| app.live_runs.get(&a.actor_id).cloned());
     let run_events = app.run_events.clone();
+    let calibration = app.calibration.clone();
     let selected_handle = app
         .team
         .as_ref()
@@ -530,7 +532,22 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
             widgets::chip(ui, state_tone(a.state), a.state.label());
         }
         if editor.cost_today > 0.0 {
-            ui.weak(format!("${:.2} today", editor.cost_today));
+            let midnight = chrono::Utc::now()
+                .date_naive()
+                .and_hms_opt(0, 0, 0)
+                .map(|t| t.and_utc());
+            let today = editor
+                .runs
+                .iter()
+                .filter(|r| midnight.is_some_and(|m| r.started_at >= m));
+            let shares = usage_view::run_shares(&calibration, today)
+                .map(|s| format!(" ({s})"))
+                .unwrap_or_default();
+            ui.weak(format!("${:.2} today{shares}", editor.cost_today))
+                .on_hover_text(
+                    "API-equivalent cost, and the estimated share of your subscription's \
+                     windows, from the agent's recent runs.",
+                );
         }
         if editor.dirty {
             widgets::chip(ui, Tone::Orange, "unsaved");
@@ -661,7 +678,7 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
     egui::ScrollArea::vertical()
         .id_salt("agent_editor_scroll")
         .show(ui, |ui| {
-            draw_runs(ui, editor, &live, &run_events, actions, project);
+            draw_runs(ui, editor, &live, &run_events, &calibration, actions, project);
             draw_refine_panel(ui, editor, actions, project, &runner_description);
             draw_integrate_panel(ui, editor, actions, project, &runner_description);
 
@@ -877,9 +894,20 @@ fn draw_runs(
     editor: &AgentEditor,
     live: &Option<crate::model::LiveRun>,
     run_events: &Option<(ak_core::ids::RunId, Vec<ak_core::run::RunEvent>)>,
+    calibration: &ak_core::usage::Calibration,
     actions: &mut Vec<Action>,
     project: ak_core::ids::ProjectId,
 ) {
+    let cost_line = |r: &ak_core::run::AgentRun| {
+        r.cost_usd
+            .map(|c| {
+                let shares = usage_view::run_shares(calibration, [r])
+                    .map(|s| format!(" {s}"))
+                    .unwrap_or_default();
+                format!(", ${c:.3}{shares}")
+            })
+            .unwrap_or_default()
+    };
     if let Some(live) = live {
         let running = live.run.is_active();
         let title = if running {
@@ -891,10 +919,7 @@ fn draw_runs(
             format!(
                 "Last run: {}{}",
                 live.run.exit_reason.map(|r| r.label()).unwrap_or("unknown"),
-                live.run
-                    .cost_usd
-                    .map(|c| format!(", ${c:.3}"))
-                    .unwrap_or_default()
+                cost_line(&live.run)
             )
         };
         egui::CollapsingHeader::new(title)
@@ -958,11 +983,7 @@ fn draw_runs(
                         ui.weak(format_time(&r.started_at));
                         let label = r.exit_reason.map(|x| x.label()).unwrap_or("running");
                         ui.label(label);
-                        ui.weak(format!(
-                            "{} turns{}",
-                            r.num_turns,
-                            r.cost_usd.map(|c| format!(", ${c:.3}")).unwrap_or_default()
-                        ));
+                        ui.weak(format!("{} turns{}", r.num_turns, cost_line(r)));
                         if let Some(err) = &r.error {
                             ui.colored_label(
                                 theme::tone(ui.style(), Tone::Red),

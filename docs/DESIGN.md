@@ -313,6 +313,18 @@ Each stdout line is one JSON message. The supervisor maps them to RunEvents:
 | `assistant` | text and tool-use blocks: live activity, loop detection |
 | `user` | tool results |
 | `result` | `num_turns`, `modelUsage` (cost and tokens; `usage` alone omits subagents), `permission_denials`, `subtype` |
+| `rate_limit_event` | not transcript: `rate_limit_info.unifiedWindows` feeds the subscription usage meter (section 8, Subscription usage) |
+
+### Subscription usage
+
+Checked against Claude Code 2.1.302 and 2.1.314 on 2026-10-30 with a claude.ai subscription login; none of this is in the documentation, so the parsers accept the shapes seen and ignore the rest.
+
+- Every headless run prints a `rate_limit_event` near its start (before or after `init`, by version) and again when the figures move. `rate_limit_info.unifiedWindows` holds `five_hour`, `seven_day` and, on Fable runs, `seven_day_overage_included`, each with `utilization` (a 0–1 fraction) and `resetsAt` (epoch seconds). `seven_day_overage_included` matched `/usage`'s "Current week (Fable)" figure, so it is read as the Fable week. `status: "rejected"` means a limit is reached until `resetsAt`.
+- `claude -p /usage` prints the same windows as text ("Current session: 5% used · resets Oct 31, 12:59am (Europe/London)") without a model call, in about three seconds. The app runs it at startup and every fifteen minutes while no run is in progress and the last report is older than that, and on Refresh. Reset times are local, without a year.
+- The status line command does not run in print mode, so its `rate_limits` input is not available.
+- The supervisor's `UsageTracker` merges every report into one snapshot for the account, saved to `~/.agentic-kanban/usage.json`. Each run records its model, the windows before (the tracker's snapshot if under ten minutes old, else the run's first report) and after, and whether any other run overlapped it.
+- The windows belong to the login, not to a run, so a run's share is estimated: across runs that ran alone, the observed rise in each window is divided by their API-equivalent cost, per model family with an overall fallback, and every run's cost is converted with that rate. A rate is used once it rests on three points of rise or five dollars of cost. The human's own use of Claude during a solo run inflates the rate; that is accepted.
+- Global settings hold new runs once a window passes a threshold (defaults: 5-hour 90%, week 95%, Fable week 95% for Fable runs; 0 turns one off) and while a limit is reported reached. The skip is recorded with reason `usage_limit`; the scheduler's timer resumes the agent after the reset.
 
 `result.subtype` maps to the run's exit reason:
 

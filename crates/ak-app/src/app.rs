@@ -14,6 +14,7 @@ use ak_core::chat::{Thread, ThreadHit};
 use ak_core::config::{GlobalSettings, ProjectEntry, ProjectPolicy, ThemeMode};
 use ak_core::ids::{ActorId, ChatId, ProjectId, RunId, ThreadId, TicketId};
 use ak_core::run::RunEvent;
+use ak_core::usage::{Calibration, UsageSnapshot};
 use ak_core::utility::UtilityState;
 use ak_core::{Actor, NotificationState};
 use ak_runtime::snapshot::DriftEntry;
@@ -33,6 +34,7 @@ use crate::snapshot_view::{ExportDialog, ImportDialog};
 use crate::team_view::{AgentEditor, ProposalView, RefineStatus};
 use crate::theme::{self, Backdrop, Tone};
 use crate::ticket_view::TicketPanelState;
+use crate::usage_view;
 use crate::widgets;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -121,6 +123,12 @@ pub struct App {
     /// The bottom panel that shows `approvals` on every view.
     pub tray: ApprovalTray,
     pub scheduler_paused: bool,
+
+    /// The subscription's windows as last reported, for the sidebar meter.
+    pub usage: Option<UsageSnapshot>,
+    /// Turns a run's cost into an estimated share of each window.
+    pub calibration: Calibration,
+    pub usage_refresh_requested: Option<Instant>,
 
     pub new_ticket: Option<NewTicketDialog>,
     pub add_project: Option<AddProjectDialog>,
@@ -214,6 +222,9 @@ impl App {
             approvals: Vec::new(),
             tray: ApprovalTray::default(),
             scheduler_paused: true,
+            usage: None,
+            calibration: Calibration::default(),
+            usage_refresh_requested: None,
             new_ticket: None,
             add_project: None,
             remove_confirm: None,
@@ -376,6 +387,16 @@ impl App {
                 if Some(project) == self.current {
                     self.scheduler_paused = paused;
                 }
+            }
+            Response::Usage {
+                snapshot,
+                calibration,
+            } => {
+                if snapshot != self.usage {
+                    self.usage_refresh_requested = None;
+                }
+                self.usage = snapshot;
+                self.calibration = calibration;
             }
             Response::ProjectPolicy { project, policy } => {
                 if Some(project) == self.current {
@@ -864,6 +885,9 @@ impl App {
                 self.actions.push(Action::SwitchView(View::Analyst));
             }
         });
+
+        ui.add_space(14.0);
+        usage_view::sidebar(self, ui);
 
         ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
             ui.add_space(6.0);

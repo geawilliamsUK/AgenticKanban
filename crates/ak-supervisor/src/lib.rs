@@ -9,6 +9,7 @@ pub mod guardrails;
 pub mod prompts;
 pub mod scheduler;
 pub mod supervisor;
+pub mod usage;
 pub mod workspace;
 
 use std::path::PathBuf;
@@ -16,6 +17,7 @@ use std::path::PathBuf;
 pub use guardrails::GuardrailMonitor;
 pub use scheduler::Scheduler;
 pub use supervisor::{RunHandle, RunNotice, RunSpec, StopReason, Supervisor, SupervisorConfig};
+pub use usage::UsageTracker;
 pub use workspace::Workspace;
 
 #[derive(Debug, thiserror::Error)]

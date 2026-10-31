@@ -1231,7 +1231,7 @@ impl Store for SqliteStore {
         sqlx::query(
             "INSERT INTO runs (id, agent_actor_id, trigger, claude_session_id, workspace_path, \
              started_at, ended_at, exit_reason, num_turns, input_tokens, output_tokens, cost_usd, \
-             error, outcome) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             error, outcome, usage) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(run.id.to_string())
         .bind(run.agent_id.to_string())
@@ -1247,6 +1247,7 @@ impl Store for SqliteStore {
         .bind(run.cost_usd)
         .bind(&run.error)
         .bind(outcome_json(run)?)
+        .bind(usage_json(run)?)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -1255,7 +1256,8 @@ impl Store for SqliteStore {
     async fn update_run(&self, run: &AgentRun) -> Result<()> {
         let result = sqlx::query(
             "UPDATE runs SET claude_session_id = ?, ended_at = ?, exit_reason = ?, num_turns = ?, \
-             input_tokens = ?, output_tokens = ?, cost_usd = ?, error = ?, outcome = ? WHERE id = ?",
+             input_tokens = ?, output_tokens = ?, cost_usd = ?, error = ?, outcome = ?, usage = ? \
+             WHERE id = ?",
         )
         .bind(&run.claude_session_id)
         .bind(run.ended_at.as_ref().map(fmt_ts))
@@ -1266,6 +1268,7 @@ impl Store for SqliteStore {
         .bind(run.cost_usd)
         .bind(&run.error)
         .bind(outcome_json(run)?)
+        .bind(usage_json(run)?)
         .bind(run.id.to_string())
         .execute(&self.pool)
         .await?;
@@ -1426,5 +1429,13 @@ fn outcome_json(run: &AgentRun) -> Result<Option<String>> {
     run.outcome
         .as_ref()
         .map(|o| serde_json::to_string(o).map_err(StoreError::from))
+        .transpose()
+}
+
+/// The usage column: JSON, or NULL before the supervisor has a baseline.
+fn usage_json(run: &AgentRun) -> Result<Option<String>> {
+    run.usage
+        .as_ref()
+        .map(|u| serde_json::to_string(u).map_err(StoreError::from))
         .transpose()
 }

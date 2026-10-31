@@ -37,6 +37,27 @@ fn main() {
         return;
     }
 
+    // Claude Code 2.1.314 reports the subscription's windows before init.
+    // `fake_claude_usage.txt` sets the 5-hour utilization.
+    let five_hour: f64 = std::fs::read_to_string(cwd.join("fake_claude_usage.txt"))
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+        .unwrap_or(0.25);
+    println!(
+        "{}",
+        serde_json::json!({
+            "type": "rate_limit_event", "session_id": session_id,
+            "rate_limit_info": {
+                "status": "allowed", "resetsAt": 1893456000, "rateLimitType": "five_hour",
+                "utilization": five_hour,
+                "unifiedWindows": {
+                    "five_hour": {"utilization": five_hour, "resetsAt": 1893456000},
+                    "seven_day": {"utilization": 0.5, "resetsAt": 1893800000}
+                }
+            }
+        })
+    );
+
     println!(
         "{}",
         serde_json::json!({

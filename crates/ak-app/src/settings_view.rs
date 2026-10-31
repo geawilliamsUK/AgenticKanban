@@ -329,6 +329,26 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         }
                         ui.end_row();
 
+                        let holds = &mut editor.global.usage_holds;
+                        for (label, value) in [
+                            ("Hold runs at 5-hour usage", &mut holds.five_hour_pct),
+                            ("Hold runs at weekly usage", &mut holds.week_pct),
+                            ("Hold Fable runs at Fable weekly usage", &mut holds.fable_week_pct),
+                        ] {
+                            ui.label(label);
+                            if ui
+                                .add(egui::DragValue::new(value).range(0..=100).suffix("%"))
+                                .on_hover_text(
+                                    "No new agent runs start once the window passes this; \
+                                     runs in progress finish. 0 turns the hold off.",
+                                )
+                                .changed()
+                            {
+                                editor.global_dirty = true;
+                            }
+                            ui.end_row();
+                        }
+
                         ui.label("Keep run files (days)");
                         if ui
                             .add(egui::DragValue::new(&mut editor.global.run_retention_days).range(1..=365))

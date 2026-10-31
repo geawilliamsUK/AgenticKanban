@@ -208,6 +208,7 @@ pub fn run_from_row(row: &SqliteRow) -> Result<AgentRun, StoreError> {
     let input_tokens: i64 = row.try_get("input_tokens")?;
     let output_tokens: i64 = row.try_get("output_tokens")?;
     let outcome: Option<String> = row.try_get("outcome")?;
+    let usage: Option<String> = row.try_get("usage")?;
     Ok(AgentRun {
         id: parse_id(&row.try_get::<String, _>("id")?, "run")?,
         agent_id: parse_id(&row.try_get::<String, _>("agent_actor_id")?, "actor")?,
@@ -229,6 +230,7 @@ pub fn run_from_row(row: &SqliteRow) -> Result<AgentRun, StoreError> {
         cost_usd: row.try_get("cost_usd")?,
         error: row.try_get("error")?,
         outcome: outcome.as_deref().map(serde_json::from_str).transpose()?,
+        usage: usage.as_deref().map(serde_json::from_str).transpose()?,
     })
 }
 
