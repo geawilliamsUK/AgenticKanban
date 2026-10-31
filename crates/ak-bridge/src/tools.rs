@@ -599,11 +599,14 @@ async fn run(ctx: &RunContext, name: &str, args: Value) -> Result<String, ToolEr
             Ok(format!("replied on {} (comment id {})", t.key, c.id))
         }
         "memory_read" => {
-            let text = ctx
-                .project
-                .agents
-                .read_memory(&ctx.agent.handle)
-                .map_err(|e| e.to_string())?;
+            let text = match &ctx.desk_memory {
+                Some(path) => std::fs::read_to_string(path).unwrap_or_default(),
+                None => ctx
+                    .project
+                    .agents
+                    .read_memory(&ctx.agent.handle)
+                    .map_err(|e| e.to_string())?,
+            };
             if text.trim().is_empty() {
                 Ok("(your memory is empty)".into())
             } else {
@@ -612,10 +615,19 @@ async fn run(ctx: &RunContext, name: &str, args: Value) -> Result<String, ToolEr
         }
         "memory_update" => {
             let input: MemoryUpdateInput = parse_args(args)?;
-            ctx.project
-                .agents
-                .write_memory(&ctx.agent.handle, &input.content)
-                .map_err(|e| e.to_string())?;
+            match &ctx.desk_memory {
+                Some(path) => {
+                    if let Some(dir) = path.parent() {
+                        std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+                    }
+                    std::fs::write(path, &input.content).map_err(|e| e.to_string())?;
+                }
+                None => ctx
+                    .project
+                    .agents
+                    .write_memory(&ctx.agent.handle, &input.content)
+                    .map_err(|e| e.to_string())?,
+            }
             Ok(format!(
                 "memory saved ({} characters)",
                 input.content.chars().count()

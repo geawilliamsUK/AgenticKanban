@@ -126,6 +126,10 @@ impl Supervisor {
         &self.usage
     }
 
+    pub fn paths(&self) -> &HomePaths {
+        &self.paths
+    }
+
     pub fn config(&self) -> SupervisorConfig {
         self.config.read().expect("config").clone()
     }
@@ -169,6 +173,7 @@ impl Supervisor {
             agent: spec.agent.clone(),
             run_id: run.id,
             profile: spec.profile.clone(),
+            desk_memory: None,
         });
         let mcp_file = run_dir.join("mcp.json");
         std::fs::write(&mcp_file, self.bridge.mcp_config(&token).to_string())
@@ -292,40 +297,7 @@ impl Supervisor {
         let store = project.store();
         let definition = project.agents.read_definition(&spec.agent.handle)?;
         let memory = project.agents.read_memory(&spec.agent.handle)?;
-        let actors = store.actors().await?;
-        let agents = store.agents().await?;
-        let mut roster = Vec::new();
-        for a in actors {
-            match a.kind {
-                ActorKind::System => continue,
-                ActorKind::Human => roster.push(RosterLine {
-                    handle: a.handle,
-                    kind: "human",
-                    description:
-                        "the person running this board; can see everything and may answer you"
-                            .into(),
-                    state: String::new(),
-                }),
-                ActorKind::Agent => {
-                    if let Some(g) = agents.iter().find(|g| g.actor_id == a.id) {
-                        if g.is_retired() {
-                            continue;
-                        }
-                        let state = if a.id == spec.agent.actor_id {
-                            "you".to_string()
-                        } else {
-                            g.state.label().to_lowercase()
-                        };
-                        roster.push(RosterLine {
-                            handle: a.handle,
-                            kind: "agent",
-                            description: g.description.clone(),
-                            state,
-                        });
-                    }
-                }
-            }
-        }
+        let roster = roster(store.as_ref(), spec.agent.actor_id).await?;
         let columns = store.columns().await?;
         let policy = project.policy();
         Ok(prompts::system_prompt(&PromptContext {
@@ -339,6 +311,51 @@ impl Supervisor {
             integration_branch: policy.integration_branch.as_deref(),
         }))
     }
+}
+
+/// The live team for a prompt: the human and every current agent, with
+/// `me` marked as "you".
+pub(crate) async fn roster(
+    store: &dyn ak_store::Store,
+    me: ak_core::ids::ActorId,
+) -> Result<Vec<RosterLine>, SupervisorError> {
+    let actors = store.actors().await?;
+    let agents = store.agents().await?;
+    let mut roster = Vec::new();
+    for a in actors {
+        match a.kind {
+            ActorKind::System => continue,
+            ActorKind::Human => roster.push(RosterLine {
+                handle: a.handle,
+                kind: "human",
+                description: if a.id == me {
+                    "you: the person running this board".into()
+                } else {
+                    "the person running this board; can see everything and may answer you".into()
+                },
+                state: String::new(),
+            }),
+            ActorKind::Agent => {
+                if let Some(g) = agents.iter().find(|g| g.actor_id == a.id) {
+                    if g.is_retired() {
+                        continue;
+                    }
+                    let state = if a.id == me {
+                        "you".to_string()
+                    } else {
+                        g.state.label().to_lowercase()
+                    };
+                    roster.push(RosterLine {
+                        handle: a.handle,
+                        kind: "agent",
+                        description: g.description.clone(),
+                        state,
+                    });
+                }
+            }
+        }
+    }
+    Ok(roster)
 }
 
 struct Driver {

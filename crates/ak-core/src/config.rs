@@ -123,6 +123,9 @@ pub struct ProjectPolicy {
     /// Run the team analyst by itself after this many completed runs. Zero
     /// means only when asked.
     pub analyst_every_runs: u32,
+    /// The permission profile the Desk runs under. It works in the human's
+    /// own checkout, so the default asks before anything but reading.
+    pub desk_permission_profile: String,
 }
 
 impl Default for ProjectPolicy {
@@ -144,6 +147,7 @@ impl ProjectPolicy {
             thread_archive_days: 30,
             integration_branch: None,
             analyst_every_runs: 0,
+            desk_permission_profile: PermissionProfile::SUPERVISED.into(),
             default_model: None,
             authoring_model: None,
             permission_profiles: PermissionProfile::defaults(),

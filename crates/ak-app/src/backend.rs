@@ -27,9 +27,10 @@ use ak_core::approval::Approval;
 use ak_core::chat::{Thread, ThreadHit};
 use ak_core::commands::{NewTicket, TicketPatch};
 use ak_core::config::{GlobalSettings, ProjectEntry, ProjectPolicy};
+use ak_core::desk::{DeskEntry, DeskSession};
 use ak_core::ids::{
-    ActorId, ApprovalId, CallId, ChatId, ColumnId, CommentId, NotificationId, ProjectId, RunId,
-    ThreadId, TicketId,
+    ActorId, ApprovalId, CallId, ChatId, ColumnId, CommentId, DeskSessionId, NotificationId,
+    ProjectId, RunId, ThreadId, TicketId,
 };
 use ak_core::run::{AgentRun, RunEvent};
 use ak_core::usage::{Calibration, UsageSnapshot};
@@ -44,7 +45,10 @@ use ak_runtime::snapshot::{
 };
 use ak_runtime::{HomePaths, OpenProject, ProjectRegistry, RuntimeError, UtilityRunner};
 use ak_store::Store;
-use ak_supervisor::{GuardrailMonitor, RunNotice, Scheduler, Supervisor, SupervisorConfig};
+use ak_supervisor::{
+    DeskHost, DeskNotice, DeskStatus, GuardrailMonitor, RunNotice, Scheduler, Supervisor,
+    SupervisorConfig,
+};
 
 use crate::model::{
     BoardModel, ChatSummary, InboxItem, ProjectOverview, ThreadDetail, TicketDetail,
@@ -246,6 +250,37 @@ pub enum Request {
     ProbeClaude,
     /// Reads the subscription's usage windows with `claude -p /usage`.
     RefreshUsage,
+    /// The project's Desk sessions.
+    LoadDesk {
+        project: ProjectId,
+    },
+    /// Starts a Desk session and opens it.
+    NewDeskSession {
+        project: ProjectId,
+        model: Option<String>,
+    },
+    /// A session's transcript and the state of its process.
+    OpenDeskSession {
+        project: ProjectId,
+        session: DeskSessionId,
+    },
+    SendToDesk {
+        project: ProjectId,
+        session: DeskSessionId,
+        text: String,
+    },
+    InterruptDesk {
+        session: DeskSessionId,
+    },
+    /// Changes the title, model or archived flag. A model change restarts
+    /// the session's process on the next message.
+    UpdateDeskSession {
+        project: ProjectId,
+        session: DeskSessionId,
+        title: Option<String>,
+        model: Option<Option<String>>,
+        archived: Option<bool>,
+    },
     // Agent control.
     WakeAgent {
         project: ProjectId,
@@ -460,6 +495,18 @@ pub enum Response {
         snapshot: Option<UsageSnapshot>,
         calibration: Calibration,
     },
+    DeskSessions {
+        project: ProjectId,
+        sessions: Vec<DeskSession>,
+    },
+    /// A session was opened or created: its transcript and its process.
+    DeskOpened {
+        project: ProjectId,
+        session: DeskSessionId,
+        entries: Vec<DeskEntry>,
+        status: DeskStatus,
+    },
+    Desk(DeskNotice),
     Error(String),
     Info(String),
 }
@@ -469,6 +516,7 @@ enum Internal {
     Run(RunNotice),
     Bridge(BridgeEvent),
     Usage,
+    Desk(DeskNotice),
 }
 
 struct ProjectWatchers {
@@ -506,6 +554,7 @@ pub struct Backend {
     watchers: HashMap<ProjectId, ProjectWatchers>,
     bridge: Option<Bridge>,
     supervisor: Option<Arc<Supervisor>>,
+    desk: Option<Arc<DeskHost>>,
     slots: Arc<Semaphore>,
     utility_slots: Arc<Semaphore>,
     internal_tx: UnboundedSender<Internal>,
@@ -541,6 +590,7 @@ impl Backend {
             watchers: HashMap::new(),
             bridge: None,
             supervisor: None,
+            desk: None,
             slots,
             utility_slots,
             internal_tx,
@@ -604,6 +654,9 @@ impl Backend {
                 }
             }
         }
+        if let Some(desk) = &self.desk {
+            desk.close_all();
+        }
         for (_, w) in self.watchers.drain() {
             w.stop();
         }
@@ -658,8 +711,25 @@ impl Backend {
                         }
                     }
                 });
+                let desk = DeskHost::new(supervisor.clone());
+                let mut notices = desk.subscribe();
+                let tx = self.internal_tx.clone();
+                tokio::spawn(async move {
+                    loop {
+                        match notices.recv().await {
+                            Ok(n) => {
+                                if tx.send(Internal::Desk(n)).is_err() {
+                                    return;
+                                }
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => return,
+                        }
+                    }
+                });
                 self.bridge = Some(bridge);
                 self.supervisor = Some(supervisor);
+                self.desk = Some(desk);
             }
             Err(e) => {
                 tracing::error!("bridge failed to start: {e}");
@@ -805,6 +875,44 @@ impl Backend {
         out
     }
 
+    fn desk_host(&self) -> Result<Arc<DeskHost>, String> {
+        self.desk
+            .clone()
+            .ok_or_else(|| "the Desk cannot run: the agent runtime is not available".to_string())
+    }
+
+    async fn send_desk_sessions(&self, p: &OpenProject) -> Result<(), String> {
+        let sessions = p.store().desk_sessions().await.map_err(|e| e.to_string())?;
+        self.send(Response::DeskSessions {
+            project: p.id(),
+            sessions,
+        });
+        Ok(())
+    }
+
+    async fn open_desk_session(
+        &self,
+        p: &OpenProject,
+        session: DeskSessionId,
+    ) -> Result<(), String> {
+        let entries = p
+            .store()
+            .desk_entries(session)
+            .await
+            .map_err(|e| e.to_string())?;
+        let alive = self.desk.as_ref().is_some_and(|d| d.is_live(session));
+        self.send(Response::DeskOpened {
+            project: p.id(),
+            session,
+            entries,
+            status: DeskStatus {
+                alive,
+                ..Default::default()
+            },
+        });
+        Ok(())
+    }
+
     /// Learns the share-per-dollar rates from the last 30 days of runs in
     /// every project, then sends the meter its state.
     async fn recalibrate(&mut self) {
@@ -945,6 +1053,7 @@ impl Backend {
                 self.maybe_auto_analyse(project).await;
             }
             Internal::Usage => self.send_usage(),
+            Internal::Desk(notice) => self.send(Response::Desk(notice)),
             Internal::Bridge(BridgeEvent::ApprovalRequested(a)) => {
                 if let Some(p) = self.project_of_agent(a.agent_id).await {
                     let _ = push_approvals(&p, &self.tx, &self.ctx).await;
@@ -964,10 +1073,12 @@ impl Backend {
         }
     }
 
+    /// The project an actor making a request belongs to: an agent's, or the
+    /// project whose human it is (a Desk session acts as the human).
     async fn project_of_agent(&self, agent: ActorId) -> Option<Arc<OpenProject>> {
         for entry in self.registry.projects() {
             if let Some(p) = self.registry.opened(entry.id) {
-                if p.store().agent(agent).await.is_ok() {
+                if p.human.id == agent || p.store().agent(agent).await.is_ok() {
                     return Some(p);
                 }
             }
@@ -1402,6 +1513,74 @@ impl Backend {
                 self.send(Response::ClaudeProbe(probe));
             }
             Request::RefreshUsage => self.refresh_usage(false),
+            Request::LoadDesk { project } => {
+                let p = self.project(project)?;
+                self.send_desk_sessions(&p).await?;
+            }
+            Request::NewDeskSession { project, model } => {
+                let p = self.project(project)?;
+                let session = DeskSession::new(model, Utc::now());
+                p.store()
+                    .insert_desk_session(&session)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                self.send_desk_sessions(&p).await?;
+                self.open_desk_session(&p, session.id).await?;
+            }
+            Request::OpenDeskSession { project, session } => {
+                let p = self.project(project)?;
+                self.open_desk_session(&p, session).await?;
+            }
+            Request::SendToDesk {
+                project,
+                session,
+                text,
+            } => {
+                let p = self.project(project)?;
+                let desk = self.desk_host()?;
+                desk.send(p, session, text)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            Request::InterruptDesk { session } => {
+                self.desk_host()?.interrupt(session);
+            }
+            Request::UpdateDeskSession {
+                project,
+                session,
+                title,
+                model,
+                archived,
+            } => {
+                let p = self.project(project)?;
+                let store = p.store();
+                let mut s = store
+                    .desk_session(session)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if let Some(t) = title
+                    .map(|t| t.trim().to_string())
+                    .filter(|t| !t.is_empty())
+                {
+                    s.title = t;
+                }
+                let restart =
+                    model.as_ref().is_some_and(|m| *m != s.model) || archived == Some(true);
+                if let Some(m) = model {
+                    s.model = m.filter(|m| !m.trim().is_empty());
+                }
+                if let Some(a) = archived {
+                    s.archived = a;
+                }
+                store
+                    .update_desk_session(&s)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                if restart {
+                    self.desk_host()?.close(session);
+                }
+                self.send_desk_sessions(&p).await?;
+            }
             Request::WakeAgent { project, handle } => {
                 let p = self.project(project)?;
                 let actor = self.agent_actor(&p, &handle).await?;

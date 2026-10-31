@@ -102,6 +102,96 @@ is unfinished); then stop. If there is nothing to do, say so in one line and sto
     out
 }
 
+pub struct DeskPromptContext<'a> {
+    pub project_name: &'a str,
+    pub human_handle: &'a str,
+    pub memory: &'a str,
+    pub roster: &'a [RosterLine],
+    pub columns: &'a [Column],
+    pub repo_path: &'a std::path::Path,
+}
+
+/// The appended system prompt for a Desk session: the human's own planning
+/// conversation, which leads the team through the board as the human.
+pub fn desk_prompt(ctx: &DeskPromptContext<'_>) -> String {
+    let mut out = format!(
+        "# The Desk for {project}\n\n\
+You are @{me}'s Desk: their own Claude Code session for the {project} project, open beside an \
+agent team that works the project's kanban board. You are where @{me} thinks out loud, plans, \
+sets priorities and decides what the team does next. Talk with them the way a sharp colleague \
+would: ask when something is unclear, push back when a plan has holes, and keep answers short.\n\n\
+Everything you do on the board goes through the `board` tools (`mcp__board__*`) and is \
+attributed to @{me}: a ticket you create is theirs, a message you post is theirs. So act on the \
+board when they ask you to, or when you have said what you are about to do and they have not \
+objected; never surprise them with board changes.\n",
+        project = ctx.project_name,
+        me = ctx.human_handle,
+    );
+    out.push_str("\n## Your memory\n\n");
+    if ctx.memory.trim().is_empty() {
+        out.push_str("(empty: nothing saved yet)\n");
+    } else {
+        out.push_str(ctx.memory.trim());
+        out.push('\n');
+    }
+    out.push_str("\n## The team right now\n\n");
+    for r in ctx.roster {
+        out.push_str(&format!(
+            "- @{} ({}{}){}\n",
+            r.handle,
+            r.kind,
+            if r.state.is_empty() {
+                String::new()
+            } else {
+                format!(", {}", r.state)
+            },
+            if r.description.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", r.description)
+            }
+        ));
+    }
+    let columns: Vec<String> = ctx
+        .columns
+        .iter()
+        .map(|c| format!("{} ({})", c.name, c.kind.as_str()))
+        .collect();
+    let has_lead = ctx.roster.iter().any(|r| r.handle == "lead");
+    out.push_str(&format!(
+        "\n## How you lead the team\n\n\
+- The board is the source of truth. Read it before you plan: ticket_list, ticket_get, \
+team_list. The columns are: {columns}.\n\
+- Work is handed out through tickets. Write a ticket the way a good lead would: what and why, \
+acceptance criteria, and anything the assignee must not touch. Assigning a ticket wakes the \
+assignee.\n\
+- {lead}\n\
+- A direct message from @{me} wakes the other member: chat_direct with an agent, then \
+thread_create or thread_post. Use it to brief, ask or redirect; keep the decision itself on a \
+ticket.\n\
+- Reports come back to @{me}'s inbox: when asked what has happened, start with inbox_list, \
+then read the tickets and threads it points at. Mark what you have dealt with with inbox_handle.\n\
+- You are not on the team. Do not do the agents' implementation work yourself unless @{me} \
+asks you to. Your working directory is @{me}'s own checkout at `{repo}`; the agents work in \
+their own worktrees on their own branches, so read their work there or on the board.\n\
+- Keep memory_update for what should outlive this conversation: priorities, decisions, \
+standing instructions. Read it with memory_read when a new session starts on something you \
+have discussed before.\n",
+        columns = columns.join(", "),
+        me = ctx.human_handle,
+        repo = ctx.repo_path.display(),
+        lead = if has_lead {
+            "@lead runs the team day to day: give it the goal and the priorities, and let it \
+break the work into tickets and assign specialists. Go to a specialist directly only for \
+something small or urgent."
+        } else {
+            "There is no @lead on this team yet, so break the work into tickets and assign the \
+specialists yourself."
+        },
+    ));
+    out
+}
+
 /// The short prompt passed on the command line.
 pub fn wake_prompt(trigger_lines: &[String], workspace: &Workspace) -> String {
     let mut out = String::new();
@@ -180,6 +270,63 @@ mod tests {
         ] {
             assert!(text.contains(needle), "missing {needle:?}");
         }
+    }
+
+    #[test]
+    fn desk_prompt_names_the_human_the_team_and_the_lead() {
+        let roster = vec![
+            RosterLine {
+                handle: "me".into(),
+                kind: "human",
+                description: "you".into(),
+                state: String::new(),
+            },
+            RosterLine {
+                handle: "lead".into(),
+                kind: "agent",
+                description: "Runs the team".into(),
+                state: "idle".into(),
+            },
+        ];
+        let columns = vec![Column {
+            id: ColumnId::new(),
+            name: "To do".into(),
+            position: 0,
+            kind: ColumnKind::Todo,
+        }];
+        let text = desk_prompt(&DeskPromptContext {
+            project_name: "zipOS",
+            human_handle: "me",
+            memory: "- ship auth first",
+            roster: &roster,
+            columns: &columns,
+            repo_path: std::path::Path::new("C:/src/zipos"),
+        });
+        for needle in [
+            "@me's Desk",
+            "zipOS",
+            "ship auth first",
+            "@lead (agent, idle): Runs the team",
+            "@lead runs the team day to day",
+            "To do (todo)",
+            "inbox_list",
+            "C:/src/zipos",
+        ] {
+            assert!(text.contains(needle), "missing {needle:?}");
+        }
+        let alone = desk_prompt(&DeskPromptContext {
+            roster: &roster[..1],
+            ..DeskPromptContext {
+                project_name: "x",
+                human_handle: "me",
+                memory: "",
+                roster: &[],
+                columns: &columns,
+                repo_path: std::path::Path::new("x"),
+            }
+        });
+        assert!(alone.contains("no @lead on this team yet"));
+        assert!(alone.contains("nothing saved yet"));
     }
 
     #[test]

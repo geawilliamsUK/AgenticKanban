@@ -1,10 +1,12 @@
 //! Running agents: the supervisor spawns and watches one Claude Code process
 //! per run, the scheduler decides when an agent runs, the workspace manager
 //! gives each agent its own git worktree, and the prompt builder composes
-//! what the agent is told.
+//! what the agent is told. The Desk host runs the human's own long-lived
+//! Claude Code conversations about a project.
 //!
 //! This sits above the bridge and the runtime because it needs both.
 
+pub mod desk;
 pub mod guardrails;
 pub mod prompts;
 pub mod scheduler;
@@ -14,6 +16,7 @@ pub mod workspace;
 
 use std::path::PathBuf;
 
+pub use desk::{DeskHost, DeskNotice, DeskStatus};
 pub use guardrails::GuardrailMonitor;
 pub use scheduler::Scheduler;
 pub use supervisor::{RunHandle, RunNotice, RunSpec, StopReason, Supervisor, SupervisorConfig};

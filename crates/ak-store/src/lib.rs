@@ -21,10 +21,11 @@ use ak_core::board::{Column, Comment, Ticket};
 use ak_core::chat::{Chat, Message, Thread, ThreadHit};
 use ak_core::commands::{NewTicket, TicketPatch};
 use ak_core::config::ProjectPolicy;
+use ak_core::desk::{DeskEntry, DeskEntryKind, DeskSession};
 use ak_core::guardrails::Trip;
 use ak_core::ids::{
-    ActorId, ApprovalId, CallId, ChatId, ColumnId, CommentId, NotificationId, RunId, ThreadId,
-    TicketId,
+    ActorId, ApprovalId, CallId, ChatId, ColumnId, CommentId, DeskSessionId, NotificationId, RunId,
+    ThreadId, TicketId,
 };
 use ak_core::run::{AgentRun, RunEvent, SchedulerDecision};
 use ak_core::utility::{UtilityCall, UtilityKind};
@@ -273,6 +274,24 @@ pub trait Store: Send + Sync {
     async fn record_scheduler_decision(&self, decision: &SchedulerDecision) -> Result<()>;
     /// Decisions at or after `since`, oldest first.
     async fn scheduler_decisions_since(&self, since: Timestamp) -> Result<Vec<SchedulerDecision>>;
+
+    // The Desk.
+
+    async fn insert_desk_session(&self, session: &DeskSession) -> Result<()>;
+    async fn update_desk_session(&self, session: &DeskSession) -> Result<()>;
+    async fn desk_session(&self, id: DeskSessionId) -> Result<DeskSession>;
+    /// Every session, archived ones too, most recently active first.
+    async fn desk_sessions(&self) -> Result<Vec<DeskSession>>;
+    /// Appends to a session's transcript; the store assigns the sequence.
+    async fn append_desk_entry(
+        &self,
+        session: DeskSessionId,
+        kind: DeskEntryKind,
+        payload: serde_json::Value,
+        at: Timestamp,
+    ) -> Result<DeskEntry>;
+    /// A session's transcript, oldest first.
+    async fn desk_entries(&self, session: DeskSessionId) -> Result<Vec<DeskEntry>>;
 }
 
 pub type SharedStore = Arc<dyn Store>;

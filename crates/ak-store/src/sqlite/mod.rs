@@ -1,6 +1,7 @@
 //! SQLite implementation of `Store`.
 
 mod chats;
+mod desk;
 mod rows;
 
 use std::path::Path;
@@ -20,6 +21,7 @@ use ak_core::board::{Column, Comment, Ticket};
 use ak_core::chat::{Chat, Message, Thread, ThreadHit};
 use ak_core::commands::{self, NewTicket, TicketPatch};
 use ak_core::config::ProjectPolicy;
+use ak_core::desk::{DeskEntry, DeskEntryKind, DeskSession};
 use ak_core::event::{EventKind, MentionSource};
 use ak_core::guardrails::Trip;
 use ak_core::ids::*;
@@ -1421,6 +1423,37 @@ impl Store for SqliteStore {
                 })
             })
             .collect()
+    }
+
+    async fn insert_desk_session(&self, session: &DeskSession) -> Result<()> {
+        self.insert_desk_session_impl(session).await
+    }
+
+    async fn update_desk_session(&self, session: &DeskSession) -> Result<()> {
+        self.update_desk_session_impl(session).await
+    }
+
+    async fn desk_session(&self, id: DeskSessionId) -> Result<DeskSession> {
+        self.desk_session_impl(id).await
+    }
+
+    async fn desk_sessions(&self) -> Result<Vec<DeskSession>> {
+        self.desk_sessions_impl().await
+    }
+
+    async fn append_desk_entry(
+        &self,
+        session: DeskSessionId,
+        kind: DeskEntryKind,
+        payload: serde_json::Value,
+        at: Timestamp,
+    ) -> Result<DeskEntry> {
+        self.append_desk_entry_impl(session, kind, payload, at)
+            .await
+    }
+
+    async fn desk_entries(&self, session: DeskSessionId) -> Result<Vec<DeskEntry>> {
+        self.desk_entries_impl(session).await
     }
 }
 

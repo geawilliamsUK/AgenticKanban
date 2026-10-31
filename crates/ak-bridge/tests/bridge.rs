@@ -71,6 +71,7 @@ async fn fixture(profile_index: usize, approval_timeout: Duration) -> Fixture {
         agent: agent.clone(),
         run_id: RunId::new(),
         profile,
+        desk_memory: None,
     });
     Fixture {
         bridge,
@@ -691,4 +692,69 @@ async fn repeated_identical_calls_are_denied_and_stop_the_run() {
         }
         other => panic!("expected a guardrail event, got {other:?}"),
     }
+}
+
+#[tokio::test]
+async fn a_desk_session_acts_as_the_human_with_its_own_memory() {
+    let f = fixture(0, Duration::from_secs(5)).await;
+    let memory = f.project.entry.path.join("desk").join("memory.md");
+    let human = f.project.human.clone();
+    let token = f.bridge.register_run(RunContext {
+        project: f.project.clone(),
+        agent: Agent::stand_in_for(&human, memory.clone()),
+        run_id: RunId::new(),
+        profile: f.project.policy().permission_profiles[0].clone(),
+        desk_memory: Some(memory.clone()),
+    });
+    let desk = Fixture {
+        bridge: f.bridge.clone(),
+        token,
+        project: f.project.clone(),
+        agent: f.agent.clone(),
+        _tmp: tempfile::tempdir().unwrap(),
+    };
+
+    // A ticket the Desk creates is the human's, and assigning it wakes the agent.
+    let (err, text) = call(
+        &desk,
+        "ticket_create",
+        json!({"title": "Plan the auth rework", "column": "To do", "assignee": "backend"}),
+    )
+    .await;
+    assert!(!err, "{text}");
+    let store = f.project.store();
+    let ticket = store.tickets().await.unwrap().pop().unwrap();
+    assert_eq!(ticket.reporter_id, human.id);
+    assert!(store
+        .notifications(f.agent.actor_id, true)
+        .await
+        .unwrap()
+        .iter()
+        .any(|n| n.wake));
+
+    // Memory lives in the Desk's own file, not under agents/.
+    let (err, _) = call(
+        &desk,
+        "memory_update",
+        json!({"content": "- sprint goal: auth"}),
+    )
+    .await;
+    assert!(!err);
+    assert_eq!(
+        std::fs::read_to_string(&memory).unwrap(),
+        "- sprint goal: auth"
+    );
+    let (_, text) = call(&desk, "memory_read", json!({})).await;
+    assert!(text.contains("sprint goal"));
+    assert!(!f
+        .project
+        .entry
+        .path
+        .join("agents")
+        .join(&human.handle)
+        .exists());
+
+    // Never held at stop, even with the human's inbox full.
+    let ctx = desk.bridge.run(&desk.token).unwrap();
+    assert_eq!(stop_decision(&ctx).await, json!({}));
 }

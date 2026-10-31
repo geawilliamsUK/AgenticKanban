@@ -86,6 +86,15 @@ impl HomePaths {
         self.root.join("calls")
     }
 
+    /// The project's Desk: its memory, and a directory per session.
+    pub fn desk_dir(&self, id: ProjectId) -> PathBuf {
+        self.project_dir(id).join("desk")
+    }
+
+    pub fn desk_memory_file(&self, id: ProjectId) -> PathBuf {
+        self.desk_dir(id).join("memory.md")
+    }
+
     /// The account's subscription usage windows as last reported.
     pub fn usage_file(&self) -> PathBuf {
         self.root.join("usage.json")

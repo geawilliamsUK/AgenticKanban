@@ -8,6 +8,7 @@ mod approvals_view;
 mod backend;
 mod board_view;
 mod chats_view;
+mod desk_view;
 mod dialogs;
 mod diff_view;
 mod inbox_view;

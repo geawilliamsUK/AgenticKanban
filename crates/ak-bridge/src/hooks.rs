@@ -64,7 +64,12 @@ pub async fn pre_tool_use(
 /// call it without HTTP.
 pub async fn decide(bridge: &Bridge, ctx: &RunContext, input: &PreToolUseInput) -> Value {
     // Repeated tool call: the same call over and over is a loop, not work.
-    let limit = ctx.project.policy().guardrails.repeated_tool_calls;
+    // The Desk is the human's own conversation and is not policed this way.
+    let limit = if ctx.is_desk() {
+        0
+    } else {
+        ctx.project.policy().guardrails.repeated_tool_calls
+    };
     let streak = bridge.note_tool_call(ctx.run_id, &input.tool_name, &input.tool_input);
     if limit > 0 && streak >= limit {
         let reason = format!(
@@ -146,6 +151,10 @@ pub async fn stop(
 
 /// `{}` to let the agent stop, or a block with the pending wake items.
 pub async fn stop_decision(ctx: &RunContext) -> Value {
+    // The Desk acts as the human, whose inbox is theirs to work through.
+    if ctx.is_desk() {
+        return json!({});
+    }
     let store = ctx.store();
     let open = match store.notifications(ctx.agent.actor_id, true).await {
         Ok(n) => n,

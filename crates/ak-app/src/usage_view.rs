@@ -133,7 +133,7 @@ fn rate_line(c: &Calibration, window: Window) -> String {
     }
 }
 
-fn bar(ui: &mut egui::Ui, fraction: f64, tone: Tone) {
+pub fn bar(ui: &mut egui::Ui, fraction: f64, tone: Tone) {
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 6.0), egui::Sense::hover());
     let palette = theme::palette(ui.style());

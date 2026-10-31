@@ -84,6 +84,10 @@ id_type!(ThreadId);
 id_type!(MessageId);
 id_type!(CallId);
 id_type!(ApprovalId);
+id_type!(
+    /// A conversation in a project's Desk.
+    DeskSessionId
+);
 
 impl ActorId {
     /// The reserved actor used for guardrail and system actions.

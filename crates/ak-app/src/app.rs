@@ -24,6 +24,7 @@ use crate::analyst_view::AnalystState;
 use crate::approvals_view::ApprovalTray;
 use crate::backend::{Backend, Request, Response, RunnerFactory};
 use crate::chats_view::ChatsState;
+use crate::desk_view::DeskState;
 use crate::dialogs::{AddProjectDialog, NewTicketDialog};
 use crate::markdown::Markdown;
 use crate::model::{
@@ -39,6 +40,7 @@ use crate::widgets;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
+    Desk,
     Board,
     Inbox,
     Chats,
@@ -129,6 +131,8 @@ pub struct App {
     /// Turns a run's cost into an estimated share of each window.
     pub calibration: Calibration,
     pub usage_refresh_requested: Option<Instant>,
+
+    pub desk: DeskState,
 
     pub new_ticket: Option<NewTicketDialog>,
     pub add_project: Option<AddProjectDialog>,
@@ -225,6 +229,7 @@ impl App {
             usage: None,
             calibration: Calibration::default(),
             usage_refresh_requested: None,
+            desk: DeskState::default(),
             new_ticket: None,
             add_project: None,
             remove_confirm: None,
@@ -320,6 +325,7 @@ impl App {
                 self.thread_detail = None;
                 self.thread_hits.clear();
                 self.chats_ui = ChatsState::default();
+                self.desk = DeskState::default();
                 self.drift.clear();
                 self.export_dialog = None;
                 self.import_dialog = None;
@@ -398,6 +404,29 @@ impl App {
                 self.usage = snapshot;
                 self.calibration = calibration;
             }
+            Response::DeskSessions { project, sessions } => {
+                if self.desk.project == Some(project) {
+                    self.desk.on_sessions(sessions);
+                }
+            }
+            Response::DeskOpened {
+                project,
+                session,
+                entries,
+                status,
+            } => {
+                if self.desk.project == Some(project) {
+                    self.desk.on_opened(session, entries, status);
+                    if let Some(text) = self.desk.pending_send.take() {
+                        self.send(Request::SendToDesk {
+                            project,
+                            session,
+                            text,
+                        });
+                    }
+                }
+            }
+            Response::Desk(notice) => self.desk.on_notice(notice),
             Response::ProjectPolicy { project, policy } => {
                 if Some(project) == self.current {
                     self.apply_policy(policy);
@@ -857,6 +886,14 @@ impl App {
         }
         let enabled = self.current.is_some();
         ui.add_enabled_ui(enabled, |ui| {
+            let busy = self.desk.status.values().any(|s| s.busy);
+            let label = if busy { "Desk  ●" } else { "Desk" };
+            if widgets::nav_item(ui, label, self.view == View::Desk)
+                .on_hover_text("Your own Claude Code session for planning and steering the team")
+                .clicked()
+            {
+                self.actions.push(Action::SwitchView(View::Desk));
+            }
             if widgets::nav_item(ui, "Board", self.view == View::Board).clicked() {
                 self.actions.push(Action::SwitchView(View::Board));
             }
@@ -1072,6 +1109,7 @@ impl eframe::App for App {
                     return;
                 }
                 match self.view {
+                    View::Desk => crate::desk_view::draw(self, ui),
                     View::Board => crate::board_view::draw(self, ui),
                     View::Inbox => crate::inbox_view::draw(self, ui),
                     View::Chats => crate::chats_view::draw(self, ui),

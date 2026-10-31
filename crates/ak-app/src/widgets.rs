@@ -3,7 +3,7 @@
 use crate::theme::{self, Tone, CONTROL_RADIUS};
 
 /// The aliases Claude Code resolves to the current model of each tier.
-pub const MODEL_ALIASES: [&str; 3] = ["opus", "sonnet", "haiku"];
+pub const MODEL_ALIASES: [&str; 4] = ["opus", "sonnet", "haiku", "fable"];
 
 /// A model choice: a combo of the Claude Code aliases plus a free-text field
 /// for a full model id. An empty value means the default named by

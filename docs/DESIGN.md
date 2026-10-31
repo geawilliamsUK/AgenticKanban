@@ -372,10 +372,22 @@ Working directory: the call's own directory under the app's home directory, neve
 
 Utility calls have no board identity, no worktree and no inbox. They run under their own concurrency cap (default 4) separate from agent runs, and their cost counts toward the global daily budget. The authoring model is a project setting, defaulting to the most capable model available, since these calls are rare and their quality compounds into every future run.
 
+### The Desk
+
+Each project has a Desk: the human's own Claude Code conversations about the project, for planning and steering the team, the way a main session sits above a team lead. It is not an agent and not on the team. Checked against Claude Code 2.1.302 on 2026-10-31.
+
+- One long-lived process per open session: `claude -p --input-format stream-json --output-format stream-json --verbose --include-partial-messages`, with the Desk's system prompt appended, the bridge's MCP config and hooks, and the project's Desk permission profile (default `supervised`, so anything beyond reading asks in the approval tray). Working directory: the human's own checkout. The human's messages go in on stdin as `{"type":"user",...}` lines; a message sent mid-reply is queued by Claude Code.
+- A session is created with `--session-id` and every later process resumes it with `--resume`, so closing the app or the half-hour idle close loses nothing. A model change closes the process and the next message resumes on the new model.
+- Stop sends `{"type":"control_request","request":{"subtype":"interrupt"}}`, which ends the turn with `terminal_reason: "aborted_streaming"` and keeps the process. This works on Windows, where a GUI process cannot send Ctrl-C.
+- Text streams from `stream_event` `text_delta`s. Output of local slash commands (`/context`, `/usage`) comes from the turn's `result.result` when `local_command` is set: the `assistant` messages carrying it are replayed after `/compact` and are skipped, as are `isReplay` and `isSynthetic` user messages. `compact_boundary` gives the tokens before and after.
+- The bridge registers the session as the human (`Agent::stand_in_for`), so its tickets, comments and messages are the human's and its approvals show as "Desk". It is never held at stop, is not policed for repeated calls, and keeps its memory in `projects/<id>/desk/memory.md`, outside the agents directory.
+- Each session's transcript is kept as entries in the project store (`desk_sessions`, `desk_entries`) so the app shows it after a restart. Its turns count as activity for the usage tracker, so agent runs alongside them are not taken as solo.
+- The app answers `/clear` (a new session) and `/model`; every other slash command, skills and custom commands included, goes to Claude Code as typed, completed from the list the process reports in `init`.
+
 ### Not used in v1
 
-- `--resume`: fresh session per wake. Session ids are kept so the run inspector can offer a copyable `claude --resume <id>` to open a run interactively from its worktree.
-- `--input-format stream-json`: the path to mid-run message injection in v2.
+- `--resume` for agent runs: fresh session per wake. Session ids are kept so the run inspector can offer a copyable `claude --resume <id>` to open a run interactively from its worktree. The Desk resumes its sessions.
+- `--input-format stream-json` for agent runs: the path to mid-run message injection in v2. The Desk uses it.
 - `--bare`: it disables the subscription login and project `CLAUDE.md`, both of which agents should have.
 - `--permission-prompt-tool`: the flag exists but its request and response contract is not documented. Hooks are the documented route. Revisit if that changes.
 - `--agents`: Claude Code subagents inside an agent run are not part of the model.

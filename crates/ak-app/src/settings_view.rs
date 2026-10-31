@@ -494,6 +494,33 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                 });
                                 ui.end_row();
 
+                                ui.label("Desk permissions");
+                                ui.horizontal(|ui| {
+                                    let names: Vec<String> = policy
+                                        .permission_profiles
+                                        .iter()
+                                        .map(|p| p.name.clone())
+                                        .collect();
+                                    egui::ComboBox::from_id_salt("desk_profile")
+                                        .selected_text(policy.desk_permission_profile.clone())
+                                        .show_ui(ui, |ui| {
+                                            for name in names {
+                                                if ui
+                                                    .selectable_value(
+                                                        &mut policy.desk_permission_profile,
+                                                        name.clone(),
+                                                        name,
+                                                    )
+                                                    .changed()
+                                                {
+                                                    editor.project_dirty = true;
+                                                }
+                                            }
+                                        });
+                                    ui.weak("the profile the Desk works under in your own checkout; anything it does not allow asks in the tray.");
+                                });
+                                ui.end_row();
+
                                 ui.label("Push policy");
                                 egui::ComboBox::from_id_salt("push_policy")
                                     .selected_text(match policy.push_policy {

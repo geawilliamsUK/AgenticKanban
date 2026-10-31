@@ -297,6 +297,25 @@ impl Agent {
     pub fn is_retired(&self) -> bool {
         self.missing_since.is_some()
     }
+
+    /// An agent-shaped stand-in for the human, for a Desk session: the bridge
+    /// attributes everything it does to the human. Never stored.
+    pub fn stand_in_for(human: &crate::Actor, memory_path: PathBuf) -> Self {
+        Self {
+            actor_id: human.id,
+            handle: human.handle.clone(),
+            description: "the human, through the Desk".into(),
+            model: None,
+            permission_profile: String::new(),
+            budgets: None,
+            state: AgentState::Idle,
+            current_run_id: None,
+            cooldown_until: None,
+            missing_since: None,
+            definition_path: PathBuf::new(),
+            memory_path,
+        }
+    }
 }
 
 #[cfg(test)]

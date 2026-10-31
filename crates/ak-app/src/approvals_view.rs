@@ -148,7 +148,13 @@ fn card(app: &mut App, ui: &mut egui::Ui, project: ProjectId, a: &Approval) -> f
     let out = theme::glass(ui, base, |ui| {
         ui.set_width(ui.available_width());
         ui.horizontal(|ui| {
-            ui.label(egui::RichText::new(app.board.handle(a.agent_id)).strong());
+            // The Desk acts as the human, so its requests carry the human's id.
+            let who = if app.human.as_ref().is_some_and(|h| h.id == a.agent_id) {
+                "Desk".to_string()
+            } else {
+                app.board.handle(a.agent_id)
+            };
+            ui.label(egui::RichText::new(who).strong());
             ui.weak(format_time(&a.created_at));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if widgets::tinted_button(ui, "Deny", Tone::Red).clicked() {
