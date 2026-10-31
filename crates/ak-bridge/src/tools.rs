@@ -19,7 +19,7 @@ use ak_core::ids::{ActorId, ChatId, ColumnId, CommentId, NotificationId, ThreadI
 use ak_core::{Actor, ActorKind, Notification};
 use ak_store::{Store, StoreError};
 
-use crate::RunContext;
+use crate::{Bridge, RunContext};
 
 pub const INSTRUCTIONS: &str =
     "You are an agent on a kanban board. Start with inbox_list to see why you were woken. \
@@ -97,10 +97,34 @@ pub struct TicketCreateInput {
     pub parent_key: Option<String>,
 }
 
+/// Accepts a ticket version as a number, or as the "v3" the board prints,
+/// which agents copy back.
+fn version<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i64, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Raw {
+        Number(i64),
+        Text(String),
+    }
+    match Raw::deserialize(d)? {
+        Raw::Number(n) => Ok(n),
+        Raw::Text(s) => s
+            .trim()
+            .trim_start_matches(['v', 'V'])
+            .parse()
+            .map_err(|_| {
+                serde::de::Error::custom(format!(
+                    "version {s:?} is not a number; pass the number from ticket_get, e.g. 3"
+                ))
+            }),
+    }
+}
+
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TicketUpdateInput {
     pub key: String,
-    /// The version you read, from ticket_get or ticket_list.
+    /// The version you read: the N in "vN" from ticket_get or ticket_list.
+    #[serde(deserialize_with = "version")]
     pub version: i64,
     pub title: Option<String>,
     pub description: Option<String>,
@@ -112,7 +136,8 @@ pub struct TicketUpdateInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TicketMoveInput {
     pub key: String,
-    /// The version you read.
+    /// The version you read: the N in "vN" from ticket_get or ticket_list.
+    #[serde(deserialize_with = "version")]
     pub version: i64,
     /// Column name or kind.
     pub column: String,
@@ -121,7 +146,8 @@ pub struct TicketMoveInput {
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct TicketAssignInput {
     pub key: String,
-    /// The version you read.
+    /// The version you read: the N in "vN" from ticket_get or ticket_list.
+    #[serde(deserialize_with = "version")]
     pub version: i64,
     /// Assignee handle without the @, or "unassigned".
     pub assignee: String,
@@ -321,7 +347,7 @@ const SPECS: &[ToolSpec] = &[
     },
     ToolSpec {
         name: "agent_activate",
-        description: "Ask the scheduler to wake another agent with a reason. Prefer assigning or @mentioning on a ticket.",
+        description: "Wake another agent now, with the reason they will be told. Assigning a ticket or @mentioning on one already wakes them; use this when there is no ticket change to react to.",
         schema: schema::<AgentActivateInput>,
     },
 ];
@@ -341,8 +367,8 @@ pub fn list() -> Vec<Value> {
 }
 
 /// Runs one tool as the run's agent.
-pub async fn call(ctx: &RunContext, name: &str, args: Value) -> Outcome {
-    match run(ctx, name, args).await {
+pub async fn call(bridge: &Bridge, ctx: &RunContext, name: &str, args: Value) -> Outcome {
+    match run(bridge, ctx, name, args).await {
         Ok(text) => Outcome::ok(text),
         Err(ToolError::Message(m)) => Outcome::err(m),
         Err(ToolError::Store(e)) => Outcome::err(store_message(&e)),
@@ -385,7 +411,12 @@ fn parse_args<T: for<'de> Deserialize<'de>>(args: Value) -> Result<T, ToolError>
     )))
 }
 
-async fn run(ctx: &RunContext, name: &str, args: Value) -> Result<String, ToolError> {
+async fn run(
+    bridge: &Bridge,
+    ctx: &RunContext,
+    name: &str,
+    args: Value,
+) -> Result<String, ToolError> {
     let store = ctx.store();
     let me = ctx.agent.actor_id;
     match name {
@@ -759,9 +790,35 @@ async fn run(ctx: &RunContext, name: &str, args: Value) -> Result<String, ToolEr
         "agent_activate" => {
             let input: AgentActivateInput = parse_args(args)?;
             let snap = Snapshot::load(store.as_ref()).await?;
-            snap.actor_named(&input.handle)?;
-            Err(ToolError::Message(
-                "direct activation is not available yet; assign a ticket to them or @mention them in a comment instead".into(),
+            let target = snap.actor_named(&input.handle)?;
+            if target.kind != ActorKind::Agent {
+                return Err(ToolError::Message(format!(
+                    "@{} is not an agent; message them in a thread instead",
+                    target.handle
+                )));
+            }
+            if target.id == ctx.agent.actor_id {
+                return Err(ToolError::Message("you cannot wake yourself".into()));
+            }
+            if store.agent(target.id).await?.is_retired() {
+                return Err(ToolError::Message(format!("@{} is retired", target.handle)));
+            }
+            let reason = input.reason.trim();
+            if reason.is_empty() {
+                return Err(ToolError::Message(
+                    "give a reason: it is what they are told when they wake".into(),
+                ));
+            }
+            bridge.request_activation(
+                ctx.project.id(),
+                target.id,
+                ctx.agent.actor_id,
+                format!("@{} asked: {reason}", ctx.agent.handle),
+            );
+            Ok(format!(
+                "@{} will be woken as soon as the scheduler can start them (a free slot, within \
+                 their budgets and the usage holds); they will see your reason",
+                target.handle
             ))
         }
         other => Err(ToolError::Message(format!("unknown tool {other}"))),

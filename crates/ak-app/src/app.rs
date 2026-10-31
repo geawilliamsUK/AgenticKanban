@@ -60,6 +60,8 @@ pub enum Action {
     OpenProject(ProjectId),
     /// `None` starts a new agent; `Some(handle)` loads an existing one.
     OpenAgent(Option<String>),
+    /// Opens the editor on the team lead preset.
+    NewLead,
     CloseAgent,
     SelectChat(Option<ChatId>),
     /// Selecting a thread also switches to the Chats view.
@@ -422,6 +424,7 @@ impl App {
                             project,
                             session,
                             text,
+                            shown: None,
                         });
                     }
                 }
@@ -789,6 +792,12 @@ impl App {
                         .cloned()
                         .unwrap_or_else(|| "supervised".into());
                     self.team = Some(AgentEditor::new_agent(&profile));
+                    self.view = View::Team;
+                }
+                Action::NewLead => {
+                    self.team = Some(AgentEditor::new_from_preset(
+                        ak_core::agent::AgentDefinition::lead(),
+                    ));
                     self.view = View::Team;
                 }
                 Action::OpenAgent(Some(handle)) => {

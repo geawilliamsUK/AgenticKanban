@@ -27,7 +27,7 @@ use tokio::sync::{broadcast, oneshot};
 
 use ak_core::approval::{Approval, ApprovalState};
 use ak_core::ids::RunId;
-use ak_core::ids::{ActorId, ApprovalId};
+use ak_core::ids::{ActorId, ApprovalId, ProjectId};
 
 pub use runs::RunContext;
 
@@ -50,6 +50,14 @@ pub enum BridgeEvent {
     RunGuardrail {
         run_id: RunId,
         agent_id: ActorId,
+        reason: String,
+    },
+    /// Someone asked for an agent to be woken (`agent_activate`); the
+    /// project's scheduler queues it.
+    ActivationRequested {
+        project: ProjectId,
+        agent_id: ActorId,
+        by: ActorId,
         reason: String,
     },
 }
@@ -226,6 +234,22 @@ impl Bridge {
             .events
             .send(BridgeEvent::ApprovalDecided(approval.clone()));
         Ok(approval)
+    }
+
+    /// Asks the target's project scheduler to wake an agent.
+    pub fn request_activation(
+        &self,
+        project: ProjectId,
+        agent_id: ActorId,
+        by: ActorId,
+        reason: String,
+    ) {
+        self.emit(BridgeEvent::ActivationRequested {
+            project,
+            agent_id,
+            by,
+            reason,
+        });
     }
 
     pub(crate) fn emit(&self, event: BridgeEvent) {

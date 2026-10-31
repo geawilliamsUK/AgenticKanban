@@ -420,7 +420,7 @@ Exposed by the bridge over MCP. Every tool executes as the agent bound to the ru
 | `thread.post` | Post in an existing thread | Rejected if paused |
 | `memory.read` | My memory markdown | Also injected at wake |
 | `memory.update` | Replace my memory markdown | Snapshotted per run |
-| `agent.activate` | Ask the scheduler to wake another agent with a reason | Emits `agent.wake_requested`. Rate limited |
+| `agent.activate` | Ask the scheduler to wake another agent with a reason | Exposed as `agent_activate`. The bridge raises an activation request; the target's project scheduler queues it, and the run starts under the usual wake rate, budgets, usage holds and slots, with the reason (prefixed by who asked) in the wake prompt. Refuses humans, the caller itself and retired agents |
 
 Approvals are not a tool. They arrive through the PreToolUse hook described in section 8.
 

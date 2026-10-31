@@ -220,11 +220,11 @@ async fn agent_works_a_ticket_through_the_tools() {
     assert!(err);
     assert!(text.contains("version conflict"), "{text}");
 
-    // Right version, column by kind.
+    // Right version, written the way the board prints it, column by kind.
     let (err, text) = call(
         &f,
         "ticket_move",
-        json!({"key": "DEM-1", "version": ticket.version, "column": "in_progress"}),
+        json!({"key": "DEM-1", "version": format!("v{}", ticket.version), "column": "in_progress"}),
     )
     .await;
     assert!(!err, "{text}");
@@ -757,4 +757,69 @@ async fn a_desk_session_acts_as_the_human_with_its_own_memory() {
     // Never held at stop, even with the human's inbox full.
     let ctx = desk.bridge.run(&desk.token).unwrap();
     assert_eq!(stop_decision(&ctx).await, json!({}));
+}
+
+#[tokio::test]
+async fn agent_activate_asks_the_scheduler_and_refuses_people_and_self() {
+    let f = fixture(0, Duration::from_secs(5)).await;
+    let mut events = f.bridge.subscribe();
+
+    // An agent cannot wake a human or itself.
+    let (err, text) = call(&f, "agent_activate", json!({"handle": "me", "reason": "x"})).await;
+    assert!(err && text.contains("not an agent"), "{text}");
+    let (err, text) = call(
+        &f,
+        "agent_activate",
+        json!({"handle": "backend", "reason": "x"}),
+    )
+    .await;
+    assert!(err && text.contains("yourself"), "{text}");
+
+    // The human, from the Desk, wakes the agent with a reason.
+    let memory = f.project.entry.path.join("desk").join("memory.md");
+    let human = f.project.human.clone();
+    let token = f.bridge.register_run(RunContext {
+        project: f.project.clone(),
+        agent: Agent::stand_in_for(&human, memory.clone()),
+        run_id: RunId::new(),
+        profile: f.project.policy().permission_profiles[0].clone(),
+        desk_memory: Some(memory),
+    });
+    let desk = Fixture {
+        bridge: f.bridge.clone(),
+        token,
+        project: f.project.clone(),
+        agent: f.agent.clone(),
+        _tmp: tempfile::tempdir().unwrap(),
+    };
+    let (err, text) = call(
+        &desk,
+        "agent_activate",
+        json!({"handle": "backend", "reason": "  "}),
+    )
+    .await;
+    assert!(err && text.contains("give a reason"), "{text}");
+    let (err, text) = call(
+        &desk,
+        "agent_activate",
+        json!({"handle": "backend", "reason": "pick up the auth tickets"}),
+    )
+    .await;
+    assert!(!err, "{text}");
+    let event = loop {
+        match events.try_recv() {
+            Ok(BridgeEvent::ActivationRequested {
+                project,
+                agent_id,
+                by,
+                reason,
+            }) => break (project, agent_id, by, reason),
+            Ok(_) => continue,
+            Err(e) => panic!("no activation event: {e:?}"),
+        }
+    };
+    assert_eq!(event.0, f.project.id());
+    assert_eq!(event.1, f.agent.actor_id);
+    assert_eq!(event.2, human.id);
+    assert_eq!(event.3, "@me asked: pick up the auth tickets");
 }

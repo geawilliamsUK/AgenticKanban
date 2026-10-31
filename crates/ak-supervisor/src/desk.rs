@@ -132,17 +132,33 @@ impl DeskHost {
         id: DeskSessionId,
         text: String,
     ) -> Result<(), SupervisorError> {
+        self.send_as(project, id, text, None).await
+    }
+
+    /// Like `send`, but the transcript shows `shown` (a command as typed)
+    /// while Claude Code receives `text` (what the command expands to).
+    pub async fn send_as(
+        self: &Arc<Self>,
+        project: Arc<OpenProject>,
+        id: DeskSessionId,
+        text: String,
+        shown: Option<String>,
+    ) -> Result<(), SupervisorError> {
         let store = project.store();
         let mut session = store.desk_session(id).await?;
         let now = Utc::now();
+        let payload = match &shown {
+            Some(s) => json!({ "text": s, "expanded": text }),
+            None => json!({ "text": text }),
+        };
         let entry = store
-            .append_desk_entry(id, DeskEntryKind::User, json!({ "text": text }), now)
+            .append_desk_entry(id, DeskEntryKind::User, payload, now)
             .await?;
         self.notify(DeskNotice::Entry {
             project: project.id(),
             entry,
         });
-        session.title_from(&text);
+        session.title_from(shown.as_deref().unwrap_or(&text));
         session.last_active_at = now;
         session.archived = false;
         store.update_desk_session(&session).await?;

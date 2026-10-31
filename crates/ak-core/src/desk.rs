@@ -129,8 +129,46 @@ impl DeskEntry {
     }
 }
 
+/// What `/standup [notes]` asks the Desk to do: catch the human up, then
+/// brief the lead in a dated thread, which wakes it. The human's notes
+/// become part of the brief.
+pub fn standup_prompt(notes: &str, today: chrono::NaiveDate) -> String {
+    let notes = notes.trim();
+    let notes = if notes.is_empty() {
+        "(none: keep the current priorities)".to_string()
+    } else {
+        notes.to_string()
+    };
+    format!(
+        "Run a standup.\n\n\
+1. Catch me up. Read the board (ticket_list), my inbox (inbox_list) and the most recent \
+standup thread with @lead if there is one (chat_list, thread_list, thread_read). Then tell me, \
+briefly: what moved since the last standup, what is in progress and with whom, what is blocked, \
+and anything waiting on my decision.\n\
+2. Brief the team. If there is an @lead, open a direct chat with it (chat_direct) and start a \
+thread titled \"Standup {today}\" (thread_create) with today's priorities in order and my notes \
+below; that wakes @lead, which turns them into tickets and assignments and reports back in that \
+thread. If there is no @lead, propose the tickets and who should take each, and wait for my \
+go-ahead before creating them.\n\
+3. Finish by telling me what you sent and to whom. Do not do any implementation work yourself.\n\n\
+My notes for this standup:\n{notes}\n",
+        today = today.format("%Y-%m-%d"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_standup_prompt_carries_the_notes_and_the_date() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 10, 31).unwrap();
+        let p = super::standup_prompt("  ship auth first\nthen billing ", day);
+        assert!(p.contains("Standup 2026-10-31"));
+        assert!(p.contains("ship auth first\nthen billing"));
+        assert!(p.contains("chat_direct"));
+        assert!(p.contains("no @lead"));
+        assert!(super::standup_prompt("", day).contains("keep the current priorities"));
+    }
+
     use super::*;
     use chrono::Utc;
 

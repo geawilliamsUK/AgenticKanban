@@ -3,8 +3,8 @@
 //! transcript, streamed as it is written, in the middle; a compose box that
 //! sends on Enter and completes slash commands.
 //!
-//! `/clear` and `/model` are the app's: a new session, and the session's
-//! model. Every other command goes to Claude Code as typed, which is how
+//! `/standup`, `/clear` and `/model` are the app's: a standup that ends
+//! with @lead briefed, a new session, and the session's model. Every other command goes to Claude Code as typed, which is how
 //! `/compact`, `/context`, `/usage`, skills and custom commands work.
 
 use std::collections::HashMap;
@@ -20,7 +20,11 @@ use crate::theme::{self, Tone};
 use crate::{usage_view, widgets};
 
 /// Commands the app answers itself, with what they do.
-const OWN_COMMANDS: [(&str, &str); 2] = [
+const OWN_COMMANDS: [(&str, &str); 3] = [
+    (
+        "standup",
+        "catch up, then brief @lead: /standup ship auth first",
+    ),
     ("clear", "start a new session"),
     ("model", "set this session's model: /model opus"),
 ];
@@ -695,10 +699,30 @@ fn submit(
                 });
             }
         },
+        Some("/standup") => {
+            let notes = text.trim_start_matches("/standup").trim();
+            let today = chrono::Local::now().date_naive();
+            if session.is_some_and(|s| s.title == DeskSession::UNTITLED) {
+                app.send(Request::UpdateDeskSession {
+                    project,
+                    session: session_id,
+                    title: Some(format!("Standup {}", today.format("%Y-%m-%d"))),
+                    model: None,
+                    archived: None,
+                });
+            }
+            app.send(Request::SendToDesk {
+                project,
+                session: session_id,
+                text: ak_core::desk::standup_prompt(notes, today),
+                shown: Some(text),
+            });
+        }
         _ => app.send(Request::SendToDesk {
             project,
             session: session_id,
             text,
+            shown: None,
         }),
     }
 }
@@ -760,8 +784,9 @@ mod tests {
             "engineering:standup".into(),
         ];
         let all = slash_suggestions("/", &reported);
-        assert_eq!(all[0].0, "clear");
-        assert_eq!(all[1].0, "model");
+        assert_eq!(all[0].0, "standup");
+        assert_eq!(all[1].0, "clear");
+        assert_eq!(all[2].0, "model");
         assert!(all.iter().any(|(n, _)| n == "review"));
         assert_eq!(
             all.iter().filter(|(n, _)| n == "compact").count(),

@@ -264,10 +264,13 @@ pub enum Request {
         project: ProjectId,
         session: DeskSessionId,
     },
+    /// `shown`, when set, is what the transcript shows in place of `text`:
+    /// a command as typed, where `text` is what it expands to.
     SendToDesk {
         project: ProjectId,
         session: DeskSessionId,
         text: String,
+        shown: Option<String>,
     },
     InterruptDesk {
         session: DeskSessionId,
@@ -1065,6 +1068,8 @@ impl Backend {
                     "Guardrail stopped a run: {reason}"
                 )));
             }
+            // The scheduler of the agent's project acts on these itself.
+            Internal::Bridge(BridgeEvent::ActivationRequested { .. }) => {}
             Internal::Bridge(BridgeEvent::ApprovalDecided(a)) => {
                 if let Some(p) = self.project_of_agent(a.agent_id).await {
                     let _ = push_approvals(&p, &self.tx, &self.ctx).await;
@@ -1535,10 +1540,11 @@ impl Backend {
                 project,
                 session,
                 text,
+                shown,
             } => {
                 let p = self.project(project)?;
                 let desk = self.desk_host()?;
-                desk.send(p, session, text)
+                desk.send_as(p, session, text, shown)
                     .await
                     .map_err(|e| e.to_string())?;
             }

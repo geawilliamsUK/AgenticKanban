@@ -58,7 +58,7 @@ pub async fn handle(
         Value::Array(items) => {
             let mut out = Vec::new();
             for item in items {
-                if let Some(r) = dispatch(&ctx, item).await {
+                if let Some(r) = dispatch(&bridge, &ctx, item).await {
                     out.push(r);
                 }
             }
@@ -68,7 +68,7 @@ pub async fn handle(
                 Json(Value::Array(out)).into_response()
             }
         }
-        single => match dispatch(&ctx, single).await {
+        single => match dispatch(&bridge, &ctx, single).await {
             Some(r) => Json(r).into_response(),
             None => StatusCode::ACCEPTED.into_response(),
         },
@@ -76,7 +76,7 @@ pub async fn handle(
 }
 
 /// Handles one message. Notifications (no id) produce no response.
-async fn dispatch(ctx: &crate::RunContext, message: Value) -> Option<Value> {
+async fn dispatch(bridge: &Bridge, ctx: &crate::RunContext, message: Value) -> Option<Value> {
     let req: RpcRequest = match serde_json::from_value(message) {
         Ok(r) => r,
         Err(e) => return Some(rpc_error(None, -32600, &format!("invalid request: {e}"))),
@@ -113,7 +113,7 @@ async fn dispatch(ctx: &crate::RunContext, message: Value) -> Option<Value> {
                 .get("arguments")
                 .cloned()
                 .unwrap_or_else(|| json!({}));
-            let outcome = tools::call(ctx, &name, args).await;
+            let outcome = tools::call(bridge, ctx, &name, args).await;
             json!({
                 "content": [{ "type": "text", "text": outcome.text }],
                 "isError": outcome.is_error,

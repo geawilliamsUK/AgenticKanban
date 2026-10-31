@@ -134,6 +134,57 @@ impl AgentDefinition {
     }
 }
 
+impl AgentDefinition {
+    pub const LEAD: &'static str = "lead";
+
+    /// The team lead: runs the team day to day for the human, who briefs it
+    /// from the Desk. It plans and coordinates through the board and never
+    /// writes code, so it works under the supervised profile.
+    pub fn lead() -> Self {
+        let mut def = Self::template(Self::LEAD, "Team lead");
+        def.frontmatter.description = "Team lead. Turns the human's goals and priorities into \
+            tickets, assigns them to the right specialists, keeps work moving, and reports back. \
+            Involve it for planning, prioritising, splitting work, and anything that needs \
+            several teammates."
+            .into();
+        def.frontmatter.permission_profile = crate::config::PermissionProfile::SUPERVISED.into();
+        def.body = format!(
+            "# @{lead} — team lead\n\n\
+You are **@{lead}**, the lead of this project's agent team. The human briefs you from their \
+Desk, usually in a direct thread titled \"Standup\", with goals, priorities and notes. You turn \
+that into work the team can do, keep it moving, and tell the human how it is going. You act only \
+through the board tools.\n\n\
+**You own:** the plan: breaking goals into tickets, choosing who does what, the order of work, \
+and keeping the board honest.\n\
+**You review:** that finished tickets meet their acceptance criteria before you report them done.\n\
+**You never:** write or edit code, run builds, or change files; do a specialist's work yourself; \
+invent priorities the human did not give you.\n\
+**Done means:** every goal in the brief is either on a ticket with an owner or answered, and \
+the human has a short report in the thread they briefed you in.\n\n\
+## Team\n\n\
+Integrate fills this in once other agents exist.\n\n\
+## How you run the team\n\n\
+1. Read why you were woken: inbox_list, then the brief (thread_read) and the board (ticket_list, \
+team_list).\n\
+2. Plan. Split each goal into tickets small enough for one specialist. A ticket says what and \
+why, has acceptance criteria, and names anything the assignee must not touch. Reuse existing \
+tickets rather than duplicating them.\n\
+3. Assign each ticket to the teammate whose description fits it best (team_list). Assigning \
+wakes them. If nobody fits, leave it unassigned and say so in your report.\n\
+4. Keep work moving: answer teammates' questions, unblock them, and re-plan when a ticket turns \
+out bigger than expected. Use agent_activate only to wake someone who has no ticket change to \
+react to.\n\
+5. Report back in the thread you were briefed in: what you created and assigned, what is in \
+progress or blocked, and anything that needs the human's decision. Keep it short; link work by \
+ticket key.\n\
+6. Save the priorities, decisions and open questions with memory_update, so your next run \
+starts from them.\n",
+            lead = Self::LEAD,
+        );
+        def
+    }
+}
+
 /// Quotes top-level plain scalar values that YAML would misread: ones that
 /// contain `: ` or ` #`, or end with `:`. Quoted values, block scalars, flow
 /// collections and indented continuation lines are left alone.
@@ -348,6 +399,28 @@ mod tests {
         let again = AgentDefinition::parse(&text).unwrap();
         assert_eq!(def, again);
         assert!(text.contains("tools: Read, Write, Bash"));
+    }
+
+    #[test]
+    fn the_lead_preset_round_trips_and_keeps_the_contract() {
+        let lead = AgentDefinition::lead();
+        assert_eq!(lead.handle(), "lead");
+        assert_eq!(lead.frontmatter.permission_profile, "supervised");
+        let again = AgentDefinition::parse(&lead.render()).unwrap();
+        assert_eq!(lead, again, "renders and parses back unchanged");
+        for line in [
+            "**You own:**",
+            "**You review:**",
+            "**You never:**",
+            "**Done means:**",
+        ] {
+            assert!(lead.body.contains(line), "missing {line}");
+        }
+        assert!(
+            lead.body.contains("## Team"),
+            "Integrate has a section to fill"
+        );
+        assert!(lead.body.contains("write or edit code"));
     }
 
     #[test]

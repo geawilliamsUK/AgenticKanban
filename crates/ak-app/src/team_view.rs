@@ -145,6 +145,25 @@ impl AgentEditor {
         editor
     }
 
+    /// A new agent prefilled from a preset, ready to review and save.
+    pub fn new_from_preset(def: AgentDefinition) -> Self {
+        let handle = def.handle().to_string();
+        let mut editor = Self::from_definition(
+            &handle,
+            Some(def),
+            String::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            Vec::new(),
+            0.0,
+        );
+        editor.is_new = true;
+        editor.dirty = true;
+        editor
+    }
+
     pub fn pending(handle: &str) -> Self {
         let mut editor = Self::from_definition(
             handle,
@@ -321,6 +340,22 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui.button("New agent").clicked() {
                         app.actions.push(Action::OpenAgent(None));
+                    }
+                    let has_lead = app
+                        .board
+                        .active_agents()
+                        .any(|a| a.handle == AgentDefinition::LEAD);
+                    if !has_lead
+                        && ui
+                            .button("Add a lead")
+                            .on_hover_text(
+                                "A team lead that turns your Desk standups into tickets and \
+                                 assignments, keeps work moving and reports back. Review it, \
+                                 then save.",
+                            )
+                            .clicked()
+                    {
+                        app.actions.push(Action::NewLead);
                     }
                     if ui
                         .small_button("Import…")

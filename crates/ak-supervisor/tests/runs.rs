@@ -570,3 +570,56 @@ async fn guardrail_monitor_freezes_a_ping_pong_ticket() {
         "one trip, then the frozen ticket is left alone"
     );
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_activation_request_wakes_the_agent_with_its_reason() {
+    let f = fixture().await;
+    let store = f.project.store();
+    let scheduler = Scheduler::spawn(
+        f.project.clone(),
+        f.supervisor.clone(),
+        Arc::new(Semaphore::new(2)),
+        GlobalSettings::default(),
+    );
+    let mut notices = f.supervisor.subscribe();
+    // A request for another project is not this scheduler's.
+    f.supervisor.bridge().request_activation(
+        ak_core::ids::ProjectId::new(),
+        f.agent.actor_id,
+        f.project.human.id,
+        "not ours".into(),
+    );
+    f.supervisor.bridge().request_activation(
+        f.project.id(),
+        f.agent.actor_id,
+        f.project.human.id,
+        "@me asked: pick up the auth tickets".into(),
+    );
+    let ended = loop {
+        match tokio::time::timeout(Duration::from_secs(20), notices.recv()).await {
+            Ok(Ok(RunNotice::Ended { run, .. })) => break run,
+            Ok(Ok(_)) => {}
+            other => panic!("no run: {other:?}"),
+        }
+    };
+    match &ended.trigger {
+        RunTrigger::Activated { by, reason } => {
+            assert_eq!(*by, f.project.human.id);
+            assert_eq!(reason, "@me asked: pick up the auth tickets");
+        }
+        other => panic!("trigger {other:?}"),
+    }
+    let wake =
+        std::fs::read_to_string(f.paths.run_dir(f.project.id(), ended.id).join("wake.md")).unwrap();
+    assert!(wake.contains("pick up the auth tickets"), "{wake}");
+    assert_eq!(
+        store
+            .runs_for_agent(f.agent.actor_id, 10)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "one activation, one run"
+    );
+    scheduler.shutdown();
+}

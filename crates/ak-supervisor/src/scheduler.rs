@@ -126,8 +126,18 @@ impl Scheduler {
                         }
                     }
                     ev = bridge_events.recv() => {
-                        if let Ok(ak_bridge::BridgeEvent::RunGuardrail { run_id, agent_id, reason }) = ev {
-                            this.guardrail_stop(agent_id, run_id, reason).await;
+                        match ev {
+                            Ok(ak_bridge::BridgeEvent::RunGuardrail { run_id, agent_id, reason }) => {
+                                this.guardrail_stop(agent_id, run_id, reason).await;
+                            }
+                            // Every project's scheduler hears every request; only the
+                            // target's own one acts on it.
+                            Ok(ak_bridge::BridgeEvent::ActivationRequested { project: p, agent_id, by, reason })
+                                if p == project.id() =>
+                            {
+                                this.activate(agent_id, by, reason);
+                            }
+                            _ => {}
                         }
                         continue;
                     }
