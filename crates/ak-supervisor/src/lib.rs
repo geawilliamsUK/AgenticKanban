@@ -12,7 +12,8 @@ pub mod guardrails;
 pub mod prompts;
 pub mod scheduler;
 pub mod supervisor;
-pub mod usage;
+/// The tracker lives in the runtime so the bridge can read it too.
+pub use ak_runtime::usage;
 pub mod workspace;
 
 use std::path::PathBuf;

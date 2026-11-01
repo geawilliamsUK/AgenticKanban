@@ -91,6 +91,9 @@ struct Inner {
     approval_timeout: Duration,
     /// The last tool call per run and how many times in a row it was made.
     repeats: Mutex<HashMap<RunId, (String, u32)>>,
+    /// The subscription's usage, for usage_get; set once the supervisor
+    /// exists.
+    usage: std::sync::OnceLock<Arc<ak_runtime::UsageTracker>>,
 }
 
 /// A cheap handle to the running bridge.
@@ -128,6 +131,7 @@ impl Bridge {
                 events,
                 approval_timeout,
                 repeats: Mutex::new(HashMap::new()),
+                usage: std::sync::OnceLock::new(),
             }),
         }
     }
@@ -280,6 +284,15 @@ impl Bridge {
             agent_id,
             halt,
         });
+    }
+
+    /// Gives the board's usage_get the account's usage tracker.
+    pub fn set_usage(&self, usage: Arc<ak_runtime::UsageTracker>) {
+        let _ = self.inner.usage.set(usage);
+    }
+
+    pub fn usage(&self) -> Option<Arc<ak_runtime::UsageTracker>> {
+        self.inner.usage.get().cloned()
     }
 
     /// Asks the agent's project scheduler to hand its run a message.

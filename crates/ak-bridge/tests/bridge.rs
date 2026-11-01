@@ -1036,3 +1036,65 @@ async fn the_desk_manages_the_team_and_the_settings_and_agents_cannot() {
         .unwrap()
         .is_retired());
 }
+
+#[tokio::test]
+async fn usage_get_reports_the_windows_and_who_used_them() {
+    let f = fixture(0, Duration::from_secs(5)).await;
+    let (_, text) = call(&f, "usage_get", json!({})).await;
+    assert!(text.contains("not tracked"), "{text}");
+
+    let tmp = tempfile::tempdir().unwrap();
+    let tracker = Arc::new(ak_runtime::UsageTracker::load(
+        tmp.path().join("usage.json"),
+    ));
+    let now = chrono::Utc::now();
+    let resets = (now + chrono::Duration::hours(2)).timestamp();
+    tracker.observe(
+        ak_core::usage::UsageSnapshot::from_rate_limit_info(
+            &json!({"status": "allowed", "unifiedWindows": {
+                "five_hour": {"utilization": 0.62, "resetsAt": resets},
+                "seven_day": {"utilization": 0.8, "resetsAt": resets + 3 * 86400}}}),
+            now,
+        )
+        .unwrap(),
+    );
+    // A learned rate: 2% of the 5-hour window per dollar.
+    let sample = ak_core::usage::RunUsage {
+        model: Some("sonnet".into()),
+        before: [(
+            ak_core::usage::Window::FiveHour,
+            ak_core::usage::WindowUsage {
+                used: 0.1,
+                resets_at: None,
+            },
+        )]
+        .into(),
+        after: [(
+            ak_core::usage::Window::FiveHour,
+            ak_core::usage::WindowUsage {
+                used: 0.14,
+                resets_at: None,
+            },
+        )]
+        .into(),
+        solo: true,
+    };
+    tracker.set_calibration(ak_core::usage::Calibration::fit([(&sample, 2.0)]));
+    f.bridge.set_usage(tracker);
+    let mut run = ak_core::run::AgentRun::start(
+        f.agent.actor_id,
+        ak_core::run::RunTrigger::Manual,
+        "w".into(),
+        now - chrono::Duration::minutes(30),
+    );
+    run.cost_usd = Some(1.5);
+    run.ended_at = Some(now);
+    f.project.store().insert_run(&run).await.unwrap();
+
+    let (err, text) = call(&f, "usage_get", json!({})).await;
+    assert!(!err, "{text}");
+    assert!(text.contains("5-hour: 62% used"), "{text}");
+    assert!(text.contains("new runs hold at 90%"), "{text}");
+    assert!(text.contains("Week: 80% used"), "{text}");
+    assert!(text.contains("@backend: ≈3.0% of the 5-hour"), "{text}");
+}

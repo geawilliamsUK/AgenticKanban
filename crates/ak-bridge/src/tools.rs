@@ -362,6 +362,11 @@ const SPECS: &[ToolSpec] = &[
         schema: schema::<ThreadPostInput>,
     },
     ToolSpec {
+        name: "usage_get",
+        description: "The human's Claude subscription right now: how much of the 5-hour window and the week is used, when each resets, where new runs are held, and roughly how much each teammate's runs used. Check it before planning a large batch of work.",
+        schema: schema::<Empty>,
+    },
+    ToolSpec {
         name: "agent_activate",
         description: "Wake another agent now, with the reason they will be told. Assigning a ticket or @mentioning on one already wakes them; use this when there is no ticket change to react to.",
         schema: schema::<AgentActivateInput>,
@@ -392,6 +397,85 @@ fn specs<'a>(specs: impl Iterator<Item = &'a ToolSpec>) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+/// What usage_get says: each window, its reset and hold, and each agent's
+/// estimated share of the current period of each window.
+fn usage_report(
+    snapshot: &ak_core::usage::UsageSnapshot,
+    holds: &ak_core::usage::UsageHolds,
+    calibration: &ak_core::usage::Calibration,
+    runs: &[ak_core::run::AgentRun],
+    handle: impl Fn(ActorId) -> String,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    use ak_core::usage::Window;
+    let mut out = format!(
+        "Subscription usage, reported {} min ago:\n",
+        (now - snapshot.observed_at).num_minutes().max(0)
+    );
+    if snapshot.is_rejected(now) {
+        out.push_str("- A limit is reached: nothing will run until it resets.\n");
+    }
+    for w in Window::ALL {
+        let Some(u) = snapshot.windows.get(&w) else {
+            continue;
+        };
+        let resets = u
+            .resets_at
+            .filter(|t| *t > now)
+            .map(|t| format!(", resets {}", t.format("%a %H:%M UTC")))
+            .unwrap_or_default();
+        let hold = match holds.threshold(w) {
+            0 => String::new(),
+            n => format!("; new runs hold at {n}%"),
+        };
+        out.push_str(&format!(
+            "- {}: {:.0}% used{resets}{hold}\n",
+            w.label(),
+            u.current(now) * 100.0
+        ));
+    }
+    let mut lines = Vec::new();
+    let mut agents: Vec<ActorId> = runs.iter().map(|r| r.agent_id).collect();
+    agents.sort();
+    agents.dedup();
+    for agent in agents {
+        let mut parts = Vec::new();
+        for w in [Window::FiveHour, Window::Week] {
+            let Some(start) = snapshot.windows.get(&w).and_then(|u| u.period_start(w)) else {
+                continue;
+            };
+            let est = calibration.estimate_total(
+                runs.iter()
+                    .filter(|r| r.agent_id == agent && r.started_at >= start)
+                    .filter_map(|r| {
+                        Some((
+                            r.usage.as_ref().and_then(|u| u.model.as_deref()),
+                            r.cost_usd?,
+                        ))
+                    }),
+            );
+            if let Some(v) = est.get(&w) {
+                parts.push(format!(
+                    "≈{:.1}% of the {}",
+                    v * 100.0,
+                    w.label().to_lowercase()
+                ));
+            }
+        }
+        if !parts.is_empty() {
+            lines.push(format!("- @{}: {}", handle(agent), parts.join(", ")));
+        }
+    }
+    if lines.is_empty() {
+        out.push_str("Per-teammate shares: not known yet; they appear once a few runs have finished on their own.\n");
+    } else {
+        out.push_str("Per-teammate shares this period (estimated from each run's cost):\n");
+        out.push_str(&lines.join("\n"));
+        out.push('\n');
+    }
+    out
 }
 
 /// Runs one tool as the run's agent.
@@ -849,6 +933,31 @@ async fn run(
             Ok(format!(
                 "posted in thread {} (message id {})",
                 thread_id, message.id
+            ))
+        }
+        "usage_get" => {
+            let Some(tracker) = bridge.usage() else {
+                return Ok("usage is not tracked in this session".into());
+            };
+            let Some(snapshot) = tracker.latest() else {
+                return Ok("no usage reported yet: it arrives with the next run".into());
+            };
+            let now = chrono::Utc::now();
+            let snap = Snapshot::load(store.as_ref()).await?;
+            let mut since = now;
+            for w in ak_core::usage::Window::ALL {
+                if let Some(start) = snapshot.windows.get(&w).and_then(|u| u.period_start(w)) {
+                    since = since.min(start);
+                }
+            }
+            let runs = store.runs_since(since).await?;
+            Ok(usage_report(
+                &snapshot,
+                &tracker.holds(),
+                &tracker.calibration(),
+                &runs,
+                |id| snap.handle(id),
+                now,
             ))
         }
         "agent_activate" => {

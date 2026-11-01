@@ -26,6 +26,10 @@ pub struct Budgets {
     pub max_usd_per_run: Option<f64>,
     pub max_usd_per_day: Option<f64>,
     pub max_wall_clock_minutes: Option<u32>,
+    /// The share of the subscription's 5-hour window, in percent, the
+    /// agent's runs may use in one window (estimated from their cost).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_five_hour_pct: Option<u32>,
 }
 
 impl Budgets {
@@ -166,7 +170,8 @@ Integrate fills this in once other agents exist.\n\n\
 ## How you run the team\n\n\
 1. Read why you were woken: inbox_list, then the brief (thread_read) and the board (ticket_list, \
 team_list).\n\
-2. Plan. Split each goal into tickets small enough for one specialist. A ticket says what and \
+2. Plan. Check usage_get first: when the 5-hour window or the week is high, plan less, keep the \
+most important work, and say why in your report. Split each goal into tickets small enough for one specialist. A ticket says what and \
 why, has acceptance criteria, and names anything the assignee must not touch. Reuse existing \
 tickets rather than duplicating them.\n\
 3. Assign each ticket to the teammate whose description fits it best (team_list). Assigning \

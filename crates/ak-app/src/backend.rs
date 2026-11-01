@@ -953,6 +953,10 @@ impl Backend {
             runs.iter()
                 .filter_map(|r| Some((r.usage.as_ref()?, r.cost_usd?))),
         );
+        if let Some(s) = &self.supervisor {
+            s.usage().set_calibration(self.calibration.clone());
+            s.usage().set_holds(self.settings.usage_holds);
+        }
         self.send_usage();
     }
 
@@ -1776,6 +1780,9 @@ impl Backend {
             .update_settings(settings.clone())
             .map_err(|e| e.to_string())?;
         self.settings = settings.clone();
+        if let Some(s) = &self.supervisor {
+            s.usage().set_holds(self.settings.usage_holds);
+        }
         self.runner = (self.runner_factory)(&self.settings);
         self.utility_slots = Arc::new(Semaphore::new(
             self.settings.max_concurrent_utility_calls.max(1) as usize,

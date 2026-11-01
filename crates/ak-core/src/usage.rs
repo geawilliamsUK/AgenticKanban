@@ -89,6 +89,23 @@ impl WindowUsage {
     }
 }
 
+impl Window {
+    /// How long one period of the window lasts.
+    pub fn period(&self) -> chrono::Duration {
+        match self {
+            Window::FiveHour => chrono::Duration::hours(5),
+            Window::Week | Window::WeekFable => chrono::Duration::days(7),
+        }
+    }
+}
+
+impl WindowUsage {
+    /// When the current period began, from its reset time.
+    pub fn period_start(&self, window: Window) -> Option<Timestamp> {
+        self.resets_at.map(|t| t - window.period())
+    }
+}
+
 /// The account's windows as last reported.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageSnapshot {
@@ -217,6 +234,27 @@ impl UsageSnapshot {
 
     pub fn is_rejected(&self, now: Timestamp) -> bool {
         self.rejected_until.is_some_and(|t| t > now)
+    }
+
+    /// One line for a prompt: each window's use and when it resets.
+    pub fn summary(&self, now: Timestamp) -> String {
+        let parts: Vec<String> = Window::ALL
+            .into_iter()
+            .filter_map(|w| {
+                let u = self.windows.get(&w)?;
+                let resets = u
+                    .resets_at
+                    .filter(|t| *t > now)
+                    .map(|t| format!(", resets {}", t.format("%a %H:%M UTC")))
+                    .unwrap_or_default();
+                Some(format!(
+                    "{} {:.0}%{resets}",
+                    w.label(),
+                    u.current(now) * 100.0
+                ))
+            })
+            .collect();
+        parts.join("; ")
     }
 }
 
@@ -442,7 +480,7 @@ impl Default for UsageHolds {
 }
 
 impl UsageHolds {
-    fn threshold(&self, window: Window) -> u32 {
+    pub fn threshold(&self, window: Window) -> u32 {
         match window {
             Window::FiveHour => self.five_hour_pct,
             Window::Week => self.week_pct,
@@ -682,6 +720,21 @@ mod tests {
         assert!(Calibration::default()
             .estimate_total([(Some("sonnet"), 1.0)])
             .is_empty());
+    }
+
+    #[test]
+    fn a_summary_and_period_starts_read_from_the_windows() {
+        let now = ts(1793400000);
+        let s = UsageSnapshot::from_rate_limit_info(&fable_event(), now).unwrap();
+        let line = s.summary(now);
+        assert!(line.starts_with("5-hour 1%, resets "), "{line}");
+        assert!(line.contains("Week 78%"), "{line}");
+        assert!(line.contains("Fable week 10%"), "{line}");
+        let five = s.windows[&Window::FiveHour];
+        assert_eq!(
+            five.period_start(Window::FiveHour),
+            Some(ts(1793408400 - 5 * 3600))
+        );
     }
 
     #[test]

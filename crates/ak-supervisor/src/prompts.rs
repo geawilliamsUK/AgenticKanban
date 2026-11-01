@@ -23,6 +23,8 @@ pub struct PromptContext<'a> {
     pub push_allowed: bool,
     /// The branch ticket branches start from; None means the default branch.
     pub integration_branch: Option<&'a str>,
+    /// The subscription's windows when the agent woke, if known.
+    pub usage: Option<&'a str>,
 }
 
 /// The appended system prompt: definition body, memory, roster, conventions.
@@ -102,6 +104,13 @@ is unfinished); then stop. If there is nothing to do, say so in one line and sto
             "Never push."
         },
     ));
+    if let Some(usage) = ctx.usage.filter(|u| !u.is_empty()) {
+        out.push_str(&format!(
+            "\n## The human's subscription when you woke\n\n{usage}.\n\
+Every run spends it. When a window is high, finish what you started, skip optional work, and \
+say so in your report; usage_get has the current figures and each teammate's share.\n"
+        ));
+    }
     out
 }
 
@@ -268,6 +277,7 @@ mod tests {
             workspace: &ws,
             push_allowed: false,
             integration_branch: Some("develop"),
+            usage: Some("5-hour 62%, resets Sat 14:00 UTC; Week 80%"),
         });
         for needle in [
             "**You own:**",
@@ -281,6 +291,8 @@ mod tests {
             "git checkout agent/backend",
             "Never push.",
             "memory_update",
+            "5-hour 62%",
+            "usage_get",
         ] {
             assert!(text.contains(needle), "missing {needle:?}");
         }

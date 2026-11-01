@@ -110,6 +110,7 @@ pub struct AgentEditor {
     pub max_usd_run: String,
     pub max_usd_day: String,
     pub wall_clock: String,
+    pub five_hour_pct: String,
     pub extra: BTreeMap<String, ak_core::serde_norway::Value>,
     pub body: String,
     pub memory: String,
@@ -207,6 +208,7 @@ impl AgentEditor {
             max_usd_run: money(budgets.max_usd_per_run),
             max_usd_day: money(budgets.max_usd_per_day),
             wall_clock: num(budgets.max_wall_clock_minutes),
+            five_hour_pct: num(budgets.max_five_hour_pct),
             extra: def.frontmatter.extra.clone(),
             body: def.body.clone(),
             memory,
@@ -247,6 +249,10 @@ impl AgentEditor {
             .max_wall_clock_minutes
             .map(|n| n.to_string())
             .unwrap_or_default();
+        self.five_hour_pct = budgets
+            .max_five_hour_pct
+            .map(|n| n.to_string())
+            .unwrap_or_default();
         self.extra = def.frontmatter.extra.clone();
         self.body = def.body.clone();
     }
@@ -280,6 +286,7 @@ impl AgentEditor {
             max_usd_per_run: parse_f64(&self.max_usd_run, "Max USD per run")?,
             max_usd_per_day: parse_f64(&self.max_usd_day, "Max USD per day")?,
             max_wall_clock_minutes: parse_u32(&self.wall_clock, "Max minutes per run")?,
+            max_five_hour_pct: parse_u32(&self.five_hour_pct, "Max % of the 5-hour window")?,
         };
         let model = self.model.trim();
         // A new agent's body was templated before the handle was typed.
@@ -789,6 +796,7 @@ fn draw_editor(app: &mut App, ui: &mut egui::Ui, project: ak_core::ids::ProjectI
                                 ("USD/run", &mut editor.max_usd_run),
                                 ("USD/day", &mut editor.max_usd_day),
                                 ("min/run", &mut editor.wall_clock),
+                                ("% of 5h", &mut editor.five_hour_pct),
                             ] {
                                 ui.weak(label);
                                 let r = ui.add(

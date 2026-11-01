@@ -90,6 +90,7 @@ async fn agent_completes_an_assigned_ticket() {
         max_usd_per_run: Some(1.5),
         max_usd_per_day: None,
         max_wall_clock_minutes: Some(8),
+        max_five_hour_pct: None,
     });
     def.body = BODY.into();
     project.agents.write_definition(&def).unwrap();

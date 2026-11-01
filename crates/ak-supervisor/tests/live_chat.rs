@@ -75,6 +75,7 @@ async fn agent_answers_a_direct_message() {
         max_usd_per_run: Some(1.0),
         max_usd_per_day: None,
         max_wall_clock_minutes: Some(6),
+        max_five_hour_pct: None,
     });
     def.body = BODY.into();
     project.agents.write_definition(&def).unwrap();

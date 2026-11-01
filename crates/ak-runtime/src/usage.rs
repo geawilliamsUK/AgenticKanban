@@ -10,7 +10,7 @@ use std::path::PathBuf;
 use std::sync::Mutex;
 
 use ak_core::ids::RunId;
-use ak_core::usage::{UsageSnapshot, Window, WindowUsage};
+use ak_core::usage::{Calibration, UsageHolds, UsageSnapshot, Window, WindowUsage};
 use ak_core::Timestamp;
 use tokio::sync::watch;
 
@@ -21,6 +21,10 @@ const FRESH_FOR: chrono::Duration = chrono::Duration::minutes(10);
 pub struct UsageTracker {
     file: PathBuf,
     state: Mutex<State>,
+    /// The rates that turn a run's cost into shares, and the holds in
+    /// force, as the app last set them; for the board's usage_get.
+    calibration: Mutex<Calibration>,
+    holds: Mutex<UsageHolds>,
     tx: watch::Sender<Option<UsageSnapshot>>,
 }
 
@@ -44,7 +48,25 @@ impl UsageTracker {
                 active: HashMap::new(),
             }),
             tx,
+            calibration: Mutex::new(Calibration::default()),
+            holds: Mutex::new(UsageHolds::default()),
         }
+    }
+
+    pub fn set_calibration(&self, c: Calibration) {
+        *self.calibration.lock().expect("usage") = c;
+    }
+
+    pub fn calibration(&self) -> Calibration {
+        self.calibration.lock().expect("usage").clone()
+    }
+
+    pub fn set_holds(&self, h: UsageHolds) {
+        *self.holds.lock().expect("usage") = h;
+    }
+
+    pub fn holds(&self) -> UsageHolds {
+        *self.holds.lock().expect("usage")
     }
 
     pub fn latest(&self) -> Option<UsageSnapshot> {

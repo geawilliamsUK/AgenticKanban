@@ -12,6 +12,7 @@ pub mod instance;
 pub mod paths;
 pub mod registry;
 pub mod snapshot;
+pub mod usage;
 pub mod utility;
 
 pub use agents::{AgentFiles, AgentWatcher, ReconcileReport};
@@ -19,6 +20,7 @@ pub use claude::ClaudeProbe;
 pub use error::RuntimeError;
 pub use paths::HomePaths;
 pub use registry::{OpenProject, ProjectRegistry};
+pub use usage::UsageTracker;
 pub use utility::{ClaudeCodeRunner, FakeRunner, UtilityOutput, UtilityRequest, UtilityRunner};
 
 pub type Result<T> = std::result::Result<T, RuntimeError>;

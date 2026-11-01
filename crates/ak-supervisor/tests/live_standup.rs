@@ -42,6 +42,7 @@ fn haiku(def: &mut AgentDefinition) {
         max_usd_per_run: Some(1.0),
         max_usd_per_day: None,
         max_wall_clock_minutes: Some(8),
+        max_five_hour_pct: None,
     });
 }
 

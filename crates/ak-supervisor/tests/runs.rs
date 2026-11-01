@@ -787,3 +787,100 @@ async fn a_message_through_the_bridge_reaches_the_running_agent() {
     );
     scheduler.shutdown();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_agent_past_its_share_of_the_five_hour_window_waits() {
+    let f = fixture().await;
+    let store = f.project.store();
+    // Cap @backend at 5% of the window.
+    let mut def = f.project.agents.read_definition("backend").unwrap();
+    def.frontmatter.budgets = Some(ak_core::agent::Budgets {
+        max_five_hour_pct: Some(5),
+        ..Default::default()
+    });
+    f.project.agents.write_definition(&def).unwrap();
+    ak_runtime::agents::reconcile(&f.project.agents, f.project.store.as_ref())
+        .await
+        .unwrap();
+
+    let now = Utc::now();
+    let tracker = f.supervisor.usage();
+    tracker.observe(
+        UsageSnapshot::from_rate_limit_info(
+            &serde_json::json!({"status": "allowed", "unifiedWindows": {
+                "five_hour": {"utilization": 0.3, "resetsAt": (now + chrono::Duration::hours(2)).timestamp()}}}),
+            now,
+        )
+        .unwrap(),
+    );
+    // 2% of the window per dollar, and a $4 run this period: about 8%.
+    let sample = ak_core::usage::RunUsage {
+        model: None,
+        before: [(
+            Window::FiveHour,
+            ak_core::usage::WindowUsage {
+                used: 0.1,
+                resets_at: None,
+            },
+        )]
+        .into(),
+        after: [(
+            Window::FiveHour,
+            ak_core::usage::WindowUsage {
+                used: 0.14,
+                resets_at: None,
+            },
+        )]
+        .into(),
+        solo: true,
+    };
+    tracker.set_calibration(ak_core::usage::Calibration::fit([(&sample, 2.0)]));
+    let mut earlier = ak_core::run::AgentRun::start(
+        f.agent.actor_id,
+        RunTrigger::Manual,
+        "w".into(),
+        now - chrono::Duration::minutes(40),
+    );
+    earlier.cost_usd = Some(4.0);
+    earlier.ended_at = Some(now - chrono::Duration::minutes(10));
+    earlier.exit_reason = Some(ExitReason::Completed);
+    store.insert_run(&earlier).await.unwrap();
+
+    let scheduler = Scheduler::spawn(
+        f.project.clone(),
+        f.supervisor.clone(),
+        Arc::new(Semaphore::new(2)),
+        GlobalSettings::default(),
+    );
+    scheduler.set_paused(true);
+    let columns = store.columns().await.unwrap();
+    store
+        .create_ticket(
+            NewTicket {
+                title: "Do it".into(),
+                column_id: columns[1].id,
+                assignee_id: Some(f.agent.actor_id),
+                ..Default::default()
+            },
+            f.project.human.id,
+        )
+        .await
+        .unwrap();
+    scheduler.set_paused(false);
+    scheduler.tick().await.unwrap();
+    assert!(store.active_runs().await.unwrap().is_empty(), "held");
+    let held = store
+        .scheduler_decisions_since(now - chrono::Duration::hours(1))
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|d| d.reason == SkipReason::UsageLimit)
+        .expect("the cap is recorded");
+    assert!(
+        held.detail
+            .contains("has used about 8% of this 5-hour window, its cap is 5%"),
+        "{}",
+        held.detail
+    );
+    scheduler.shutdown();
+}

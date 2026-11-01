@@ -56,6 +56,9 @@ pub struct AgentUpdateInput {
     pub max_usd_per_run: Option<f64>,
     pub max_usd_per_day: Option<f64>,
     pub max_wall_clock_minutes: Option<u32>,
+    /// The share of the 5-hour subscription window, in percent, its runs may
+    /// use per window; 0 clears it.
+    pub max_five_hour_pct: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -268,6 +271,7 @@ async fn run_inner(
                     input.max_wall_clock_minutes,
                     budgets.max_wall_clock_minutes,
                 ),
+                max_five_hour_pct: positive_u(input.max_five_hour_pct, budgets.max_five_hour_pct),
             };
             def.frontmatter.budgets = (!budgets.is_empty()).then_some(budgets);
             save(ctx, &def).await?;

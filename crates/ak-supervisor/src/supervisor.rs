@@ -188,6 +188,7 @@ impl Supervisor {
     pub fn new(bridge: Bridge, paths: HomePaths, config: SupervisorConfig) -> Self {
         let (notices, _) = broadcast::channel(1024);
         let usage = Arc::new(UsageTracker::load(paths.usage_file()));
+        bridge.set_usage(usage.clone());
         Self {
             bridge,
             paths,
@@ -390,6 +391,7 @@ impl Supervisor {
         let roster = roster(store.as_ref(), spec.agent.actor_id).await?;
         let columns = store.columns().await?;
         let policy = project.policy();
+        let usage_line = self.usage.latest().map(|u| u.summary(Utc::now()));
         Ok(prompts::system_prompt(&PromptContext {
             agent: &spec.agent,
             definition_body: &definition.body,
@@ -399,6 +401,7 @@ impl Supervisor {
             workspace: &spec.workspace,
             push_allowed: policy.push_policy == ak_core::config::PushPolicy::Allowed,
             integration_branch: policy.integration_branch.as_deref(),
+            usage: usage_line.as_deref(),
         }))
     }
 }

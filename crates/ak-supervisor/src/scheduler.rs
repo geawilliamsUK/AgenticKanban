@@ -465,6 +465,53 @@ impl Scheduler {
                 continue;
             }
 
+            // The agent's own cap on the 5-hour window, from its runs this
+            // period and the learned rate; unknown until a rate exists.
+            if let Some(cap) = agent
+                .budgets
+                .as_ref()
+                .and_then(|b| b.max_five_hour_pct)
+                .filter(|c| *c > 0)
+            {
+                let tracker = self.inner.supervisor.usage();
+                let start = tracker.latest().and_then(|s| {
+                    s.windows
+                        .get(&ak_core::usage::Window::FiveHour)
+                        .and_then(|w| w.period_start(ak_core::usage::Window::FiveHour))
+                });
+                if let Some(start) = start {
+                    let runs: Vec<_> = store
+                        .runs_since(start)
+                        .await?
+                        .into_iter()
+                        .filter(|r| r.agent_id == agent.actor_id)
+                        .collect();
+                    let used = tracker
+                        .calibration()
+                        .estimate_total(runs.iter().filter_map(|r| {
+                            Some((
+                                r.usage.as_ref().and_then(|u| u.model.as_deref()),
+                                r.cost_usd?,
+                            ))
+                        }))
+                        .get(&ak_core::usage::Window::FiveHour)
+                        .copied();
+                    if let Some(used) = used.filter(|u| u * 100.0 >= cap as f64) {
+                        self.skip(
+                            &agent,
+                            SkipReason::UsageLimit,
+                            format!(
+                                "{waiting}; @{} has used about {:.0}% of this 5-hour window, its cap is {cap}%",
+                                agent.handle,
+                                used * 100.0
+                            ),
+                        )
+                        .await;
+                        continue;
+                    }
+                }
+            }
+
             // Subscription windows. The timer tick picks the agent up again
             // once a window resets.
             let model = agent.model.clone().or_else(|| policy.default_model.clone());
