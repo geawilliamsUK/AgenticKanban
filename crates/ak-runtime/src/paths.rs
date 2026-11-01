@@ -91,6 +91,11 @@ impl HomePaths {
         self.project_dir(id).join("desk")
     }
 
+    /// The Global Desk: its database, memory and sessions.
+    pub fn global_desk_dir(&self) -> PathBuf {
+        self.root.join("desk")
+    }
+
     pub fn desk_memory_file(&self, id: ProjectId) -> PathBuf {
         self.desk_dir(id).join("memory.md")
     }

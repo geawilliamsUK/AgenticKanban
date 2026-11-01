@@ -18,7 +18,7 @@ pub mod workspace;
 
 use std::path::PathBuf;
 
-pub use desk::{DeskHost, DeskNotice, DeskStatus};
+pub use desk::{DeskHost, DeskNotice, DeskScope, DeskStatus};
 pub use guardrails::GuardrailMonitor;
 pub use scheduler::Scheduler;
 pub use supervisor::{

@@ -36,6 +36,60 @@ use crate::prompts::{self, DeskPromptContext};
 use crate::supervisor::{rate_limit_snapshot, roster, Supervisor};
 use crate::SupervisorError;
 
+/// The id Desk notices and requests use for the Global Desk, which belongs
+/// to no one project.
+pub const GLOBAL: ProjectId = ProjectId::from_uuid(uuid::Uuid::nil());
+
+/// Where a Desk session belongs: one project, or all of them.
+#[derive(Clone)]
+pub enum DeskScope {
+    Project(Arc<OpenProject>),
+    /// Every project at once. Its sessions live in a store of their own,
+    /// and it reaches each project's board through a server named for it.
+    Global {
+        store: Arc<dyn ak_store::Store>,
+        projects: Vec<Arc<OpenProject>>,
+    },
+}
+
+impl DeskScope {
+    pub fn store(&self) -> Arc<dyn ak_store::Store> {
+        match self {
+            DeskScope::Project(p) => p.store(),
+            DeskScope::Global { store, .. } => store.clone(),
+        }
+    }
+
+    /// The project id its notices carry: the project's, or `GLOBAL`.
+    pub fn id(&self) -> ProjectId {
+        match self {
+            DeskScope::Project(p) => p.id(),
+            DeskScope::Global { .. } => GLOBAL,
+        }
+    }
+}
+
+impl From<Arc<OpenProject>> for DeskScope {
+    fn from(p: Arc<OpenProject>) -> Self {
+        DeskScope::Project(p)
+    }
+}
+
+/// The MCP server name for a project's board in the Global Desk:
+/// `board-` and the project's name, lowercased, with runs of anything but
+/// letters and digits as one hyphen.
+pub fn board_server(project_name: &str) -> String {
+    let slug: String = project_name
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect::<String>()
+        .split('-')
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join("-");
+    format!("board-{}", if slug.is_empty() { "project".into() } else { slug })
+}
+
 /// An idle process is closed after this; the next message resumes it.
 const IDLE_CLOSE: Duration = Duration::from_secs(30 * 60);
 
@@ -133,22 +187,23 @@ impl DeskHost {
     /// being written waits its turn.
     pub async fn send(
         self: &Arc<Self>,
-        project: Arc<OpenProject>,
+        project: impl Into<DeskScope>,
         id: DeskSessionId,
         text: String,
     ) -> Result<(), SupervisorError> {
-        self.send_as(project, id, text, None).await
+        self.send_as(project.into(), id, text, None).await
     }
 
     /// Like `send`, but the transcript shows `shown` (a command as typed)
     /// while Claude Code receives `text` (what the command expands to).
     pub async fn send_as(
         self: &Arc<Self>,
-        project: Arc<OpenProject>,
+        project: impl Into<DeskScope>,
         id: DeskSessionId,
         text: String,
         shown: Option<String>,
     ) -> Result<(), SupervisorError> {
+        let project: DeskScope = project.into();
         let store = project.store();
         let mut session = store.desk_session(id).await?;
         let now = Utc::now();
@@ -186,12 +241,13 @@ impl DeskHost {
     /// left as it was.
     pub async fn edit(
         self: &Arc<Self>,
-        project: Arc<OpenProject>,
+        project: impl Into<DeskScope>,
         id: DeskSessionId,
         seq: i64,
         text: String,
         shown: Option<String>,
     ) -> Result<(), SupervisorError> {
+        let project: DeskScope = project.into();
         let store = project.store();
         let entries = store.desk_entries(id).await?;
         let Some(target) = entries.iter().find(|e| e.seq == seq) else {
@@ -249,11 +305,12 @@ impl DeskHost {
     /// prompt.
     pub async fn deliver_update(
         self: &Arc<Self>,
-        project: Arc<OpenProject>,
+        project: impl Into<DeskScope>,
         id: DeskSessionId,
         update: Value,
         prompt: Option<String>,
     ) -> Result<(), SupervisorError> {
+        let project: DeskScope = project.into();
         let store = project.store();
         let entry = store
             .append_desk_entry(id, DeskEntryKind::TeamUpdate, update, Utc::now())
@@ -322,71 +379,133 @@ impl DeskHost {
 
     async fn spawn(
         self: &Arc<Self>,
-        project: &Arc<OpenProject>,
+        project: &DeskScope,
         session: &DeskSession,
     ) -> Result<mpsc::UnboundedSender<Command>, SupervisorError> {
         let sup = &self.supervisor;
         let config = sup.config();
         let binary = config.binary.clone().map_err(SupervisorError::Spawn)?;
         let paths = sup.paths();
-        let dir = paths
-            .desk_dir(project.id())
-            .join("sessions")
-            .join(session.id.to_string());
+        let home = match project {
+            DeskScope::Project(p) => paths.desk_dir(p.id()),
+            DeskScope::Global { .. } => paths.global_desk_dir(),
+        };
+        let dir = home.join("sessions").join(session.id.to_string());
         std::fs::create_dir_all(&dir).map_err(|e| SupervisorError::io(&dir, e))?;
-        let store = project.store();
-
-        let memory_file = paths.desk_memory_file(project.id());
+        let memory_file = home.join("memory.md");
         let memory = std::fs::read_to_string(&memory_file).unwrap_or_default();
-        let roster = roster(store.as_ref(), project.human.id).await?;
-        let columns = store.columns().await?;
-        let system = prompts::desk_prompt(&DeskPromptContext {
-            project_name: &project.entry.name,
-            human_handle: &project.human.handle,
-            memory: &memory,
-            roster: &roster,
-            columns: &columns,
-            repo_path: &project.entry.path,
-        });
-        let system_file = dir.join("system.md");
-        std::fs::write(&system_file, &system).map_err(|e| SupervisorError::io(&system_file, e))?;
-
-        let policy = project.policy();
-        let profile = policy
-            .permission_profiles
-            .iter()
-            .find(|p| p.name == policy.desk_permission_profile)
-            .cloned()
-            .unwrap_or_else(|| {
-                PermissionProfile::defaults()
-                    .into_iter()
-                    .next()
-                    .expect("a default profile")
-            });
         let run_key = RunId::from_uuid(session.id.as_uuid());
-        let token = sup.bridge().register_run(RunContext {
-            project: project.clone(),
-            agent: Agent::stand_in_for(&project.human, memory_file.clone()),
-            run_id: run_key,
-            profile: profile.clone(),
-            desk_memory: Some(memory_file),
-            policy_file: Some(paths.project_policy_file(project.id())),
-        });
+
+        // A Desk acts as the human in each project it reaches, under that
+        // project's Desk permission profile, through one board server each.
+        let desk_context = |p: &Arc<OpenProject>| {
+            let policy = p.policy();
+            let profile = policy
+                .permission_profiles
+                .iter()
+                .find(|x| x.name == policy.desk_permission_profile)
+                .cloned()
+                .unwrap_or_else(|| {
+                    PermissionProfile::defaults()
+                        .into_iter()
+                        .next()
+                        .expect("a default profile")
+                });
+            RunContext {
+                project: p.clone(),
+                agent: Agent::stand_in_for(&p.human, memory_file.clone()),
+                run_id: run_key,
+                profile,
+                desk_memory: Some(memory_file.clone()),
+                policy_file: Some(paths.project_policy_file(p.id())),
+            }
+        };
+        let (system, servers, cwd, strict) = match project {
+            DeskScope::Project(p) => {
+                let store = p.store();
+                let roster = roster(store.as_ref(), p.human.id).await?;
+                let columns = store.columns().await?;
+                let system = prompts::desk_prompt(&DeskPromptContext {
+                    project_name: &p.entry.name,
+                    human_handle: &p.human.handle,
+                    memory: &memory,
+                    roster: &roster,
+                    columns: &columns,
+                    repo_path: &p.entry.path,
+                });
+                let token = sup.bridge().register_run(desk_context(p));
+                (
+                    system,
+                    vec![("board".to_string(), token)],
+                    p.entry.path.clone(),
+                    !p.policy().allow_project_mcp,
+                )
+            }
+            DeskScope::Global { projects, .. } => {
+                if projects.is_empty() {
+                    return Err(SupervisorError::Other(
+                        "the Global Desk needs at least one project".into(),
+                    ));
+                }
+                let mut boards = Vec::new();
+                let mut servers = Vec::new();
+                for p in projects {
+                    // Two projects whose names read the same get numbered.
+                    let base = board_server(&p.entry.name);
+                    let mut server = base.clone();
+                    let mut n = 1;
+                    while servers.iter().any(|(s, _): &(String, String)| *s == server) {
+                        n += 1;
+                        server = format!("{base}-{n}");
+                    }
+                    let roster = roster(p.store().as_ref(), p.human.id).await?;
+                    boards.push(prompts::GlobalBoard {
+                        name: p.entry.name.clone(),
+                        server: server.clone(),
+                        repo_path: p.entry.path.clone(),
+                        roster,
+                    });
+                    servers.push((server, sup.bridge().register_run(desk_context(p))));
+                }
+                let human = projects[0].human.handle.clone();
+                let system = prompts::global_desk_prompt(&human, &memory, &boards);
+                std::fs::create_dir_all(&home).map_err(|e| SupervisorError::io(&home, e))?;
+                (system, servers, home.clone(), true)
+            }
+        };
+        let tokens: Vec<String> = servers.iter().map(|(_, t)| t.clone()).collect();
+        let system_file = dir.join("system.md");
         let mcp_file = dir.join("mcp.json");
         let settings_file = dir.join("settings.json");
-        let written = std::fs::write(&mcp_file, sup.bridge().mcp_config(&token).to_string())
-            .map_err(|e| SupervisorError::io(&mcp_file, e))
+        let mcp = json!({ "mcpServers": servers
+            .iter()
+            .map(|(name, token)| (name.clone(), json!({"type": "http", "url": sup.bridge().mcp_url(token)})))
+            .collect::<serde_json::Map<String, Value>>() });
+        // Approvals go through the first board; every board's own tools are
+        // allowed by the hook.
+        let written = std::fs::write(&system_file, &system)
+            .map_err(|e| SupervisorError::io(&system_file, e))
+            .and_then(|_| {
+                std::fs::write(&mcp_file, mcp.to_string())
+                    .map_err(|e| SupervisorError::io(&mcp_file, e))
+            })
             .and_then(|_| {
                 std::fs::write(
                     &settings_file,
-                    sup.bridge().hook_settings(&token).to_string(),
+                    sup.bridge().hook_settings(&tokens[0]).to_string(),
                 )
                 .map_err(|e| SupervisorError::io(&settings_file, e))
             });
         if let Err(e) = written {
-            sup.bridge().unregister_run(&token);
+            for t in &tokens {
+                sup.bridge().unregister_run(t);
+            }
             return Err(e);
         }
+        let profile = match project {
+            DeskScope::Project(p) => desk_context(p).profile,
+            DeskScope::Global { projects, .. } => desk_context(&projects[0]).profile,
+        };
 
         let mut args: Vec<String> = vec![
             "-p".into(),
@@ -422,7 +541,7 @@ impl DeskHost {
                 args.push(session.claude_session_id.clone());
             }
         }
-        if !policy.allow_project_mcp {
+        if strict {
             args.push("--strict-mcp-config".into());
         }
         if let Some(model) = &session.model {
@@ -441,7 +560,7 @@ impl DeskHost {
 
         let mut cmd = tokio::process::Command::new(&binary);
         cmd.args(&args)
-            .current_dir(&project.entry.path)
+            .current_dir(&cwd)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -459,7 +578,9 @@ impl DeskHost {
         let child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => {
-                sup.bridge().unregister_run(&token);
+                for t in &tokens {
+                    sup.bridge().unregister_run(t);
+                }
                 return Err(SupervisorError::Spawn(format!(
                     "could not start {}: {e}",
                     binary.display()
@@ -478,7 +599,7 @@ impl DeskHost {
             host: self.clone(),
             project: project.clone(),
             session_id: session.id,
-            token,
+            tokens,
             dir,
             run_key,
             status: DeskStatus {
@@ -497,9 +618,10 @@ impl DeskHost {
 
 struct DeskDriver {
     host: Arc<DeskHost>,
-    project: Arc<OpenProject>,
+    project: DeskScope,
     session_id: DeskSessionId,
-    token: String,
+    /// One bridge registration per board the session reaches.
+    tokens: Vec<String>,
     dir: PathBuf,
     /// The session's key in the bridge and the usage tracker.
     run_key: RunId,
@@ -605,7 +727,9 @@ impl DeskDriver {
             )
             .await;
         }
-        self.host.supervisor.bridge().unregister_run(&self.token);
+        for t in &self.tokens {
+            self.host.supervisor.bridge().unregister_run(t);
+        }
         {
             let mut live = self.host.live.lock().expect("desk");
             if live

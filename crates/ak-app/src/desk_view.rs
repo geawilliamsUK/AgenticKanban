@@ -145,9 +145,13 @@ impl DeskState {
 }
 
 pub fn draw(app: &mut App, ui: &mut egui::Ui) {
-    let Some(project) = app.current else {
-        return;
-    };
+    if let Some(project) = app.current {
+        draw_for(app, ui, project);
+    }
+}
+
+/// The Desk for one project, or with `desk::GLOBAL` the Global Desk.
+pub fn draw_for(app: &mut App, ui: &mut egui::Ui, project: ProjectId) {
     if app.desk.project != Some(project) {
         app.desk = DeskState {
             project: Some(project),
@@ -192,8 +196,13 @@ fn draw_session(app: &mut App, ui: &mut egui::Ui, project: ProjectId) {
     let Some(session_id) = app.desk.selected else {
         ui.vertical_centered(|ui| {
             ui.add_space(ui.available_height() / 3.0);
-            ui.heading("Desk");
-            ui.label("Your own Claude Code session for this project: plan, prioritise, and steer the team.");
+            if project == ak_supervisor::desk::GLOBAL {
+                ui.heading("Global Desk");
+                ui.label("Your own Claude Code session across every project: what is moving, what waits on you, and where the teams should go next.");
+            } else {
+                ui.heading("Desk");
+                ui.label("Your own Claude Code session for this project: plan, prioritise, and steer the team.");
+            }
             ui.add_space(8.0);
             if widgets::filled_button(ui, "Start a session", Tone::Accent).clicked() {
                 app.send(Request::NewDeskSession {
@@ -463,7 +472,11 @@ fn draw_transcript(
     let entries = app.desk.entries.clone();
     if entries.is_empty() && app.desk.streaming.is_empty() {
         ui.add_space(12.0);
-        ui.weak("Ask anything about the project, or tell the Desk what the team should do next. It acts on the board as you.");
+        ui.weak(if app.desk.project == Some(ak_supervisor::desk::GLOBAL) {
+            "Ask what is happening across your projects, or what should come next. It acts on each board as you."
+        } else {
+            "Ask anything about the project, or tell the Desk what the team should do next. It acts on the board as you."
+        });
     }
     let results: HashMap<String, &DeskEntry> = entries
         .iter()
@@ -522,7 +535,17 @@ fn draw_transcript(
                 let summary = ak_core::permissions::summarise("", &input)
                     .trim_start_matches(": ")
                     .to_string();
-                let short = name.strip_prefix("mcp__board__").unwrap_or(&name);
+                // A Global Desk names the board: "board-web · ticket_list".
+                let short = match name.strip_prefix("mcp__board__") {
+                    Some(tool) => tool.to_string(),
+                    None => match name.strip_prefix("mcp__").and_then(|n| n.split_once("__")) {
+                        Some((server, tool)) if server.starts_with("board-") => {
+                            format!("{} · {tool}", &server[6..])
+                        }
+                        _ => name.clone(),
+                    },
+                };
+                let short = short.as_str();
                 let result = results.get(&id);
                 // A coloured dot, because the UI font has no tick or cross.
                 let tone = match result {
@@ -682,7 +705,10 @@ fn draw_team_update(app: &mut App, ui: &mut egui::Ui, e: &DeskEntry) {
             });
             app.markdown.show(ui, &s("text"));
             if i["needs_you"].as_bool() == Some(true) {
-                if let Some(project) = app.current {
+                let project = app
+                    .current
+                    .filter(|_| app.desk.project != Some(ak_supervisor::desk::GLOBAL));
+                if let Some(project) = project {
                     crate::inbox_view::reply_box(
                         app,
                         ui,
@@ -724,7 +750,12 @@ fn draw_compose(
         ui.add_space(4.0);
     }
     let commands = slash_commands(&app.desk.commands);
-    let actors = app.board.actors.clone();
+    // The Global Desk spans projects, so no one board's people complete.
+    let actors = if project == ak_supervisor::desk::GLOBAL {
+        Vec::new()
+    } else {
+        app.board.actors.clone()
+    };
     let out = crate::mention_edit::compose(
         ui,
         ("desk_compose", session_id),

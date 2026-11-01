@@ -21,8 +21,9 @@ use ak_core::permissions::{self, Decision};
 use crate::tools::describe;
 use crate::{Bridge, BridgeEvent, RunContext};
 
-/// The prefix of this bridge's own tools as Claude Code names them.
-const BOARD_TOOL_PREFIX: &str = "mcp__board__";
+/// The prefixes of this bridge's own tools as Claude Code names them: the
+/// `board` server, or a Global Desk's `board-<project>` servers.
+const BOARD_TOOL_PREFIXES: [&str; 2] = ["mcp__board__", "mcp__board-"];
 
 #[derive(Debug, Deserialize)]
 pub struct PreToolUseInput {
@@ -88,7 +89,7 @@ pub async fn decide(bridge: &Bridge, ctx: &RunContext, input: &PreToolUseInput) 
             ),
         );
     }
-    if input.tool_name.starts_with(BOARD_TOOL_PREFIX) {
+    if BOARD_TOOL_PREFIXES.iter().any(|p| input.tool_name.starts_with(p)) {
         return permission("allow", "board tools are always available");
     }
     match permissions::decide(&ctx.profile, &input.tool_name, &input.tool_input) {

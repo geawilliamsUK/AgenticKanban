@@ -19,4 +19,7 @@ tracing = "0.1.44"
 uuid = { version = "1.26.1", features = ["v4"] }
 
 [dev-dependencies]
+axum = "0.8.9"
+http-body-util = "0.1.5"
 tempfile = "3.27.0"
+tower = "0.5.3"

@@ -135,6 +135,22 @@ pub fn compose(
         .layouter(&mut layouter)
         .show(ui);
     let response = output.response.clone();
+    // egui also drops focus on Escape before any widget runs, unless the
+    // focused widget claims it; while the list is open, Escape only closes
+    // the list. Set after the text box, which sets its own filter.
+    if list_open && response.has_focus() {
+        ui.memory_mut(|m| {
+            m.set_focus_lock_filter(
+                id,
+                egui::EventFilter {
+                    tab: true,
+                    horizontal_arrows: true,
+                    vertical_arrows: true,
+                    escape: true,
+                },
+            )
+        });
+    }
 
     if response.has_focus() {
         let cursor = output

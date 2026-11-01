@@ -215,6 +215,69 @@ specialists yourself."
     out
 }
 
+/// One project as the Global Desk sees it.
+pub struct GlobalBoard {
+    pub name: String,
+    /// Its MCP server, whose tools are `mcp__<server>__*`.
+    pub server: String,
+    pub repo_path: std::path::PathBuf,
+    pub roster: Vec<RosterLine>,
+}
+
+/// The appended system prompt for the Global Desk: every project at once.
+pub fn global_desk_prompt(human_handle: &str, memory: &str, boards: &[GlobalBoard]) -> String {
+    let mut out = format!(
+        "# The Global Desk\n\n\
+You are @{me}'s Global Desk: their own Claude Code session above every project they run with an \
+agent team. Each project has its own board, team and Desk; you are where @{me} looks across them: \
+what is moving where, what is waiting on them, and where the team's time and their subscription \
+should go next. Keep answers short, and ask when it is unclear which project they mean.\n\n\
+Each project's board is its own MCP server, with the same tools a project's Desk has (tickets, \
+chats, inbox, team and settings), acting as @{me}. Always say which project you are acting on, \
+and never surprise them with board changes.\n",
+        me = human_handle
+    );
+    out.push_str("\n## Your memory\n\n");
+    if memory.trim().is_empty() {
+        out.push_str("(empty: nothing saved yet)\n");
+    } else {
+        out.push_str(memory.trim());
+        out.push('\n');
+    }
+    out.push_str("\n## The projects\n");
+    for b in boards {
+        out.push_str(&format!(
+            "\n### {} (server `{}`, tools `mcp__{}__*`)\n\nRepository: `{}`\n\n",
+            b.name,
+            b.server,
+            b.server,
+            b.repo_path.display()
+        ));
+        for r in &b.roster {
+            out.push_str(&format!(
+                "- @{} ({}){}\n",
+                r.handle,
+                r.kind,
+                if r.description.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {}", r.description)
+                }
+            ));
+        }
+    }
+    out.push_str(
+        "\n## How you work\n\n\
+- For a status across projects, read each board's inbox_list and ticket_list and usage_get once \
+(usage is the same subscription everywhere), then put what waits on @{me} first.\n\
+- To change what a team is doing, work through that project: brief its @lead in a direct thread, \
+or ticket the work. A project's own Desk may be in the middle of something; say so if you see it.\n\
+- memory_update keeps cross-project priorities and standing instructions; it is shared by all \
+your servers.\n",
+    );
+    out.replace("@{me}", &format!("@{human_handle}"))
+}
+
 /// The short prompt passed on the command line.
 pub fn wake_prompt(trigger_lines: &[String], workspace: &Workspace) -> String {
     let mut out = String::new();

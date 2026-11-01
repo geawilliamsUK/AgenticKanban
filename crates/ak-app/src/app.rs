@@ -40,6 +40,8 @@ use crate::widgets;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
+    /// The Desk above every project.
+    GlobalDesk,
     Desk,
     Board,
     Inbox,
@@ -135,6 +137,8 @@ pub struct App {
     pub usage_refresh_requested: Option<Instant>,
 
     pub desk: DeskState,
+    /// The Global Desk's state, kept apart so neither reloads the other.
+    pub global_desk: DeskState,
     notifier: crate::notify::Notifier,
 
     pub new_ticket: Option<NewTicketDialog>,
@@ -233,6 +237,7 @@ impl App {
             calibration: Calibration::default(),
             usage_refresh_requested: None,
             desk: DeskState::default(),
+            global_desk: DeskState::default(),
             notifier: Default::default(),
             new_ticket: None,
             add_project: None,
@@ -414,8 +419,8 @@ impl App {
                 self.calibration = calibration;
             }
             Response::DeskSessions { project, sessions } => {
-                if self.desk.project == Some(project) {
-                    self.desk.on_sessions(sessions);
+                if let Some(desk) = self.desk_for(project) {
+                    desk.on_sessions(sessions);
                 }
             }
             Response::DeskOpened {
@@ -424,9 +429,9 @@ impl App {
                 entries,
                 status,
             } => {
-                if self.desk.project == Some(project) {
-                    self.desk.on_opened(session, entries, status);
-                    if let Some(text) = self.desk.pending_send.take() {
+                if let Some(desk) = self.desk_for(project) {
+                    desk.on_opened(session, entries, status);
+                    if let Some(text) = desk.pending_send.take() {
                         self.send(Request::SendToDesk {
                             project,
                             session,
@@ -436,7 +441,10 @@ impl App {
                     }
                 }
             }
-            Response::Desk(notice) => self.desk.on_notice(notice),
+            Response::Desk(notice) => {
+                self.global_desk.on_notice(notice.clone());
+                self.desk.on_notice(notice);
+            }
             Response::ProjectPolicy { project, policy } => {
                 if Some(project) == self.current {
                     self.apply_policy(policy);
@@ -777,6 +785,17 @@ impl App {
         }
     }
 
+    /// The Desk state a Desk response is for, if it is on screen.
+    fn desk_for(&mut self, project: ProjectId) -> Option<&mut DeskState> {
+        if self.global_desk.project == Some(project) {
+            Some(&mut self.global_desk)
+        } else if self.desk.project == Some(project) {
+            Some(&mut self.desk)
+        } else {
+            None
+        }
+    }
+
     fn dispatch_actions(&mut self) {
         let actions = std::mem::take(&mut self.actions);
         for action in actions {
@@ -962,6 +981,19 @@ impl App {
 
         if widgets::nav_item(ui, "Overview", self.view == View::Overview).clicked() {
             self.actions.push(Action::SwitchView(View::Overview));
+        }
+        let busy = self.global_desk.status.values().any(|s| s.busy);
+        let resp = widgets::nav_item(ui, "Global Desk", self.view == View::GlobalDesk)
+            .on_hover_text("One Claude Code session that sees every project's board");
+        if busy {
+            widgets::breathing_dot(
+                ui,
+                resp.rect.right_center() - egui::vec2(16.0, 0.0),
+                Tone::Accent,
+            );
+        }
+        if resp.clicked() {
+            self.actions.push(Action::SwitchView(View::GlobalDesk));
         }
         let enabled = self.current.is_some();
         ui.add_enabled_ui(enabled, |ui| {
@@ -1180,6 +1212,19 @@ impl eframe::App for App {
                     crate::overview_view::draw(self, ui);
                     return;
                 }
+                if self.view == View::GlobalDesk {
+                    if self.projects.is_empty() {
+                        ui.centered_and_justified(|ui| {
+                            ui.label("Add a project from the sidebar to get started.");
+                        });
+                        return;
+                    }
+                    // The Desk view draws `app.desk`; lend it the global state.
+                    std::mem::swap(&mut self.desk, &mut self.global_desk);
+                    crate::desk_view::draw_for(self, ui, ak_supervisor::desk::GLOBAL);
+                    std::mem::swap(&mut self.desk, &mut self.global_desk);
+                    return;
+                }
                 if self.current.is_none() {
                     ui.centered_and_justified(|ui| {
                         ui.label("Add a project from the sidebar to get started.");
@@ -1193,7 +1238,7 @@ impl eframe::App for App {
                     View::Chats => crate::chats_view::draw(self, ui),
                     View::Team => crate::team_view::draw(self, ui),
                     View::Analyst => crate::analyst_view::draw(self, ui),
-                    View::Settings | View::Overview => unreachable!(),
+                    View::Settings | View::Overview | View::GlobalDesk => unreachable!(),
                 }
             });
 

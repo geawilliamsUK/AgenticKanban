@@ -46,7 +46,7 @@ use ak_runtime::snapshot::{
 use ak_runtime::{HomePaths, OpenProject, ProjectRegistry, RuntimeError, UtilityRunner};
 use ak_store::Store;
 use ak_supervisor::{
-    DeskHost, DeskNotice, DeskStatus, GuardrailMonitor, RunNotice, Scheduler, Supervisor,
+    DeskHost, DeskNotice, DeskScope, DeskStatus, GuardrailMonitor, RunNotice, Scheduler, Supervisor,
     SupervisorConfig,
 };
 
@@ -578,6 +578,8 @@ pub struct Backend {
     bridge: Option<Bridge>,
     supervisor: Option<Arc<Supervisor>>,
     desk: Option<Arc<DeskHost>>,
+    /// The Global Desk's sessions, opened on first use.
+    global_desk: Option<Arc<dyn ak_store::Store>>,
     slots: Arc<Semaphore>,
     utility_slots: Arc<Semaphore>,
     internal_tx: UnboundedSender<Internal>,
@@ -614,6 +616,7 @@ impl Backend {
             bridge: None,
             supervisor: None,
             desk: None,
+            global_desk: None,
             slots,
             utility_slots,
             internal_tx,
@@ -904,7 +907,36 @@ impl Backend {
             .ok_or_else(|| "the Desk cannot run: the agent runtime is not available".to_string())
     }
 
-    async fn send_desk_sessions(&self, p: &OpenProject) -> Result<(), String> {
+    /// Where a Desk request's sessions live: a project, or for
+    /// `desk::GLOBAL` every open project at once.
+    async fn desk_scope(&mut self, project: ProjectId) -> Result<DeskScope, String> {
+        if project != ak_supervisor::desk::GLOBAL {
+            return Ok(DeskScope::Project(self.project(project)?));
+        }
+        let store = match &self.global_desk {
+            Some(s) => s.clone(),
+            None => {
+                let dir = self.registry.paths().global_desk_dir();
+                std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+                let store: Arc<dyn ak_store::Store> = Arc::new(
+                    ak_store::SqliteStore::open(&dir.join("desk.db"))
+                        .await
+                        .map_err(|e| e.to_string())?,
+                );
+                self.global_desk = Some(store.clone());
+                store
+            }
+        };
+        let projects = self
+            .registry
+            .projects()
+            .iter()
+            .filter_map(|e| self.registry.opened(e.id))
+            .collect();
+        Ok(DeskScope::Global { store, projects })
+    }
+
+    async fn send_desk_sessions(&self, p: &DeskScope) -> Result<(), String> {
         let sessions = p.store().desk_sessions().await.map_err(|e| e.to_string())?;
         self.send(Response::DeskSessions {
             project: p.id(),
@@ -915,7 +947,7 @@ impl Backend {
 
     async fn open_desk_session(
         &self,
-        p: &OpenProject,
+        p: &DeskScope,
         session: DeskSessionId,
     ) -> Result<(), String> {
         let entries = p
@@ -1559,11 +1591,11 @@ impl Backend {
             }
             Request::RefreshUsage => self.refresh_usage(false),
             Request::LoadDesk { project } => {
-                let p = self.project(project)?;
+                let p = self.desk_scope(project).await?;
                 self.send_desk_sessions(&p).await?;
             }
             Request::NewDeskSession { project, model } => {
-                let p = self.project(project)?;
+                let p = self.desk_scope(project).await?;
                 let session = DeskSession::new(model, Utc::now());
                 p.store()
                     .insert_desk_session(&session)
@@ -1573,7 +1605,7 @@ impl Backend {
                 self.open_desk_session(&p, session.id).await?;
             }
             Request::OpenDeskSession { project, session } => {
-                let p = self.project(project)?;
+                let p = self.desk_scope(project).await?;
                 self.open_desk_session(&p, session).await?;
             }
             Request::SendToDesk {
@@ -1582,7 +1614,7 @@ impl Backend {
                 text,
                 shown,
             } => {
-                let p = self.project(project)?;
+                let p = self.desk_scope(project).await?;
                 let desk = self.desk_host()?;
                 desk.send_as(p, session, text, shown)
                     .await
@@ -1595,7 +1627,7 @@ impl Backend {
                 text,
                 shown,
             } => {
-                let p = self.project(project)?;
+                let p = self.desk_scope(project).await?;
                 self.desk_host()?
                     .edit(p, session, seq, text, shown)
                     .await
@@ -1611,7 +1643,7 @@ impl Backend {
                 model,
                 archived,
             } => {
-                let p = self.project(project)?;
+                let p = self.desk_scope(project).await?;
                 let store = p.store();
                 let mut s = store
                     .desk_session(session)
