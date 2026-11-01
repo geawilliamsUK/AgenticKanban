@@ -135,6 +135,7 @@ pub struct App {
     pub usage_refresh_requested: Option<Instant>,
 
     pub desk: DeskState,
+    notifier: crate::notify::Notifier,
 
     pub new_ticket: Option<NewTicketDialog>,
     pub add_project: Option<AddProjectDialog>,
@@ -232,6 +233,7 @@ impl App {
             calibration: Calibration::default(),
             usage_refresh_requested: None,
             desk: DeskState::default(),
+            notifier: Default::default(),
             new_ticket: None,
             add_project: None,
             remove_confirm: None,
@@ -603,6 +605,32 @@ impl App {
                 }
             }
             Response::Inbox { project, items } => {
+                let fresh: Vec<String> = self
+                    .notifier
+                    .fresh(project, &items)
+                    .iter()
+                    .map(|i| i.excerpt.clone().unwrap_or_default())
+                    .collect();
+                let wanted = self
+                    .settings
+                    .as_ref()
+                    .is_none_or(|s| s.desktop_notifications);
+                let in_front = self.egui.input(|i| i.viewport().focused.unwrap_or(true));
+                if !fresh.is_empty() && wanted && !in_front {
+                    let name = self
+                        .projects
+                        .iter()
+                        .find(|p| p.id == project)
+                        .map(|p| p.name.clone())
+                        .unwrap_or_default();
+                    for text in &fresh {
+                        crate::notify::question(&name, text);
+                    }
+                    self.egui
+                        .send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(
+                            egui::UserAttentionType::Informational,
+                        ));
+                }
                 if Some(project) == self.current {
                     self.inbox = items;
                 }

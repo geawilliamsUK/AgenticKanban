@@ -16,6 +16,7 @@ mod inbox_view;
 mod markdown;
 mod mention_edit;
 mod model;
+mod notify;
 mod overview_view;
 mod settings_view;
 mod snapshot_view;

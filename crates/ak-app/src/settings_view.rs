@@ -349,6 +349,18 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                             ui.end_row();
                         }
 
+                        ui.label("Notifications");
+                        if ui
+                            .checkbox(
+                                &mut editor.global.desktop_notifications,
+                                "Notify me when the team asks a question and the app is not in front",
+                            )
+                            .changed()
+                        {
+                            editor.global_dirty = true;
+                        }
+                        ui.end_row();
+
                         ui.label("Keep run files (days)");
                         if ui
                             .add(egui::DragValue::new(&mut editor.global.run_retention_days).range(1..=365))

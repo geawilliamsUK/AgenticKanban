@@ -79,6 +79,63 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
     });
 }
 
+/// Answers a question where it was asked: a comment on its ticket, or a
+/// post in its thread. Answering there clears it from Needs you.
+pub fn reply_box(
+    app: &mut App,
+    ui: &mut egui::Ui,
+    project: ak_core::ids::ProjectId,
+    id: egui::Id,
+    ticket: Option<ak_core::ids::TicketId>,
+    thread: Option<ak_core::ids::ThreadId>,
+) {
+    if ticket.is_none() && thread.is_none() {
+        return;
+    }
+    let mut text: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_default();
+    ui.add_space(4.0);
+    let actors = app.board.actors.clone();
+    let out = crate::mention_edit::compose(
+        ui,
+        id.with("edit"),
+        &mut text,
+        &actors,
+        &[],
+        "Answer here. Enter sends, Shift+Enter for a new line.",
+        2,
+        true,
+    );
+    let mut send = out.submitted;
+    ui.horizontal(|ui| {
+        send |= widgets::filled_button_if(ui, !text.trim().is_empty(), "Answer", Tone::Accent)
+            .clicked();
+        ui.weak(if ticket.is_some() {
+            "posted as a comment on the ticket"
+        } else {
+            "posted in the thread"
+        });
+    });
+    if send && !text.trim().is_empty() {
+        let body = std::mem::take(&mut text).trim().to_string();
+        match (ticket, thread) {
+            (Some(ticket), _) => app.actions.push(Action::Request(Request::Comment {
+                project,
+                ticket,
+                body,
+                parent: None,
+            })),
+            (None, Some(thread)) => app.actions.push(Action::Request(Request::PostMessage {
+                project,
+                thread,
+                body,
+            })),
+            (None, None) => {}
+        }
+        app.toast("Answered", false);
+    }
+    ui.data_mut(|d| d.insert_temp(id, text));
+}
+
 fn card(
     app: &mut App,
     ui: &mut egui::Ui,
@@ -154,6 +211,16 @@ fn card(
             ui.add_space(2.0);
             if item.needs_you {
                 app.markdown.show(ui, text);
+                if let Some(e) = &item.event {
+                    reply_box(
+                        app,
+                        ui,
+                        project,
+                        egui::Id::new(("answer", n.id)),
+                        e.kind.ticket_id(),
+                        e.kind.thread_id(),
+                    );
+                }
             } else {
                 let short: String = text
                     .replace("**", "")

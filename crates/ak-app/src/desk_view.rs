@@ -681,6 +681,18 @@ fn draw_team_update(app: &mut App, ui: &mut egui::Ui, e: &DeskEntry) {
                 }
             });
             app.markdown.show(ui, &s("text"));
+            if i["needs_you"].as_bool() == Some(true) {
+                if let Some(project) = app.current {
+                    crate::inbox_view::reply_box(
+                        app,
+                        ui,
+                        project,
+                        egui::Id::new(("desk_answer", e.seq, &s("text"))),
+                        i["ticket_id"].as_str().and_then(|t| t.parse().ok()),
+                        i["thread_id"].as_str().and_then(|t| t.parse().ok()),
+                    );
+                }
+            }
         }
     });
 }

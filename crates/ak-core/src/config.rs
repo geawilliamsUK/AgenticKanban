@@ -64,6 +64,9 @@ pub struct GlobalSettings {
     pub theme: ThemeMode,
     /// Subscription windows past which no new runs start.
     pub usage_holds: UsageHolds,
+    /// A desktop notification when a question for the human arrives while
+    /// the app is not in front.
+    pub desktop_notifications: bool,
 }
 
 impl Default for GlobalSettings {
@@ -79,6 +82,7 @@ impl Default for GlobalSettings {
             run_retention_days: 30,
             theme: ThemeMode::System,
             usage_holds: UsageHolds::default(),
+            desktop_notifications: true,
         }
     }
 }
