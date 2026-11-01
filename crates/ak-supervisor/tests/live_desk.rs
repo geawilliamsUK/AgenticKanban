@@ -142,6 +142,30 @@ async fn desk_session_with_real_claude_code() {
     let entries = turn(&mut notices).await;
     assert!(reply(&entries).contains("me"), "{}", reply(&entries));
 
+    println!("--- turn 4: the Desk adds a teammate with its own tools");
+    desk.send(
+        project.clone(),
+        session.id,
+        "Add a QA agent to the team now, handle qa, description \"Tests every change before it is \
+         merged.\", on the haiku model. I approve; just do it and reply done."
+            .into(),
+    )
+    .await
+    .unwrap();
+    let entries = turn(&mut notices).await;
+    assert!(
+        entries.iter().any(|e| e.kind == DeskEntryKind::ToolCall
+            && e.text("name") == "mcp__board__agent_create"),
+        "the Desk used agent_create"
+    );
+    let qa = store
+        .agent_by_handle("qa")
+        .await
+        .unwrap()
+        .expect("@qa was created");
+    assert_eq!(qa.model.as_deref(), Some("haiku"));
+    assert!(!project.agents.agent_dir("qa").join("..").join("me").exists());
+
     let saved = store.desk_session(session.id).await.unwrap();
     println!(
         "session: title {:?}, cost ${:.4}, started {}",

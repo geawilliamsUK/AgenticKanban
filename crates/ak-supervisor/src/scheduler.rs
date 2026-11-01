@@ -137,6 +137,18 @@ impl Scheduler {
                             {
                                 this.activate(agent_id, by, reason);
                             }
+                            Ok(ak_bridge::BridgeEvent::AgentControl { project: p, agent_id, halt })
+                                if p == project.id() =>
+                            {
+                                let done = if halt {
+                                    this.halt(agent_id).await
+                                } else {
+                                    this.resume(agent_id).await
+                                };
+                                if let Err(e) = done {
+                                    tracing::warn!("could not change an agent's state: {e}");
+                                }
+                            }
                             _ => {}
                         }
                         continue;

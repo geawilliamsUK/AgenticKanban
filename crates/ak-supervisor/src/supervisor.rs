@@ -200,6 +200,7 @@ impl Supervisor {
             run_id: run.id,
             profile: spec.profile.clone(),
             desk_memory: None,
+            policy_file: None,
         });
         let mcp_file = run_dir.join("mcp.json");
         std::fs::write(&mcp_file, self.bridge.mcp_config(&token).to_string())

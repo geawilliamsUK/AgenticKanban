@@ -72,6 +72,7 @@ async fn fixture(profile_index: usize, approval_timeout: Duration) -> Fixture {
         run_id: RunId::new(),
         profile,
         desk_memory: None,
+        policy_file: None,
     });
     Fixture {
         bridge,
@@ -705,6 +706,7 @@ async fn a_desk_session_acts_as_the_human_with_its_own_memory() {
         run_id: RunId::new(),
         profile: f.project.policy().permission_profiles[0].clone(),
         desk_memory: Some(memory.clone()),
+        policy_file: None,
     });
     let desk = Fixture {
         bridge: f.bridge.clone(),
@@ -784,6 +786,7 @@ async fn agent_activate_asks_the_scheduler_and_refuses_people_and_self() {
         run_id: RunId::new(),
         profile: f.project.policy().permission_profiles[0].clone(),
         desk_memory: Some(memory),
+        policy_file: None,
     });
     let desk = Fixture {
         bridge: f.bridge.clone(),
@@ -856,4 +859,180 @@ async fn ask_human_posts_a_marked_question_on_the_ticket() {
         .unwrap()
         .iter()
         .any(|n| n.kind == NotificationKind::Mentioned));
+}
+
+#[tokio::test]
+async fn the_desk_manages_the_team_and_the_settings_and_agents_cannot() {
+    let f = fixture(0, Duration::from_secs(5)).await;
+    let mut events = f.bridge.subscribe();
+
+    // Agents never see the team tools, and cannot call them.
+    let (_, v) = rpc(
+        &f,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    )
+    .await;
+    let names: Vec<String> = v["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|t| t["name"].as_str().unwrap().to_string())
+        .collect();
+    assert!(!names.contains(&"agent_create".to_string()));
+    let (err, _) = call(
+        &f,
+        "agent_create",
+        json!({"handle": "x", "description": "x"}),
+    )
+    .await;
+    assert!(err);
+
+    let memory = f.project.entry.path.join("desk").join("memory.md");
+    let policy_file = f.project.entry.path.join("project.toml");
+    let human = f.project.human.clone();
+    let token = f.bridge.register_run(RunContext {
+        project: f.project.clone(),
+        agent: Agent::stand_in_for(&human, memory.clone()),
+        run_id: RunId::new(),
+        profile: f.project.policy().permission_profiles[0].clone(),
+        desk_memory: Some(memory),
+        policy_file: Some(policy_file.clone()),
+    });
+    let desk = Fixture {
+        bridge: f.bridge.clone(),
+        token,
+        project: f.project.clone(),
+        agent: f.agent.clone(),
+        _tmp: tempfile::tempdir().unwrap(),
+    };
+    let (_, v) = rpc(
+        &desk,
+        json!({"jsonrpc": "2.0", "id": 1, "method": "tools/list"}),
+    )
+    .await;
+    assert!(v["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|t| t["name"] == "project_settings_update"));
+
+    // A lead from the preset, then a specialist, assignable at once.
+    let (err, text) = call(
+        &desk,
+        "agent_create",
+        json!({"handle": "lead", "preset": "lead", "description": "Runs the team.", "model": "sonnet"}),
+    )
+    .await;
+    assert!(!err, "{text}");
+    let (err, text) = call(
+        &desk,
+        "agent_create",
+        json!({"handle": "@QA", "description": "Tests everything.", "permission_profile": "trusted"}),
+    )
+    .await;
+    assert!(!err, "{text}");
+    let store = f.project.store();
+    let qa = store
+        .agent_by_handle("qa")
+        .await
+        .unwrap()
+        .expect("qa exists");
+    assert_eq!(qa.permission_profile, "trusted");
+    assert_eq!(
+        store
+            .agent_by_handle("lead")
+            .await
+            .unwrap()
+            .unwrap()
+            .model
+            .as_deref(),
+        Some("sonnet")
+    );
+    let (err, _) = call(
+        &desk,
+        "agent_create",
+        json!({"handle": "qa", "description": "again"}),
+    )
+    .await;
+    assert!(err, "no duplicates");
+    let (err, text) = call(
+        &desk,
+        "agent_create",
+        json!({"handle": "x", "description": "x", "permission_profile": "nope"}),
+    )
+    .await;
+    assert!(err && text.contains("no permission profile"), "{text}");
+
+    // Edits, budgets, memory, reading back.
+    let (err, _) = call(
+        &desk,
+        "agent_update",
+        json!({"handle": "qa", "model": "haiku", "max_usd_per_run": 2.5}),
+    )
+    .await;
+    assert!(!err);
+    let (err, _) = call(
+        &desk,
+        "agent_memory_update",
+        json!({"handle": "qa", "content": "- run cargo test"}),
+    )
+    .await;
+    assert!(!err);
+    let (_, text) = call(&desk, "agent_get", json!({"handle": "qa"})).await;
+    assert!(text.contains("model: haiku"), "{text}");
+    assert!(text.contains("max_usd_per_run: 2.5"), "{text}");
+    assert!(text.contains("- run cargo test"), "{text}");
+
+    // Halting goes to the scheduler.
+    let (err, _) = call(&desk, "agent_halt", json!({"handle": "qa"})).await;
+    assert!(!err);
+    let mut halted = false;
+    while let Ok(e) = events.try_recv() {
+        if let BridgeEvent::AgentControl {
+            agent_id,
+            halt: true,
+            ..
+        } = e
+        {
+            halted = agent_id == qa.actor_id;
+        }
+    }
+    assert!(halted);
+
+    // Settings: merged, checked, saved and announced.
+    let (err, text) = call(
+        &desk,
+        "project_settings_update",
+        json!({"changes": {"guardrails": {"max_usd_per_run": 4.0}, "default_model": "sonnet"}}),
+    )
+    .await;
+    assert!(!err, "{text}");
+    assert_eq!(f.project.policy().guardrails.max_usd_per_run, 4.0);
+    assert!(std::fs::read_to_string(&policy_file)
+        .unwrap()
+        .contains("max_usd_per_run = 4.0"));
+    assert!(std::iter::from_fn(|| events.try_recv().ok())
+        .any(|e| matches!(e, BridgeEvent::PolicyChanged { .. })));
+    let (err, text) = call(
+        &desk,
+        "project_settings_update",
+        json!({"changes": {"permission_profiles": []}}),
+    )
+    .await;
+    assert!(
+        err && text.contains("which these settings remove"),
+        "{text}"
+    );
+    let (_, text) = call(&desk, "project_settings_get", json!({})).await;
+    assert!(text.contains("default_model = \"sonnet\""), "{text}");
+
+    // Retiring.
+    let (err, _) = call(&desk, "agent_retire", json!({"handle": "qa"})).await;
+    assert!(!err);
+    assert!(store
+        .agent_by_handle("qa")
+        .await
+        .unwrap()
+        .unwrap()
+        .is_retired());
 }

@@ -370,6 +370,7 @@ impl DeskHost {
             run_id: run_key,
             profile: profile.clone(),
             desk_memory: Some(memory_file),
+            policy_file: Some(paths.project_policy_file(project.id())),
         });
         let mcp_file = dir.join("mcp.json");
         let settings_file = dir.join("settings.json");

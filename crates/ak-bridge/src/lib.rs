@@ -14,6 +14,7 @@
 pub mod hooks;
 pub mod mcp;
 pub mod runs;
+pub mod team;
 pub mod tools;
 
 use std::collections::HashMap;
@@ -59,6 +60,16 @@ pub enum BridgeEvent {
         agent_id: ActorId,
         by: ActorId,
         reason: String,
+    },
+    /// The Desk halted or resumed an agent; the project's scheduler does it.
+    AgentControl {
+        project: ProjectId,
+        agent_id: ActorId,
+        halt: bool,
+    },
+    /// The Desk changed the project's settings; the app shows them afresh.
+    PolicyChanged {
+        project: ProjectId,
     },
 }
 
@@ -249,6 +260,16 @@ impl Bridge {
             agent_id,
             by,
             reason,
+        });
+    }
+
+    /// Asks the agent's project scheduler to halt it (stopping any run) or
+    /// to let it wake again.
+    pub fn control_agent(&self, project: ProjectId, agent_id: ActorId, halt: bool) {
+        self.emit(BridgeEvent::AgentControl {
+            project,
+            agent_id,
+            halt,
         });
     }
 

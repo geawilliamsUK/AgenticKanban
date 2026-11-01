@@ -240,13 +240,13 @@ pub struct ThreadPostInput {
     pub body: String,
 }
 
-struct ToolSpec {
-    name: &'static str,
-    description: &'static str,
-    schema: fn() -> Value,
+pub(crate) struct ToolSpec {
+    pub(crate) name: &'static str,
+    pub(crate) description: &'static str,
+    pub(crate) schema: fn() -> Value,
 }
 
-fn schema<T: JsonSchema>() -> Value {
+pub(crate) fn schema<T: JsonSchema>() -> Value {
     serde_json::to_value(schemars::schema_for!(T)).unwrap_or_else(|_| json!({"type": "object"}))
 }
 
@@ -370,8 +370,20 @@ const SPECS: &[ToolSpec] = &[
 
 /// The `tools/list` payload.
 pub fn list() -> Vec<Value> {
-    SPECS
-        .iter()
+    specs(SPECS.iter())
+}
+
+/// The tools this run sees: the board's, and for a Desk session the team's.
+pub fn list_for(ctx: &RunContext) -> Vec<Value> {
+    if ctx.is_desk() {
+        specs(SPECS.iter().chain(crate::team::SPECS.iter()))
+    } else {
+        list()
+    }
+}
+
+fn specs<'a>(specs: impl Iterator<Item = &'a ToolSpec>) -> Vec<Value> {
+    specs
         .map(|s| {
             json!({
                 "name": s.name,
@@ -391,7 +403,8 @@ pub async fn call(bridge: &Bridge, ctx: &RunContext, name: &str, args: Value) ->
     }
 }
 
-enum ToolError {
+#[derive(Debug)]
+pub(crate) enum ToolError {
     Message(String),
     Store(StoreError),
 }
@@ -421,7 +434,7 @@ fn store_message(e: &StoreError) -> String {
     }
 }
 
-fn parse_args<T: for<'de> Deserialize<'de>>(args: Value) -> Result<T, ToolError> {
+pub(crate) fn parse_args<T: for<'de> Deserialize<'de>>(args: Value) -> Result<T, ToolError> {
     serde_json::from_value(args).map_err(|e| ToolError::Message(format!(
         "invalid arguments: {e}. Check the tool's input schema; a ticket change needs the version from ticket_get."
     )))
@@ -872,7 +885,10 @@ async fn run(
                 target.handle
             ))
         }
-        other => Err(ToolError::Message(format!("unknown tool {other}"))),
+        other => match crate::team::run(bridge, ctx, other, args).await {
+            Some(result) => result,
+            None => Err(ToolError::Message(format!("unknown tool {other}"))),
+        },
     }
 }
 

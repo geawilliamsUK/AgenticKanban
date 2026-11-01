@@ -6,6 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+toml = "1.1.8"
 ak-core = { version = "0.1.0", path = "../ak-core" }
 ak-runtime = { version = "0.1.0", path = "../ak-runtime" }
 ak-store = { version = "0.1.0", path = "../ak-store" }

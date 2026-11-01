@@ -17,6 +17,9 @@ pub struct RunContext {
     /// Set for a Desk session: its memory file, outside the agents
     /// directory so it is never taken for an agent.
     pub desk_memory: Option<PathBuf>,
+    /// Set for a Desk session: the project's settings file, which its team
+    /// tools may change.
+    pub policy_file: Option<PathBuf>,
 }
 
 impl RunContext {

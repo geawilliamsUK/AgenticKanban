@@ -100,7 +100,7 @@ async fn dispatch(bridge: &Bridge, ctx: &crate::RunContext, message: Value) -> O
             })
         }
         "ping" => json!({}),
-        "tools/list" => json!({ "tools": tools::list() }),
+        "tools/list" => json!({ "tools": tools::list_for(ctx) }),
         "tools/call" => {
             let name = req
                 .params

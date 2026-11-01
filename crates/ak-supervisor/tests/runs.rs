@@ -623,3 +623,38 @@ async fn an_activation_request_wakes_the_agent_with_its_reason() {
     );
     scheduler.shutdown();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_desk_can_halt_and_resume_an_agent_through_the_bridge() {
+    let f = fixture().await;
+    let store = f.project.store();
+    let scheduler = Scheduler::spawn(
+        f.project.clone(),
+        f.supervisor.clone(),
+        Arc::new(Semaphore::new(2)),
+        GlobalSettings::default(),
+    );
+    let wait_for = |state: AgentState| {
+        let store = store.clone();
+        let id = f.agent.actor_id;
+        async move {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            loop {
+                if store.agent(id).await.unwrap().state == state {
+                    return;
+                }
+                assert!(tokio::time::Instant::now() < deadline, "never {state:?}");
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    };
+    f.supervisor
+        .bridge()
+        .control_agent(f.project.id(), f.agent.actor_id, true);
+    wait_for(AgentState::Halted).await;
+    f.supervisor
+        .bridge()
+        .control_agent(f.project.id(), f.agent.actor_id, false);
+    wait_for(AgentState::Idle).await;
+    scheduler.shutdown();
+}

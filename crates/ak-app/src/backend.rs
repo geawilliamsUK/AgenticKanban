@@ -1082,7 +1082,17 @@ impl Backend {
                 )));
             }
             // The scheduler of the agent's project acts on these itself.
-            Internal::Bridge(BridgeEvent::ActivationRequested { .. }) => {}
+            Internal::Bridge(BridgeEvent::ActivationRequested { .. })
+            | Internal::Bridge(BridgeEvent::AgentControl { .. }) => {}
+            Internal::Bridge(BridgeEvent::PolicyChanged { project }) => {
+                if let Some(p) = self.registry.opened(project) {
+                    self.send(Response::ProjectPolicy {
+                        project,
+                        policy: p.policy(),
+                    });
+                    let _ = push_board(&p, &self.tx, &self.ctx).await;
+                }
+            }
             Internal::Bridge(BridgeEvent::ApprovalDecided(a)) => {
                 if let Some(p) = self.project_of_agent(a.agent_id).await {
                     let _ = push_approvals(&p, &self.tx, &self.ctx).await;
