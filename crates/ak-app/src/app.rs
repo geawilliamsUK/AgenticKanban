@@ -58,6 +58,8 @@ pub enum View {
 pub enum Action {
     Request(Request),
     SelectTicket(Option<TicketId>),
+    /// Open a ticket with its branch's diff showing.
+    ReviewBranch(TicketId),
     SwitchView(View),
     OpenProject(ProjectId),
     /// `None` starts a new agent; `Some(handle)` loads an existing one.
@@ -607,6 +609,15 @@ impl App {
                     }
                 }
             }
+            Response::Branch {
+                project,
+                ticket,
+                diff,
+            } => {
+                if Some(project) == self.current && Some(ticket) == self.selected {
+                    self.ticket_panel.branch = Some(crate::ticket_view::BranchState::Loaded(diff));
+                }
+            }
             Response::TicketDetail { project, detail } => {
                 if Some(project) == self.current && Some(detail.ticket.id) == self.selected {
                     self.detail = Some(detail);
@@ -806,6 +817,17 @@ impl App {
                     self.detail = None;
                     self.ticket_panel = TicketPanelState::default();
                     if let (Some(project), Some(id)) = (self.current, id) {
+                        self.send(Request::LoadTicket { project, id });
+                    }
+                }
+                Action::ReviewBranch(id) => {
+                    self.selected = Some(id);
+                    self.detail = None;
+                    self.ticket_panel = TicketPanelState {
+                        branch_open: true,
+                        ..Default::default()
+                    };
+                    if let Some(project) = self.current {
                         self.send(Request::LoadTicket { project, id });
                     }
                 }

@@ -167,6 +167,33 @@ pub fn bash_segments(command: &str) -> Vec<String> {
     segments
 }
 
+/// The ticket branch a shell command merges, if any part of it is a
+/// `git merge` naming `ticket/KEY` (or `origin/ticket/KEY`).
+pub fn merged_ticket_branch(command: &str) -> Option<String> {
+    for segment in bash_segments(command) {
+        let segment = normalise(&segment);
+        let words: Vec<&str> = segment.split_whitespace().collect();
+        if words.first() != Some(&"git") {
+            continue;
+        }
+        let mut i = 1;
+        while words.get(i) == Some(&"-C") {
+            i += 2;
+        }
+        if words.get(i) != Some(&"merge") {
+            continue;
+        }
+        for w in words.iter().skip(i + 1) {
+            let w = w.trim_matches(|c| c == '"' || c == '\'');
+            let branch = w.strip_prefix("origin/").unwrap_or(w);
+            if branch.len() > "ticket/".len() && branch.starts_with("ticket/") {
+                return Some(branch.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// The part of a tool call a pattern applies to.
 fn subject_of(tool_name: &str, input: &serde_json::Value) -> Option<String> {
     let key = if tool_name == "Bash" {
@@ -417,6 +444,23 @@ mod tests {
             bash_segments("cargo test 2>&1 | tail -40 && cmd &>log; x <&3"),
             vec!["cargo test 2>&1", "tail -40", "cmd &>log", "x <&3"]
         );
+    }
+
+    #[test]
+    fn ticket_branch_merges_are_recognised() {
+        for (c, want) in [
+            ("git merge --no-ff ticket/ATP-3", Some("ticket/ATP-3")),
+            ("cd ../x && git -c user.name=i merge -m \"m\" \"ticket/ATP-3\"", Some("ticket/ATP-3")),
+            ("git -C ../repo merge origin/ticket/WEB-12 2>&1 | tail -3", Some("ticket/WEB-12")),
+            ("git checkout develop; git merge --squash ticket/A-1", Some("ticket/A-1")),
+            ("git merge --abort", None),
+            ("git merge feature/x", None),
+            ("git log ticket/ATP-3", None),
+            ("git branch -d ticket/ATP-3", None),
+            ("echo git merge ticket/X", None),
+        ] {
+            assert_eq!(merged_ticket_branch(c).as_deref(), want, "{c}");
+        }
     }
 
     #[test]

@@ -303,6 +303,8 @@ A profile is a permission mode, allow rules, deny rules and an approval policy. 
 | Supervised (default) | `default` | read-only tools, `git status`, `git diff`, `git log` | everything else | destructive shell patterns |
 | Trusted | `acceptEdits` | file edits in the worktree, `git add`, `git commit`, `git checkout`, build and test commands | `git push`, package installs, anything outside the worktree | destructive shell patterns |
 
+Merge review (project setting `review_merges`, off by default): an agent's `git merge` of a `ticket/KEY` branch, in any part of a compound command, goes to the approval tray even when its profile allows it (the integrator's does). An explicit deny still denies, and the Desk, acting as the human, is not held. The tray marks the request as a merge review with a Review diff button that opens the ticket at its Branch section: the commits on `ticket/KEY` but not on the base (the integration branch, else the branch of the human's checkout) and the three-dot diff per file, coloured, with long patches cut. The branch is read from the project repository, whose refs the agent worktrees share. Any ticket shows its branch the same way.
+
 ### Reading the output stream
 
 Each stdout line is one JSON message. The supervisor maps them to RunEvents:

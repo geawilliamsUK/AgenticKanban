@@ -476,6 +476,18 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                                 });
                                 ui.end_row();
 
+                                ui.label("Review merges");
+                                ui.horizontal(|ui| {
+                                    if ui
+                                        .checkbox(&mut policy.review_merges, "")
+                                        .changed()
+                                    {
+                                        editor.project_dirty = true;
+                                    }
+                                    ui.weak("merging a ticket branch waits for your approval, with its diff to check");
+                                });
+                                ui.end_row();
+
                                 ui.label("Archive idle threads after");
                                 ui.horizontal(|ui| {
                                     if ui

@@ -92,7 +92,21 @@ pub async fn decide(bridge: &Bridge, ctx: &RunContext, input: &PreToolUseInput) 
     if BOARD_TOOL_PREFIXES.iter().any(|p| input.tool_name.starts_with(p)) {
         return permission("allow", "board tools are always available");
     }
-    match permissions::decide(&ctx.profile, &input.tool_name, &input.tool_input) {
+    let decision = permissions::decide(&ctx.profile, &input.tool_name, &input.tool_input);
+    // A ticket branch merge waits for the human's review when the project
+    // asks for one. The Desk is the human, and an explicit deny stands.
+    if decision != Decision::Deny
+        && !ctx.is_desk()
+        && input.tool_name == "Bash"
+        && ctx.project.policy().review_merges
+        && input.tool_input["command"]
+            .as_str()
+            .and_then(permissions::merged_ticket_branch)
+            .is_some()
+    {
+        return ask_human(bridge, ctx, input).await;
+    }
+    match decision {
         Decision::Allow => permission("allow", &format!("allowed by profile {}", ctx.profile.name)),
         Decision::Deny => permission("deny", &format!("denied by profile {}", ctx.profile.name)),
         Decision::Ask => ask_human(bridge, ctx, input).await,

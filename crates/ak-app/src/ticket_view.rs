@@ -1,10 +1,12 @@
-//! The ticket panel: fields, freeze controls, comment tree, activity.
+//! The ticket panel: fields, freeze controls, the ticket's branch, comment
+//! tree, activity.
 
 use std::collections::HashMap;
 
 use ak_core::board::{Comment, Priority};
 use ak_core::commands::TicketPatch;
-use ak_core::ids::CommentId;
+use ak_core::ids::{CommentId, ProjectId, TicketId};
+use ak_supervisor::review::BranchDiff;
 
 use crate::app::{Action, App};
 use crate::backend::Request;
@@ -18,6 +20,15 @@ pub struct TicketPanelState {
     pub compose: String,
     pub reply_to: Option<CommentId>,
     pub freeze_reason: String,
+    /// The ticket's branch, fetched when its section first shows.
+    pub branch: Option<BranchState>,
+    /// Open the branch section on arrival, for a merge waiting on review.
+    pub branch_open: bool,
+}
+
+pub enum BranchState {
+    Loading,
+    Loaded(Result<Option<BranchDiff>, String>),
 }
 
 pub struct EditDraft {
@@ -279,6 +290,9 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                     });
             }
 
+            ui.add_space(4.0);
+            draw_branch(app, ui, project, t.id, &t.key);
+
             ui.add_space(8.0);
             ui.separator();
 
@@ -355,6 +369,125 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
                         });
                     }
                 });
+        });
+}
+
+/// The ticket's branch: what merging it would bring in, file by file.
+fn draw_branch(app: &mut App, ui: &mut egui::Ui, project: ProjectId, ticket: TicketId, key: &str) {
+    let open = std::mem::take(&mut app.ticket_panel.branch_open);
+    let summary = match &app.ticket_panel.branch {
+        Some(BranchState::Loaded(Ok(Some(d)))) => format!(
+            "Branch: {} files, +{} −{}",
+            d.files.len(),
+            d.added(),
+            d.removed()
+        ),
+        _ => "Branch".to_string(),
+    };
+    let shown = egui::CollapsingHeader::new(summary)
+        .id_salt(("branch_header", ticket))
+        .open(open.then_some(true))
+        .show(ui, |ui| {
+            if app.ticket_panel.branch.is_none() {
+                app.ticket_panel.branch = Some(BranchState::Loading);
+                app.actions
+                    .push(Action::Request(Request::LoadBranch { project, ticket }));
+            }
+            let refresh = |app: &mut App, ui: &mut egui::Ui| {
+                if ui.small_button("Refresh").clicked() {
+                    app.ticket_panel.branch = Some(BranchState::Loading);
+                    app.actions
+                        .push(Action::Request(Request::LoadBranch { project, ticket }));
+                }
+            };
+            match &app.ticket_panel.branch {
+                None | Some(BranchState::Loading) => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.weak("Reading the branch…");
+                    });
+                }
+                Some(BranchState::Loaded(Err(e))) => {
+                    ui.colored_label(theme::tone(ui.style(), Tone::Red), e.clone());
+                    refresh(app, ui);
+                }
+                Some(BranchState::Loaded(Ok(None))) => {
+                    ui.horizontal(|ui| {
+                        ui.weak(format!("No branch ticket/{key} yet."));
+                        refresh(app, ui);
+                    });
+                }
+                Some(BranchState::Loaded(Ok(Some(d)))) => {
+                    let d = d.clone();
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(egui::RichText::new(&d.branch).monospace().strong());
+                        ui.weak(format!("into {} · head {}", d.base, d.head));
+                        refresh(app, ui);
+                    });
+                    if d.commits.is_empty() {
+                        ui.weak(format!("Nothing to merge: {} already has every commit.", d.base));
+                    }
+                    for (hash, subject) in &d.commits {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new(hash).monospace().weak());
+                            ui.label(subject);
+                        });
+                    }
+                    ui.add_space(4.0);
+                    for f in &d.files {
+                        let counts = match (f.added, f.removed) {
+                            (Some(a), Some(r)) => format!("+{a} −{r}"),
+                            _ => "binary".to_string(),
+                        };
+                        egui::CollapsingHeader::new(
+                            egui::RichText::new(format!("{}   {counts}", f.path)).monospace(),
+                        )
+                        .id_salt(("branch_file", ticket, &f.path))
+                        .show(ui, |ui| patch(ui, &f.patch));
+                    }
+                    if d.truncated {
+                        ui.weak("Some long patches are cut short here.");
+                    }
+                }
+            }
+        });
+    // Opened for a merge review: bring it into view.
+    if open {
+        shown.header_response.scroll_to_me(Some(egui::Align::Min));
+    }
+}
+
+/// A file's patch, coloured by line.
+fn patch(ui: &mut egui::Ui, text: &str) {
+    let style = ui.style().clone();
+    let mut job = egui::text::LayoutJob::default();
+    let font = egui::TextStyle::Monospace.resolve(&style);
+    let plain = style.visuals.text_color();
+    // The header (diff, index, ---, +++, renames) is dimmed up to the first hunk.
+    let mut in_hunk = false;
+    for line in text.lines() {
+        in_hunk |= line.starts_with("@@");
+        let color = if !in_hunk {
+            style.visuals.weak_text_color()
+        } else if line.starts_with('+') {
+            theme::tone(&style, Tone::Green)
+        } else if line.starts_with('-') {
+            theme::tone(&style, Tone::Red)
+        } else if line.starts_with("@@") {
+            theme::tone(&style, Tone::Teal)
+        } else {
+            plain
+        };
+        job.append(
+            &format!("{line}\n"),
+            0.0,
+            egui::TextFormat::simple(font.clone(), color),
+        );
+    }
+    egui::ScrollArea::horizontal()
+        .id_salt(text.len())
+        .show(ui, |ui| {
+            ui.add(egui::Label::new(job).extend());
         });
 }
 

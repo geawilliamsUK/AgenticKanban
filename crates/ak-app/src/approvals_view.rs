@@ -109,7 +109,7 @@ fn draw_inner(app: &mut App, ui: &mut egui::Ui, project: ProjectId) {
         }
         ui.label(egui::RichText::new("Approvals").strong());
         widgets::chip(ui, Tone::Yellow, format!("{} waiting", approvals.len()));
-        ui.weak("An agent wants to do something its profile does not cover. It is paused until you answer.");
+        ui.weak("An agent wants to do something that needs your say. It is paused until you answer.");
     });
     let header_height = header.response.rect.height();
     if app.tray.header_height != Some(header_height) {
@@ -173,6 +173,26 @@ fn card(app: &mut App, ui: &mut egui::Ui, project: ProjectId, a: &Approval) -> f
                 }
             });
         });
+        // A ticket branch merge held for review links to its diff.
+        let merge = (a.tool_name == "Bash")
+            .then(|| a.input["command"].as_str())
+            .flatten()
+            .and_then(ak_core::permissions::merged_ticket_branch);
+        if let Some(branch) = merge {
+            ui.horizontal(|ui| {
+                widgets::chip(ui, Tone::Teal, "Merge review");
+                ui.weak(format!("Wants to merge {branch}. Check the diff before you approve."));
+                let ticket = branch
+                    .strip_prefix("ticket/")
+                    .and_then(|key| app.board.tickets.iter().find(|t| t.key == key))
+                    .map(|t| t.id);
+                if let Some(id) = ticket {
+                    if ui.button("Review diff").clicked() {
+                        app.actions.push(Action::ReviewBranch(id));
+                    }
+                }
+            });
+        }
         ui.add(egui::Label::new(egui::RichText::new(&a.summary).monospace()).wrap());
         egui::CollapsingHeader::new("Full input")
             .id_salt(("approval_input", a.id))

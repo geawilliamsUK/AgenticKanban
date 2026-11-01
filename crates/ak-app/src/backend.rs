@@ -75,6 +75,11 @@ pub enum Request {
         project: ProjectId,
         id: TicketId,
     },
+    /// The ticket's branch against the branch it merges into.
+    LoadBranch {
+        project: ProjectId,
+        ticket: TicketId,
+    },
     CreateTicket {
         project: ProjectId,
         input: NewTicket,
@@ -375,6 +380,12 @@ pub enum Response {
     TicketDetail {
         project: ProjectId,
         detail: TicketDetail,
+    },
+    /// `Ok(None)`: the ticket has no branch.
+    Branch {
+        project: ProjectId,
+        ticket: TicketId,
+        diff: Result<Option<ak_supervisor::review::BranchDiff>, String>,
     },
     Inbox {
         project: ProjectId,
@@ -1208,6 +1219,35 @@ impl Backend {
                     watchers: store.watchers(id).await.map_err(|e| e.to_string())?,
                 };
                 self.send(Response::TicketDetail { project, detail });
+            }
+            Request::LoadBranch { project, ticket } => {
+                let p = self.project(project)?;
+                let key = p
+                    .store()
+                    .ticket(ticket)
+                    .await
+                    .map_err(|e| e.to_string())?
+                    .key;
+                let repo = p.entry.path.clone();
+                let integration = p.policy().integration_branch;
+                let tx = self.tx.clone();
+                let ctx = self.ctx.clone();
+                // git can take a moment on a large diff; keep the loop free.
+                tokio::spawn(async move {
+                    use ak_supervisor::review;
+                    let diff = async {
+                        let base = review::base_branch(&repo, integration.as_deref()).await?;
+                        review::branch_diff(&repo, &base, &format!("ticket/{key}")).await
+                    }
+                    .await
+                    .map_err(|e| e.to_string());
+                    let _ = tx.send(Response::Branch {
+                        project,
+                        ticket,
+                        diff,
+                    });
+                    ctx.request_repaint();
+                });
             }
             Request::CreateTicket { project, input } => {
                 let p = self.project(project)?;

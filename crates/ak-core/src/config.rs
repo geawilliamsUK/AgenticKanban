@@ -130,6 +130,9 @@ pub struct ProjectPolicy {
     /// The permission profile the Desk runs under. It works in the human's
     /// own checkout, so the default asks before anything but reading.
     pub desk_permission_profile: String,
+    /// An agent's merge of a ticket branch waits for the human's approval,
+    /// with the branch's diff to review, whatever its profile allows.
+    pub review_merges: bool,
 }
 
 impl Default for ProjectPolicy {
@@ -152,6 +155,7 @@ impl ProjectPolicy {
             integration_branch: None,
             analyst_every_runs: 0,
             desk_permission_profile: PermissionProfile::SUPERVISED.into(),
+            review_merges: false,
             default_model: None,
             authoring_model: None,
             permission_profiles: PermissionProfile::defaults(),

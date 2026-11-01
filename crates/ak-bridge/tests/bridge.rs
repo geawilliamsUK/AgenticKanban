@@ -1098,3 +1098,40 @@ async fn usage_get_reports_the_windows_and_who_used_them() {
     assert!(text.contains("Week: 80% used"), "{text}");
     assert!(text.contains("@backend: ≈3.0% of the 5-hour"), "{text}");
 }
+
+#[tokio::test]
+async fn a_ticket_branch_merge_waits_for_review_when_the_project_asks() {
+    // The integrator profile allows merging.
+    let f = fixture(2, Duration::from_millis(300)).await;
+    let ctx = f.bridge.run(&f.token).unwrap();
+    let merge = PreToolUseInput {
+        tool_name: "Bash".into(),
+        tool_input: json!({"command": "git checkout develop && git merge --no-ff ticket/DEM-4"}),
+    };
+    let v = decide(&f.bridge, &ctx, &merge).await;
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "allow", "{v}");
+
+    let mut policy = f.project.policy();
+    policy.review_merges = true;
+    *f.project.policy.write().unwrap() = policy;
+    let mut events = f.bridge.subscribe();
+    let v = decide(&f.bridge, &ctx, &merge).await;
+    // Nobody answered within the timeout, so the merge did not happen.
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "deny", "{v}");
+    let Ok(BridgeEvent::ApprovalRequested(a)) = events.try_recv() else {
+        panic!("the merge asked for review");
+    };
+    assert!(a.summary.contains("ticket/DEM-4"), "{}", a.summary);
+
+    // Other merges and other commands are judged by the profile as before.
+    let v = decide(
+        &f.bridge,
+        &ctx,
+        &PreToolUseInput {
+            tool_name: "Bash".into(),
+            tool_input: json!({"command": "git merge --abort"}),
+        },
+    )
+    .await;
+    assert_eq!(v["hookSpecificOutput"]["permissionDecision"], "allow", "{v}");
+}
