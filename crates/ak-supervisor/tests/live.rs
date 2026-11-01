@@ -127,6 +127,7 @@ async fn agent_completes_an_assigned_ticket() {
             binary,
             pass_api_key: false,
             startup_timeout: Duration::from_secs(120),
+            stop_grace: Duration::from_secs(10),
         },
     ));
     let mut notices = supervisor.subscribe();

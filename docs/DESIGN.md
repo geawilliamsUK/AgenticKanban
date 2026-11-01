@@ -225,7 +225,7 @@ At startup the harness locates the binary (explicit setting, then PATH, then the
 ### Invocation
 
 ```
-claude -p "<wake prompt>"
+claude -p --input-format stream-json
   --output-format stream-json --verbose
   --session-id <run uuid>
   --append-system-prompt-file <run dir>/system.md
@@ -340,9 +340,10 @@ Stderr is captured to the run directory for diagnostics.
 
 ### Stopping a run
 
-There is no wall-clock flag in print mode, so the supervisor enforces it. A graceful stop sends an interrupt (SIGINT on Unix, which ends the turn and still produces a `result`), waits a grace period (default 10 s), then kills. A kill produces no `result`, so the supervisor records what the stream already delivered. All work product is on disk and on the board, so a hard kill is always safe.
+The wake prompt is the first message on stdin (`{"type":"user",...}`), and stdin stays open until the run's `result`, when the supervisor closes it and the process finishes on its own. While it is open, two things can go in:
 
-Windows cannot deliver an interrupt to a child without a shared console, which a GUI process may not have. v1 may fall back to a hard kill on Windows. This is tracked in open questions.
+- **A stop.** Stop, Halt, a guardrail and the wall clock (there is no wall-clock flag in print mode, so the supervisor enforces it) all send `{"type":"control_request","request":{"subtype":"interrupt"}}`, which ends the turn with a `result` (`terminal_reason: "aborted_streaming"`). The process gets a grace period (`stop_grace`, 10 s in the app) and is killed only if it is still there. This works on Windows, where a GUI process cannot send Ctrl-C. A kill produces no `result`, so the supervisor records what the stream already delivered; all work product is on disk and on the board, so a hard kill is always safe.
+- **A message.** "Message from @<who> while you work: ..." as a user message. Claude Code reads it at the agent's next step, within the same turn (checked against 2.1.302: a message sent during a tool call was acted on at the next model call). With interrupt, the step in progress is ended first. The human sends one from the agent's live run panel; the Desk with `agent_message`. A message that arrives after the `result` is refused, and the sender is told to comment or wake the agent instead.
 
 ### Environment
 
@@ -390,7 +391,6 @@ Each project has a Desk: the human's own Claude Code conversations about the pro
 ### Not used in v1
 
 - `--resume` for agent runs: fresh session per wake. Session ids are kept so the run inspector can offer a copyable `claude --resume <id>` to open a run interactively from its worktree. The Desk resumes its sessions.
-- `--input-format stream-json` for agent runs: the path to mid-run message injection in v2. The Desk uses it.
 - `--bare`: it disables the subscription login and project `CLAUDE.md`, both of which agents should have.
 - `--permission-prompt-tool`: the flag exists but its request and response contract is not documented. Hooks are the documented route. Revisit if that changes.
 - `--agents`: Claude Code subagents inside an agent run are not part of the model.
@@ -658,7 +658,7 @@ Cargo workspace:
 3. **Human acting as an agent.** Not in v1.
 4. **Default model per role.** A cheaper model for triage or review-only agents, settable per agent.
 5. **Push policy.** Whether agents may push branches to a remote. Default no, per-project setting.
-6. **Graceful stop on Windows.** A GUI process may have no console to send an interrupt through. Options are spawning children under a hidden console, a small helper process, or accepting a hard kill in v1. Hard kill is safe since all state is on disk and the board, so this is a quality issue, not a correctness one.
+6. **Graceful stop on Windows.** Decided 2026-11-01: runs take their input as stream-json, so a stop is Claude Code's `interrupt` control request on stdin, on every platform, with a kill only after a grace period (section 8, Stopping a run).
 7. **Project MCP servers.** Whether agents may load the project's own `.mcp.json` servers. Default off via strict MCP config, per-project setting.
 8. **Shared project id.** Decided 2026-10-13: every project gets a shared id generated when it is first created, stored in its policy file and carried in the exported `project.toml`, so Import can match a snapshot to an existing project and a future remote store can map every clone of a repository to one board. The machine-local id in the home config remains the key for local directories.
 

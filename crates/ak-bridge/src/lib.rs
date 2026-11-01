@@ -67,6 +67,15 @@ pub enum BridgeEvent {
         agent_id: ActorId,
         halt: bool,
     },
+    /// The Desk sent a running agent a message; the project's scheduler
+    /// hands it to the run.
+    AgentMessage {
+        project: ProjectId,
+        agent_id: ActorId,
+        from: String,
+        text: String,
+        interrupt: bool,
+    },
     /// The Desk changed the project's settings; the app shows them afresh.
     PolicyChanged {
         project: ProjectId,
@@ -270,6 +279,24 @@ impl Bridge {
             project,
             agent_id,
             halt,
+        });
+    }
+
+    /// Asks the agent's project scheduler to hand its run a message.
+    pub fn message_agent(
+        &self,
+        project: ProjectId,
+        agent_id: ActorId,
+        from: String,
+        text: String,
+        interrupt: bool,
+    ) {
+        self.emit(BridgeEvent::AgentMessage {
+            project,
+            agent_id,
+            from,
+            text,
+            interrupt,
         });
     }
 

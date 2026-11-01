@@ -105,6 +105,7 @@ async fn agent_answers_a_direct_message() {
             binary: claude::locate(None).map_err(|e| e.to_string()),
             pass_api_key: false,
             startup_timeout: Duration::from_secs(120),
+            stop_grace: Duration::from_secs(10),
         },
     ));
     let mut notices = supervisor.subscribe();

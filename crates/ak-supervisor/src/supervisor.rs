@@ -37,6 +37,9 @@ pub struct SupervisorConfig {
     pub pass_api_key: bool,
     /// How long to wait for the init message before giving up.
     pub startup_timeout: Duration,
+    /// How long a stopped run gets to end its turn after the interrupt
+    /// before it is killed.
+    pub stop_grace: Duration,
 }
 
 /// Everything needed to start one run.
@@ -74,7 +77,42 @@ pub enum RunNotice {
 pub struct RunHandle {
     pub run_id: RunId,
     stop: Option<oneshot::Sender<StopReason>>,
+    commands: mpsc::UnboundedSender<RunCommand>,
     done: JoinHandle<AgentRun>,
+}
+
+/// A message for a run in progress.
+enum RunCommand {
+    Message {
+        text: String,
+        from: String,
+        interrupt: bool,
+        delivered: oneshot::Sender<bool>,
+    },
+}
+
+/// Hands a message to a run's process: at its next step, or straight away
+/// after interrupting the step in progress. False when the run has already
+/// finished taking input.
+async fn send_message(
+    commands: &mpsc::UnboundedSender<RunCommand>,
+    text: String,
+    from: String,
+    interrupt: bool,
+) -> bool {
+    let (tx, rx) = oneshot::channel();
+    if commands
+        .send(RunCommand::Message {
+            text,
+            from,
+            interrupt,
+            delivered: tx,
+        })
+        .is_err()
+    {
+        return false;
+    }
+    rx.await.unwrap_or(false)
 }
 
 impl RunHandle {
@@ -91,9 +129,15 @@ impl RunHandle {
             RunStopper {
                 run_id: self.run_id,
                 stop: self.stop,
+                commands: self.commands,
             },
             self.done,
         )
+    }
+
+    /// See `RunStopper::message`.
+    pub async fn message(&self, text: String, from: String, interrupt: bool) -> bool {
+        send_message(&self.commands, text, from, interrupt).await
     }
 
     /// Waits for the run to finish.
@@ -108,9 +152,23 @@ impl RunHandle {
 pub struct RunStopper {
     pub run_id: RunId,
     stop: Option<oneshot::Sender<StopReason>>,
+    commands: mpsc::UnboundedSender<RunCommand>,
 }
 
 impl RunStopper {
+    /// Gives the running agent a message from `from`, which it reads at its
+    /// next step, or at once with `interrupt`, which ends the step in
+    /// progress first. False when the run is past taking input.
+    pub fn message(
+        &self,
+        text: String,
+        from: String,
+        interrupt: bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>> {
+        let commands = self.commands.clone();
+        Box::pin(async move { send_message(&commands, text, from, interrupt).await })
+    }
+
     pub fn stop(&mut self, reason: StopReason) {
         if let Some(tx) = self.stop.take() {
             let _ = tx.send(reason);
@@ -213,9 +271,12 @@ impl Supervisor {
         .map_err(|e| SupervisorError::io(&settings_file, e))?;
 
         let session_id = uuid::Uuid::new_v4().to_string();
+        // The wake prompt goes in on stdin, which stays open for the run, so
+        // a message can reach the agent mid-run and a stop is an interrupt.
         let mut args: Vec<String> = vec![
             "-p".into(),
-            wake,
+            "--input-format".into(),
+            "stream-json".into(),
             "--output-format".into(),
             "stream-json".into(),
             "--verbose".into(),
@@ -287,8 +348,7 @@ impl Supervisor {
                 return Err(SupervisorError::Spawn(msg));
             }
         };
-        // Nothing goes in on stdin; close it so the process never waits on it.
-        drop(child.stdin.take());
+        let stdin = child.stdin.take();
         let usage_baseline = self.usage.begin(run.id, Utc::now());
 
         let _ = self.notices.send(RunNotice::Started {
@@ -297,6 +357,7 @@ impl Supervisor {
         });
 
         let (stop_tx, stop_rx) = oneshot::channel();
+        let (commands, command_rx) = mpsc::unbounded_channel();
         let run_id = run.id;
         let driver = Driver {
             bridge: self.bridge.clone(),
@@ -308,13 +369,15 @@ impl Supervisor {
             token,
             wall_clock: spec.wall_clock,
             startup_timeout: self.config().startup_timeout,
+            stop_grace: self.config().stop_grace,
             usage: self.usage.clone(),
             usage_baseline,
         };
-        let done = tokio::spawn(driver.drive(child, stop_rx));
+        let done = tokio::spawn(driver.drive(child, stdin, wake, stop_rx, command_rx));
         Ok(RunHandle {
             run_id,
             stop: Some(stop_tx),
+            commands,
             done,
         })
     }
@@ -395,6 +458,7 @@ struct Driver {
     token: String,
     wall_clock: Duration,
     startup_timeout: Duration,
+    stop_grace: Duration,
     usage: Arc<UsageTracker>,
     /// The windows when the run started, if the last report was recent.
     usage_baseline: Option<BTreeMap<Window, WindowUsage>>,
@@ -410,7 +474,10 @@ impl Driver {
     async fn drive(
         mut self,
         mut child: tokio::process::Child,
+        mut stdin: Option<tokio::process::ChildStdin>,
+        wake: String,
         stop_rx: oneshot::Receiver<StopReason>,
+        mut commands: mpsc::UnboundedReceiver<RunCommand>,
     ) -> AgentRun {
         let store = self.project.store();
         let project_id = self.project.id();
@@ -455,6 +522,12 @@ impl Driver {
         tokio::pin!(deadline);
         let startup = tokio::time::sleep(self.startup_timeout);
         tokio::pin!(startup);
+        // Armed when a stop is asked for: the interrupt has this long to end
+        // the turn before the process is killed.
+        let grace = tokio::time::sleep(Duration::from_secs(365 * 24 * 3600));
+        tokio::pin!(grace);
+        let mut stopping = false;
+        let mut stop_fired = false;
 
         self.record(
             &mut seq,
@@ -462,6 +535,15 @@ impl Driver {
             json!({"message": "process started"}),
         )
         .await;
+        let wake_line = json!({"type": "user", "message": {"role": "user", "content": wake}});
+        if !crate::desk::write_line(&mut stdin, &wake_line).await {
+            self.record(
+                &mut seq,
+                RunEventKind::Supervisor,
+                json!({"message": "could not hand the wake prompt to the process"}),
+            )
+            .await;
+        }
 
         loop {
             tokio::select! {
@@ -495,6 +577,9 @@ impl Driver {
                             }
                             if kind == RunEventKind::Result {
                                 result = Some(payload.clone());
+                                // The turn is done: closing stdin lets the
+                                // process finish once anything queued is read.
+                                stdin = None;
                             }
                             match kind {
                                 RunEventKind::ToolCall => outcome.note_tool_call(
@@ -517,25 +602,58 @@ impl Driver {
                     }
                     Some(Line::Closed) | None => break,
                 },
-                _ = &mut deadline => {
+                _ = &mut deadline, if !stopping => {
                     forced_exit = Some((ExitReason::TimedOut, format!("exceeded the wall clock of {} minutes", self.wall_clock.as_secs() / 60)));
+                    self.begin_stop(&mut seq, &mut stdin, &mut stopping, grace.as_mut()).await;
+                }
+                _ = &mut grace, if stopping => {
+                    self.record(&mut seq, RunEventKind::Supervisor, json!({"message": format!(
+                        "did not stop within {} seconds of the interrupt; killed", self.stop_grace.as_secs()
+                    )})).await;
                     let _ = child.kill().await;
                     break;
+                }
+                cmd = commands.recv() => {
+                    if let Some(RunCommand::Message { text, from, interrupt, delivered }) = cmd {
+                        let ok = if stdin.is_some() && !stopping {
+                            if interrupt {
+                                let line = json!({"type": "control_request", "request_id": uuid::Uuid::new_v4().to_string(), "request": {"subtype": "interrupt"}});
+                                crate::desk::write_line(&mut stdin, &line).await;
+                            }
+                            let line = json!({"type": "user", "message": {"role": "user", "content": format!(
+                                "Message from @{from} while you work{}: {text}",
+                                if interrupt { " (your last step was interrupted for it)" } else { "" }
+                            )}});
+                            crate::desk::write_line(&mut stdin, &line).await
+                        } else {
+                            false
+                        };
+                        if ok {
+                            self.record(&mut seq, RunEventKind::Supervisor, json!({"message": format!(
+                                "{}message from @{from}: {text}", if interrupt { "interrupted for a " } else { "" }
+                            )})).await;
+                        }
+                        let _ = delivered.send(ok);
+                    }
                 }
                 _ = &mut startup, if !got_init => {
                     forced_exit = Some((ExitReason::Crashed, format!("no init message within {} seconds", self.startup_timeout.as_secs())));
                     let _ = child.kill().await;
                     break;
                 }
-                reason = &mut stop_rx => {
+                reason = &mut stop_rx, if !stop_fired => {
+                    stop_fired = true;
                     let reason = reason.unwrap_or(StopReason::Stopped);
                     let exit = match reason {
                         StopReason::Stopped | StopReason::Halted => ExitReason::Halted,
                         StopReason::Guardrail => ExitReason::GuardrailTripped,
                     };
-                    forced_exit = Some((exit, format!("stopped: {reason:?}")));
-                    let _ = child.kill().await;
-                    break;
+                    if forced_exit.is_none() {
+                        forced_exit = Some((exit, format!("stopped: {reason:?}")));
+                    }
+                    if !stopping {
+                        self.begin_stop(&mut seq, &mut stdin, &mut stopping, grace.as_mut()).await;
+                    }
                 }
             }
         }
@@ -614,6 +732,32 @@ impl Driver {
             run: self.run.clone(),
         });
         self.run
+    }
+
+    /// Asks Claude Code to end the turn, and arms the kill for if it does
+    /// not. A run that has already finished its turn just finishes.
+    async fn begin_stop(
+        &self,
+        seq: &mut i64,
+        stdin: &mut Option<tokio::process::ChildStdin>,
+        stopping: &mut bool,
+        grace: std::pin::Pin<&mut tokio::time::Sleep>,
+    ) {
+        *stopping = true;
+        grace.reset(tokio::time::Instant::now() + self.stop_grace);
+        let line = json!({"type": "control_request", "request_id": uuid::Uuid::new_v4().to_string(), "request": {"subtype": "interrupt"}});
+        if crate::desk::write_line(stdin, &line).await {
+            // The interrupt ends the turn; no more input after it.
+            *stdin = None;
+            self.record(
+                seq,
+                RunEventKind::Supervisor,
+                json!({"message": format!(
+                    "asked Claude Code to stop; it has {} seconds", self.stop_grace.as_secs()
+                )}),
+            )
+            .await;
+        }
     }
 
     async fn record(&self, seq: &mut i64, kind: RunEventKind, payload: Value) {

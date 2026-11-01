@@ -935,7 +935,10 @@ fn parent_of(transcript: &str, text: &str) -> Option<String> {
 }
 
 /// Writes one JSON line to the process. False when stdin is gone.
-async fn write_line(stdin: &mut Option<tokio::process::ChildStdin>, value: &Value) -> bool {
+pub(crate) async fn write_line(
+    stdin: &mut Option<tokio::process::ChildStdin>,
+    value: &Value,
+) -> bool {
     let Some(pipe) = stdin.as_mut() else {
         return false;
     };

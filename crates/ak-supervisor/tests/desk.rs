@@ -66,6 +66,7 @@ async fn fixture() -> Fixture {
             binary: Ok(PathBuf::from(env!("CARGO_BIN_EXE_fake_claude"))),
             pass_api_key: false,
             startup_timeout: Duration::from_secs(5),
+            stop_grace: Duration::from_secs(2),
         },
     ));
     let desk = DeskHost::new(supervisor.clone());

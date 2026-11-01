@@ -59,6 +59,17 @@ pub struct AgentUpdateInput {
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
+pub struct AgentMessageInput {
+    pub handle: String,
+    /// What the agent should know or do differently.
+    pub text: String,
+    /// Stop the step in progress first, for a change of plan that cannot
+    /// wait. Otherwise the agent reads it at its next step.
+    #[serde(default)]
+    pub interrupt: bool,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
 pub struct AgentMemoryInput {
     pub handle: String,
     /// The agent's whole memory file, replacing what is there.
@@ -91,6 +102,11 @@ pub(crate) const SPECS: &[ToolSpec] = &[
         name: "agent_update",
         description: "Change an agent's description, body, model, permission profile or budgets. Fields left out stay as they are.",
         schema: schema::<AgentUpdateInput>,
+    },
+    ToolSpec {
+        name: "agent_message",
+        description: "Tell a running agent something mid-run: it reads it at its next step, or at once with interrupt. For an agent that is not running, comment on its ticket or agent_activate it instead.",
+        schema: schema::<AgentMessageInput>,
     },
     ToolSpec {
         name: "agent_memory_update",
@@ -256,6 +272,34 @@ async fn run_inner(
             def.frontmatter.budgets = (!budgets.is_empty()).then_some(budgets);
             save(ctx, &def).await?;
             Ok(format!("updated @{handle}"))
+        }
+        "agent_message" => {
+            let input: AgentMessageInput = parse_args(args)?;
+            let handle = bare(&input.handle);
+            let agent = store
+                .agent_by_handle(&handle)
+                .await?
+                .filter(|a| !a.is_retired())
+                .ok_or_else(|| format!("no agent @{handle}"))?;
+            if !agent.state.is_active() {
+                return Err(format!(
+                    "@{handle} is not running ({}); comment on its ticket, or agent_activate it with this as the reason",
+                    agent.state.label().to_lowercase()
+                )
+                .into());
+            }
+            bridge.message_agent(
+                project.id(),
+                agent.actor_id,
+                ctx.agent.handle.clone(),
+                input.text,
+                input.interrupt,
+            );
+            Ok(if input.interrupt {
+                format!("@{handle}'s current step is being interrupted; it reads your message next")
+            } else {
+                format!("@{handle} reads your message at its next step")
+            })
         }
         "agent_memory_update" => {
             let input: AgentMemoryInput = parse_args(args)?;

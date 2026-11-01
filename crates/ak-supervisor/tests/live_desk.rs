@@ -90,6 +90,7 @@ async fn desk_session_with_real_claude_code() {
             binary: claude::locate(configured.as_deref()).map_err(|e| e.to_string()),
             pass_api_key: false,
             startup_timeout: Duration::from_secs(120),
+            stop_grace: Duration::from_secs(10),
         },
     ));
     let desk = DeskHost::new(supervisor.clone());
@@ -154,8 +155,10 @@ async fn desk_session_with_real_claude_code() {
     .unwrap();
     let entries = turn(&mut notices).await;
     assert!(
-        entries.iter().any(|e| e.kind == DeskEntryKind::ToolCall
-            && e.text("name") == "mcp__board__agent_create"),
+        entries
+            .iter()
+            .any(|e| e.kind == DeskEntryKind::ToolCall
+                && e.text("name") == "mcp__board__agent_create"),
         "the Desk used agent_create"
     );
     let qa = store
@@ -164,7 +167,12 @@ async fn desk_session_with_real_claude_code() {
         .unwrap()
         .expect("@qa was created");
     assert_eq!(qa.model.as_deref(), Some("haiku"));
-    assert!(!project.agents.agent_dir("qa").join("..").join("me").exists());
+    assert!(!project
+        .agents
+        .agent_dir("qa")
+        .join("..")
+        .join("me")
+        .exists());
 
     let saved = store.desk_session(session.id).await.unwrap();
     println!(

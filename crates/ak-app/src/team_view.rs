@@ -968,6 +968,44 @@ fn draw_runs(
                 if let Some(err) = &live.run.error {
                     ui.colored_label(theme::tone(ui.style(), Tone::Red), err);
                 }
+                if running {
+                    // A message for the run: read at its next step, or at
+                    // once after interrupting the step in progress.
+                    let id = egui::Id::new(("agent_message", &editor.handle));
+                    let mut text: String = ui.data_mut(|d| d.get_temp(id)).unwrap_or_default();
+                    ui.horizontal(|ui| {
+                        ui.add(
+                            egui::TextEdit::singleline(&mut text)
+                                .id(id.with("edit"))
+                                .hint_text(format!("Tell @{} something mid-run…", editor.handle))
+                                .desired_width(ui.available_width() - 230.0),
+                        );
+                        let ready = !text.trim().is_empty();
+                        let mut send = |interrupt: bool, text: &mut String| {
+                            actions.push(Action::Request(Request::MessageAgent {
+                                project,
+                                handle: editor.handle.clone(),
+                                text: std::mem::take(text).trim().to_string(),
+                                interrupt,
+                            }));
+                        };
+                        if ui
+                            .add_enabled(ready, egui::Button::new("Send"))
+                            .on_hover_text("It reads this at its next step.")
+                            .clicked()
+                        {
+                            send(false, &mut text);
+                        }
+                        if ui
+                            .add_enabled(ready, egui::Button::new("Interrupt and send"))
+                            .on_hover_text("Stops the step in progress, then it reads this.")
+                            .clicked()
+                        {
+                            send(true, &mut text);
+                        }
+                    });
+                    ui.data_mut(|d| d.insert_temp(id, text));
+                }
                 let card = theme::card(ui.style());
                 theme::glass(ui, card, |ui| {
                     ui.set_width(ui.available_width());

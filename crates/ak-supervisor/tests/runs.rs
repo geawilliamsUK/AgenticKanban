@@ -89,6 +89,7 @@ async fn fixture() -> Fixture {
             binary: Ok(fake_binary()),
             pass_api_key: false,
             startup_timeout: Duration::from_secs(5),
+            stop_grace: Duration::from_secs(2),
         },
     ));
     Fixture {
@@ -208,7 +209,7 @@ async fn a_run_completes_and_is_recorded() {
         .collect();
     let joined = argv.join(" ");
     for needle in [
-        "-p You were woken by",
+        "-p --input-format stream-json",
         "--output-format stream-json",
         "--permission-mode acceptEdits",
         "--max-turns 50",
@@ -222,6 +223,13 @@ async fn a_run_completes_and_is_recorded() {
         assert!(joined.contains(needle), "missing {needle:?} in {joined}");
     }
     assert!(args["env_api_key"].is_null(), "the API key is scrubbed");
+    assert!(
+        args["stdin"]
+            .as_str()
+            .unwrap()
+            .starts_with("You were woken by"),
+        "the wake prompt goes in on stdin"
+    );
 
     let run_dir = f.paths.run_dir(f.project.id(), run.id);
     let system = std::fs::read_to_string(run_dir.join("system.md")).unwrap();
@@ -656,5 +664,126 @@ async fn the_desk_can_halt_and_resume_an_agent_through_the_bridge() {
         .bridge()
         .control_agent(f.project.id(), f.agent.actor_id, false);
     wait_for(AgentState::Idle).await;
+    scheduler.shutdown();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_running_agent_hears_a_message_mid_run() {
+    let f = fixture().await;
+    let mut notices = f.supervisor.subscribe();
+    let run_spec = spec(&f, Duration::from_secs(30)).await;
+    set_mode(&run_spec, "steer");
+    let handle = f.supervisor.start_run(run_spec).await.unwrap();
+    // Wait until it is busy with its first step.
+    loop {
+        match tokio::time::timeout(Duration::from_secs(10), notices.recv()).await {
+            Ok(Ok(RunNotice::Event { event, .. })) if event.kind == RunEventKind::ToolCall => break,
+            Ok(Ok(_)) => {}
+            other => panic!("no tool call: {other:?}"),
+        }
+    }
+    assert!(
+        handle
+            .message("skip the tests, ship it".into(), "me".into(), true)
+            .await,
+        "delivered"
+    );
+    let run = handle.wait().await;
+    assert_eq!(
+        run.exit_reason,
+        Some(ExitReason::Completed),
+        "{:?}",
+        run.error
+    );
+    let events = f.project.store().run_events(run.id).await.unwrap();
+    let said: Vec<String> = events.iter().map(|e| e.summary()).collect();
+    assert!(
+        said.iter()
+            .any(|s| s.contains("interrupted for a message from @me: skip the tests")),
+        "{said:?}"
+    );
+    assert!(
+        said.iter().any(|s| s.contains(
+            "Heard: Message from @me while you work (your last step was interrupted for it): skip the tests"
+        )),
+        "{said:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_run_that_ignores_the_interrupt_is_killed_after_the_grace() {
+    let f = fixture().await;
+    let run_spec = spec(&f, Duration::from_secs(60)).await;
+    set_mode(&run_spec, "stubborn");
+    let mut handle = f.supervisor.start_run(run_spec).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let started = std::time::Instant::now();
+    handle.stop(StopReason::Stopped);
+    let run = handle.wait().await;
+    assert_eq!(run.exit_reason, Some(ExitReason::Halted));
+    assert!(
+        started.elapsed() >= Duration::from_secs(2),
+        "it got its grace"
+    );
+    let events = f.project.store().run_events(run.id).await.unwrap();
+    assert!(events
+        .iter()
+        .any(|e| e.summary().contains("did not stop within 2 seconds")));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_message_through_the_bridge_reaches_the_running_agent() {
+    let f = fixture().await;
+    let scheduler = Scheduler::spawn(
+        f.project.clone(),
+        f.supervisor.clone(),
+        Arc::new(Semaphore::new(2)),
+        GlobalSettings::default(),
+    );
+    let mut notices = f.supervisor.subscribe();
+    // The scheduler starts the run in the agent's worktree; set its mode there.
+    let base = workspace::default_base(&f.project.entry.path);
+    let ws = workspace::ensure(&f.project.entry.path, &base, "backend")
+        .await
+        .unwrap();
+    std::fs::write(ws.path.join("fake_claude_mode.txt"), "steer").unwrap();
+    scheduler.activate(f.agent.actor_id, f.project.human.id, "try it".into());
+    loop {
+        match tokio::time::timeout(Duration::from_secs(20), notices.recv()).await {
+            Ok(Ok(RunNotice::Event { event, .. })) if event.kind == RunEventKind::ToolCall => break,
+            Ok(Ok(_)) => {}
+            other => panic!("no tool call: {other:?}"),
+        }
+    }
+    f.supervisor.bridge().message_agent(
+        f.project.id(),
+        f.agent.actor_id,
+        "me".into(),
+        "use the staging database".into(),
+        false,
+    );
+    let ended = loop {
+        match tokio::time::timeout(Duration::from_secs(20), notices.recv()).await {
+            Ok(Ok(RunNotice::Ended { run, .. })) => break run,
+            Ok(Ok(_)) => {}
+            other => panic!("run did not end: {other:?}"),
+        }
+    };
+    assert_eq!(
+        ended.exit_reason,
+        Some(ExitReason::Completed),
+        "{:?}",
+        ended.error
+    );
+    let events = f.project.store().run_events(ended.id).await.unwrap();
+    assert!(events.iter().any(|e| e
+        .summary()
+        .contains("Heard: Message from @me while you work: use the staging database")));
+    assert!(
+        !scheduler
+            .message(f.agent.actor_id, "late".into(), "me".into(), false)
+            .await,
+        "nothing to deliver to once the run is over"
+    );
     scheduler.shutdown();
 }

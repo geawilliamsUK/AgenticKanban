@@ -301,6 +301,13 @@ pub enum Request {
         project: ProjectId,
         handle: String,
     },
+    /// Tells a running agent something mid-run.
+    MessageAgent {
+        project: ProjectId,
+        handle: String,
+        text: String,
+        interrupt: bool,
+    },
     HaltAgent {
         project: ProjectId,
         handle: String,
@@ -1009,6 +1016,7 @@ impl Backend {
                 .map_err(|e| e.to_string()),
             pass_api_key: false,
             startup_timeout: Duration::from_secs(90),
+            stop_grace: Duration::from_secs(10),
         }
     }
 
@@ -1083,7 +1091,8 @@ impl Backend {
             }
             // The scheduler of the agent's project acts on these itself.
             Internal::Bridge(BridgeEvent::ActivationRequested { .. })
-            | Internal::Bridge(BridgeEvent::AgentControl { .. }) => {}
+            | Internal::Bridge(BridgeEvent::AgentControl { .. })
+            | Internal::Bridge(BridgeEvent::AgentMessage { .. }) => {}
             Internal::Bridge(BridgeEvent::PolicyChanged { project }) => {
                 if let Some(p) = self.registry.opened(project) {
                     self.send(Response::ProjectPolicy {
@@ -1633,6 +1642,34 @@ impl Backend {
                 let scheduler = self.scheduler(project)?;
                 scheduler.activate(actor, p.human.id, "woken from the Team view".into());
                 self.send(Response::Info(format!("Waking @{handle}")));
+            }
+            Request::MessageAgent {
+                project,
+                handle,
+                text,
+                interrupt,
+            } => {
+                let p = self.project(project)?;
+                let actor = self.agent_actor(&p, &handle).await?;
+                let from = p.human.handle.clone();
+                if self
+                    .scheduler(project)?
+                    .message(actor, text, from, interrupt)
+                    .await
+                {
+                    self.send(Response::Info(format!(
+                        "@{handle} {}",
+                        if interrupt {
+                            "was interrupted and reads your message now"
+                        } else {
+                            "reads your message at its next step"
+                        }
+                    )));
+                } else {
+                    self.send(Response::Error(format!(
+                        "@{handle} has no run taking messages; comment on its ticket or wake it instead"
+                    )));
+                }
             }
             Request::StopAgent { project, handle } => {
                 let p = self.project(project)?;

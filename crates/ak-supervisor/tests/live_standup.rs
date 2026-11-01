@@ -117,6 +117,7 @@ async fn standup_at_the_desk_briefs_the_lead_who_plans_and_reports() {
             binary: claude::locate(configured.as_deref()).map_err(|e| e.to_string()),
             pass_api_key: false,
             startup_timeout: Duration::from_secs(120),
+            stop_grace: Duration::from_secs(10),
         },
     ));
     let mut runs = supervisor.subscribe();

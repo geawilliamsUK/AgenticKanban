@@ -137,6 +137,11 @@ impl Scheduler {
                             {
                                 this.activate(agent_id, by, reason);
                             }
+                            Ok(ak_bridge::BridgeEvent::AgentMessage { project: p, agent_id, from, text, interrupt })
+                                if p == project.id() =>
+                            {
+                                this.message(agent_id, text, from, interrupt).await;
+                            }
                             Ok(ak_bridge::BridgeEvent::AgentControl { project: p, agent_id, halt })
                                 if p == project.id() =>
                             {
@@ -203,6 +208,26 @@ impl Scheduler {
             .expect("state")
             .active
             .contains_key(&agent)
+    }
+
+    /// Gives the agent's run in progress a message from `from` (see
+    /// `RunStopper::message`). False when it has no run taking input.
+    pub async fn message(
+        &self,
+        agent: ActorId,
+        text: String,
+        from: String,
+        interrupt: bool,
+    ) -> bool {
+        let send = {
+            let state = self.inner.state.lock().expect("state");
+            let send = match state.active.get(&agent) {
+                Some(a) => a.handle.message(text, from, interrupt),
+                None => return false,
+            };
+            send
+        };
+        send.await
     }
 
     /// Kills the agent's run if any. The agent may be woken again.
