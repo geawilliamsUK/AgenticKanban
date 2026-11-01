@@ -252,6 +252,11 @@ impl App {
         self.toast = Some((Instant::now(), text.into(), is_error));
     }
 
+    /// Open questions the team asked the human.
+    pub fn needs_you_count(&self) -> usize {
+        self.inbox.iter().filter(|i| i.needs_you).count()
+    }
+
     pub fn unread_count(&self) -> usize {
         self.inbox
             .iter()
@@ -848,6 +853,43 @@ impl App {
         ui.heading("AgenticKanban");
         ui.add_space(14.0);
 
+        // Leave the bottom block (appearance, Settings) its room; the rest
+        // scrolls when the window is short.
+        let room = (ui.available_height() - 130.0).max(120.0);
+        egui::ScrollArea::vertical()
+            .id_salt("sidebar_scroll")
+            .max_height(room)
+            .show(ui, |ui| self.draw_sidebar_nav(ui));
+
+        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
+            ui.add_space(6.0);
+            if let Some(h) = &self.human {
+                ui.weak(format!("You are @{}", h.handle));
+            }
+            if widgets::nav_item(ui, "Settings", self.view == View::Settings).clicked() {
+                self.actions.push(Action::SwitchView(View::Settings));
+            }
+            if let Some(current) = self.settings.as_ref().map(|s| s.theme) {
+                let mut mode = current;
+                ui.horizontal(|ui| {
+                    for (m, label) in [
+                        (ThemeMode::System, "Auto"),
+                        (ThemeMode::Light, "Light"),
+                        (ThemeMode::Dark, "Dark"),
+                    ] {
+                        ui.selectable_value(&mut mode, m, label)
+                            .on_hover_text("Auto follows the Windows setting.");
+                    }
+                });
+                if mode != current {
+                    self.set_theme(mode);
+                }
+            }
+        });
+    }
+
+    /// Projects, the workspace views and the usage meter.
+    fn draw_sidebar_nav(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             widgets::caption(ui, "Projects");
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -896,11 +938,22 @@ impl App {
         let enabled = self.current.is_some();
         ui.add_enabled_ui(enabled, |ui| {
             let busy = self.desk.status.values().any(|s| s.busy);
-            let label = if busy { "Desk  ●" } else { "Desk" };
-            if widgets::nav_item(ui, label, self.view == View::Desk)
-                .on_hover_text("Your own Claude Code session for planning and steering the team")
-                .clicked()
-            {
+            let updates = self.desk.unseen_updates;
+            let label = if updates > 0 && self.view != View::Desk {
+                format!("Desk  ({updates})")
+            } else {
+                "Desk".to_string()
+            };
+            let resp = widgets::nav_item(ui, label, self.view == View::Desk)
+                .on_hover_text("Your own Claude Code session for planning and steering the team");
+            if busy || (updates > 0 && self.view != View::Desk) {
+                widgets::breathing_dot(
+                    ui,
+                    resp.rect.right_center() - egui::vec2(16.0, 0.0),
+                    if busy { Tone::Accent } else { Tone::Teal },
+                );
+            }
+            if resp.clicked() {
                 self.actions.push(Action::SwitchView(View::Desk));
             }
             if widgets::nav_item(ui, "Board", self.view == View::Board).clicked() {
@@ -912,7 +965,21 @@ impl App {
             } else {
                 "Inbox".to_string()
             };
-            if widgets::nav_item(ui, label, self.view == View::Inbox).clicked() {
+            let resp = widgets::nav_item(ui, label, self.view == View::Inbox);
+            let waiting = self.needs_you_count();
+            if waiting > 0 {
+                widgets::breathing_dot(
+                    ui,
+                    resp.rect.right_center() - egui::vec2(16.0, 0.0),
+                    Tone::Orange,
+                );
+            }
+            let resp = if waiting > 0 {
+                resp.on_hover_text(format!("{waiting} question(s) waiting on you"))
+            } else {
+                resp
+            };
+            if resp.clicked() {
                 self.actions.push(Action::SwitchView(View::Inbox));
             }
             if widgets::nav_item(ui, "Chats", self.view == View::Chats).clicked() {
@@ -934,32 +1001,6 @@ impl App {
 
         ui.add_space(14.0);
         usage_view::sidebar(self, ui);
-
-        ui.with_layout(egui::Layout::bottom_up(egui::Align::Min), |ui| {
-            ui.add_space(6.0);
-            if let Some(h) = &self.human {
-                ui.weak(format!("You are @{}", h.handle));
-            }
-            if widgets::nav_item(ui, "Settings", self.view == View::Settings).clicked() {
-                self.actions.push(Action::SwitchView(View::Settings));
-            }
-            if let Some(current) = self.settings.as_ref().map(|s| s.theme) {
-                let mut mode = current;
-                ui.horizontal(|ui| {
-                    for (m, label) in [
-                        (ThemeMode::System, "Auto"),
-                        (ThemeMode::Light, "Light"),
-                        (ThemeMode::Dark, "Dark"),
-                    ] {
-                        ui.selectable_value(&mut mode, m, label)
-                            .on_hover_text("Auto follows the Windows setting.");
-                    }
-                });
-                if mode != current {
-                    self.set_theme(mode);
-                }
-            }
-        });
     }
 
     /// Applies a theme now and saves it with the other global settings.

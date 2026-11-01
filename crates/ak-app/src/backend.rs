@@ -275,6 +275,14 @@ pub enum Request {
     InterruptDesk {
         session: DeskSessionId,
     },
+    /// Replaces one of the human's messages, and everything after it.
+    EditDeskMessage {
+        project: ProjectId,
+        session: DeskSessionId,
+        seq: i64,
+        text: String,
+        shown: Option<String>,
+    },
     /// Changes the title, model or archived flag. A model change restarts
     /// the session's process on the next message.
     UpdateDeskSession {
@@ -530,11 +538,16 @@ struct ProjectWatchers {
     snapshot: Option<(AgentWatcher, JoinHandle<()>)>,
     scheduler: Option<Scheduler>,
     guardrails: GuardrailMonitor,
+    /// Tells the project's Desk what the team does.
+    desk_updates: Option<JoinHandle<()>>,
 }
 
 impl ProjectWatchers {
     fn stop(self) {
         self.events.abort();
+        if let Some(t) = self.desk_updates {
+            t.abort();
+        }
         self.files.abort();
         if let Some((_, task)) = self.snapshot {
             task.abort();
@@ -1195,6 +1208,8 @@ impl Backend {
                     .comment(ticket, body, parent, p.human.id)
                     .await
                     .map_err(|e| e.to_string())?;
+                crate::attention::answered(p.store.as_ref(), p.human.id, Some(ticket), None).await;
+                push_inbox(&p, &self.tx, &self.ctx).await?;
             }
             Request::Freeze {
                 project,
@@ -1342,7 +1357,9 @@ impl Backend {
                     .post_message(thread, body, p.human.id)
                     .await
                     .map_err(|e| e.to_string())?;
+                crate::attention::answered(p.store.as_ref(), p.human.id, None, Some(thread)).await;
                 push_thread(&p, thread, &self.tx, &self.ctx).await?;
+                push_inbox(&p, &self.tx, &self.ctx).await?;
             }
             Request::SetThreadPaused {
                 project,
@@ -1545,6 +1562,19 @@ impl Backend {
                 let p = self.project(project)?;
                 let desk = self.desk_host()?;
                 desk.send_as(p, session, text, shown)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+            Request::EditDeskMessage {
+                project,
+                session,
+                seq,
+                text,
+                shown,
+            } => {
+                let p = self.project(project)?;
+                self.desk_host()?
+                    .edit(p, session, seq, text, shown)
                     .await
                     .map_err(|e| e.to_string())?;
             }
@@ -1768,6 +1798,12 @@ impl Backend {
                 )
             });
             let guardrails = GuardrailMonitor::spawn(p.clone());
+            let desk_updates = match self.desk.clone().zip(self.supervisor.clone()) {
+                Some((d, s)) => Some(
+                    ak_supervisor::desk_updates::spawn(p.clone(), d, s, Default::default()).await,
+                ),
+                None => None,
+            };
             self.watchers.insert(
                 id,
                 ProjectWatchers {
@@ -1777,6 +1813,7 @@ impl Backend {
                     snapshot: None,
                     scheduler,
                     guardrails,
+                    desk_updates,
                 },
             );
             self.ensure_snapshot_watch(id);
@@ -2383,6 +2420,8 @@ async fn load_inbox(
         .map(|n| InboxItem {
             event: by_id.get(&n.event_id).cloned(),
             notification: n,
+            excerpt: None,
+            needs_you: false,
         })
         .collect())
 }
@@ -2392,7 +2431,8 @@ async fn push_inbox(
     tx: &Sender<Response>,
     ctx: &egui::Context,
 ) -> Result<(), String> {
-    let items = load_inbox(p.store.as_ref(), p.human.id, false).await?;
+    let mut items = load_inbox(p.store.as_ref(), p.human.id, false).await?;
+    crate::attention::enrich(p.store.as_ref(), &p.human, &mut items).await;
     tx.send(Response::Inbox {
         project: p.id(),
         items,

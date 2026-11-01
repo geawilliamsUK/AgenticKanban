@@ -30,7 +30,6 @@ const OWN_COMMANDS: [(&str, &str); 3] = [
 ];
 /// Claude Code commands worth offering even before a process reports its list.
 const KNOWN_COMMANDS: [&str; 3] = ["compact", "context", "usage"];
-const MAX_SUGGESTIONS: usize = 8;
 
 #[derive(Default)]
 pub struct DeskState {
@@ -45,11 +44,16 @@ pub struct DeskState {
     /// The slash commands a process last reported, kept for completion.
     pub commands: Vec<String>,
     pub compose: String,
-    compose_focused: bool,
     show_archived: bool,
     renaming: Option<(DeskSessionId, String)>,
     /// A message typed before any session existed, sent once one opens.
     pub pending_send: Option<String>,
+    /// The earlier message being edited: sending replaces it and what follows.
+    editing: Option<i64>,
+    /// A session whose transcript changed under the view and must reload.
+    reload: Option<DeskSessionId>,
+    /// Team updates that arrived while the Desk was not on screen.
+    pub unseen_updates: usize,
 }
 
 impl DeskState {
@@ -63,9 +67,6 @@ impl DeskState {
         entries: Vec<DeskEntry>,
         status: DeskStatus,
     ) {
-        if self.selected != Some(session) {
-            self.compose_focused = false;
-        }
         self.selected = Some(session);
         self.entries = entries;
         self.streaming.clear();
@@ -75,6 +76,11 @@ impl DeskState {
     pub fn on_notice(&mut self, notice: DeskNotice) {
         match notice {
             DeskNotice::Entry { project, entry } => {
+                if entry.kind == DeskEntryKind::TeamUpdate
+                    && self.project.is_none_or(|p| p == project)
+                {
+                    self.unseen_updates += 1;
+                }
                 if Some(project) != self.project || Some(entry.session_id) != self.selected {
                     return;
                 }
@@ -114,6 +120,11 @@ impl DeskState {
                 }
                 self.status.insert(session, status);
             }
+            DeskNotice::Reset { project, session } => {
+                if Some(project) == self.project && Some(session) == self.selected {
+                    self.reload = Some(session);
+                }
+            }
             DeskNotice::Session { project, session } => {
                 if Some(project) != self.project {
                     return;
@@ -143,6 +154,12 @@ pub fn draw(app: &mut App, ui: &mut egui::Ui) {
             ..Default::default()
         };
         app.send(Request::LoadDesk { project });
+    }
+    app.desk.unseen_updates = 0;
+    if let Some(session) = app.desk.reload.take() {
+        app.desk.entries.clear();
+        app.desk.streaming.clear();
+        app.send(Request::OpenDeskSession { project, session });
     }
     // Open the most recent session the first time the list arrives.
     if app.desk.selected.is_none() {
@@ -324,12 +341,25 @@ fn draw_header(
                 }
             }
             _ => {
+                // Leave room for the state chip and the model picker.
+                let room = (ui.available_width() - 380.0).max(120.0);
                 let r = ui
-                    .add(
-                        egui::Label::new(egui::RichText::new(&session.title).size(18.0).strong())
+                    .scope(|ui| {
+                        ui.set_max_width(room);
+                        ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&session.title).size(18.0).strong(),
+                            )
+                            .truncate()
                             .sense(egui::Sense::click()),
-                    )
-                    .on_hover_text("Double-click to rename");
+                        )
+                    })
+                    .inner
+                    .on_hover_text(format!(
+                        "{}
+Double-click to rename",
+                        session.title
+                    ));
                 if r.double_clicked() {
                     app.desk.renaming = Some((session.id, session.title.clone()));
                 }
@@ -452,10 +482,27 @@ fn draw_transcript(
                     .fill(theme::palette(ui.style()).tone_fill(Tone::Accent));
                 theme::glass(ui, frame, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.label(egui::RichText::new("You").strong());
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("You").strong());
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            let editing = app.desk.editing == Some(e.seq);
+                            if editing {
+                                widgets::chip(ui, Tone::Orange, "editing");
+                            } else if ui
+                                .add_enabled(!status.busy, egui::Button::new("Edit").small())
+                                .on_hover_text("Change this message and continue from it. Your later messages and the replies to them are replaced.")
+                                .on_disabled_hover_text("Stop the reply in progress to edit.")
+                                .clicked()
+                            {
+                                app.desk.editing = Some(e.seq);
+                                app.desk.compose = e.text("text").to_string();
+                            }
+                        });
+                    });
                     ui.add(egui::Label::new(e.text("text")).wrap());
                 });
             }
+            DeskEntryKind::TeamUpdate => draw_team_update(app, ui, e),
             DeskEntryKind::Assistant => {
                 ui.add_space(4.0);
                 if e.payload["local_command"].as_bool() == Some(true) {
@@ -584,6 +631,60 @@ fn draw_transcript(
     }
 }
 
+/// What the team did, as the app posted it: questions breathe, the rest is
+/// a quiet list. Each line opens the ticket or thread it came from.
+fn draw_team_update(app: &mut App, ui: &mut egui::Ui, e: &DeskEntry) {
+    let items = e.payload["items"].as_array().cloned().unwrap_or_default();
+    let idle = e.payload["idle"].as_bool() == Some(true);
+    let questions = items
+        .iter()
+        .filter(|i| i["needs_you"].as_bool() == Some(true))
+        .count();
+    ui.add_space(6.0);
+    let frame = if questions > 0 {
+        widgets::breathing_card(ui, Tone::Orange)
+    } else {
+        theme::tinted(ui.style(), Tone::Teal)
+    };
+    theme::glass(ui, frame, |ui| {
+        ui.set_width(ui.available_width());
+        ui.horizontal(|ui| {
+            let title = match (idle, questions) {
+                (true, 0) => "The team is idle".to_string(),
+                (true, n) => format!("The team is idle, waiting on you for {n} question(s)"),
+                (false, 0) => "Team update".to_string(),
+                (false, n) => format!("Team update: {n} question(s) for you"),
+            };
+            ui.label(egui::RichText::new(title).strong());
+            ui.weak(format_time(&e.at));
+        });
+        for i in &items {
+            let s = |k: &str| i[k].as_str().unwrap_or("").to_string();
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                if i["needs_you"].as_bool() == Some(true) {
+                    widgets::chip(ui, Tone::Orange, "needs you");
+                }
+                ui.label(egui::RichText::new(format!("@{}", s("who"))).strong());
+                ui.weak(s("subject"));
+                if let Some(t) = i["ticket_id"].as_str().and_then(|t| t.parse().ok()) {
+                    if ui.small_button("Open ticket").clicked() {
+                        app.actions.push(Action::SelectTicket(Some(t)));
+                        app.actions
+                            .push(Action::SwitchView(crate::app::View::Board));
+                    }
+                }
+                if let Some(t) = i["thread_id"].as_str().and_then(|t| t.parse().ok()) {
+                    if ui.small_button("Open thread").clicked() {
+                        app.actions.push(Action::SelectThread(Some(t)));
+                    }
+                }
+            });
+            app.markdown.show(ui, &s("text"));
+        }
+    });
+}
+
 fn draw_compose(
     app: &mut App,
     ui: &mut egui::Ui,
@@ -592,49 +693,37 @@ fn draw_compose(
     session: Option<&DeskSession>,
     status: &DeskStatus,
 ) {
-    let suggestions = slash_suggestions(&app.desk.compose, &app.desk.commands);
-    // Enter sends and Tab completes; take the keys before the editor sees them.
-    let (enter, tab) = if app.desk.compose_focused {
-        ui.input_mut(|i| {
-            (
-                i.consume_key(egui::Modifiers::NONE, egui::Key::Enter),
-                !suggestions.is_empty() && i.consume_key(egui::Modifiers::NONE, egui::Key::Tab),
-            )
-        })
-    } else {
-        (false, false)
-    };
-    if tab {
-        app.desk.compose = format!("/{} ", suggestions[0].0);
-    }
-
-    if !suggestions.is_empty() {
-        ui.horizontal_wrapped(|ui| {
-            for (name, hint) in &suggestions {
-                if ui
-                    .small_button(format!("/{name}"))
-                    .on_hover_text(*hint)
-                    .clicked()
-                {
-                    app.desk.compose = format!("/{name} ");
-                }
-            }
+    if app.desk.editing.is_some() {
+        let frame = theme::tinted(ui.style(), Tone::Orange);
+        theme::glass(ui, frame, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(
+                    "Editing an earlier message. Sending replaces it and everything after it.",
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Cancel").clicked() {
+                        app.desk.editing = None;
+                        app.desk.compose.clear();
+                    }
+                });
+            });
         });
+        ui.add_space(4.0);
     }
-
+    let commands = slash_commands(&app.desk.commands);
     let actors = app.board.actors.clone();
-    let resp = crate::mention_edit::multiline(
+    let out = crate::mention_edit::compose(
         ui,
         ("desk_compose", session_id),
         &mut app.desk.compose,
         &actors,
+        &commands,
         "Message the Desk. Enter sends, Shift+Enter for a new line, / for commands, @ to mention.",
         3,
+        true,
     );
-    app.desk.compose_focused = resp.has_focus();
-    if tab {
-        resp.request_focus();
-    }
+    let (resp, enter) = (out.response, out.submitted);
 
     ui.horizontal(|ui| {
         let can_send = !app.desk.compose.trim().is_empty();
@@ -663,6 +752,23 @@ fn submit(
     session: Option<&DeskSession>,
     text: String,
 ) {
+    if let Some(seq) = app.desk.editing.take() {
+        let (text, shown) = match text.strip_prefix("/standup") {
+            Some(notes) => (
+                ak_core::desk::standup_prompt(notes, chrono::Local::now().date_naive()),
+                Some(text.clone()),
+            ),
+            None => (text, None),
+        };
+        app.send(Request::EditDeskMessage {
+            project,
+            session: session_id,
+            seq,
+            text,
+            shown,
+        });
+        return;
+    }
     let mut words = text.split_whitespace();
     match words.next() {
         Some("/clear") => {
@@ -727,17 +833,15 @@ fn submit(
     }
 }
 
-/// Completions while the compose box holds a bare `/word`.
-fn slash_suggestions(text: &str, reported: &[String]) -> Vec<(String, &'static str)> {
-    let Some(partial) = text.strip_prefix('/') else {
-        return Vec::new();
-    };
-    if partial.contains(char::is_whitespace) {
-        return Vec::new();
-    }
-    let mut out: Vec<(String, &'static str)> = OWN_COMMANDS
+/// Every command the compose box completes: the app's own first, then
+/// Claude Code's, from what the session reported plus a few it always has.
+fn slash_commands(reported: &[String]) -> Vec<crate::mention_edit::Command> {
+    let mut out: Vec<crate::mention_edit::Command> = OWN_COMMANDS
         .iter()
-        .map(|(n, h)| (n.to_string(), *h))
+        .map(|(n, h)| crate::mention_edit::Command {
+            name: n.to_string(),
+            hint: h.to_string(),
+        })
         .collect();
     let mut rest: Vec<String> = KNOWN_COMMANDS.iter().map(|c| c.to_string()).collect();
     rest.extend(reported.iter().cloned());
@@ -746,10 +850,15 @@ fn slash_suggestions(text: &str, reported: &[String]) -> Vec<(String, &'static s
     out.extend(
         rest.into_iter()
             .filter(|c| !OWN_COMMANDS.iter().any(|(n, _)| n == c))
-            .map(|c| (c, "Claude Code")),
+            .map(|name| crate::mention_edit::Command {
+                hint: if name.contains(':') {
+                    "skill".into()
+                } else {
+                    "Claude Code".into()
+                },
+                name,
+            }),
     );
-    out.retain(|(n, _)| n.starts_with(partial));
-    out.truncate(MAX_SUGGESTIONS);
     out
 }
 
@@ -777,29 +886,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn slash_suggestions_mix_own_and_reported_commands() {
+    fn slash_commands_put_the_apps_first_without_duplicates() {
         let reported = vec![
             "review".to_string(),
             "compact".to_string(),
             "engineering:standup".into(),
         ];
-        let all = slash_suggestions("/", &reported);
-        assert_eq!(all[0].0, "standup");
-        assert_eq!(all[1].0, "clear");
-        assert_eq!(all[2].0, "model");
-        assert!(all.iter().any(|(n, _)| n == "review"));
-        assert_eq!(
-            all.iter().filter(|(n, _)| n == "compact").count(),
-            1,
-            "no duplicates"
-        );
-        let c: Vec<String> = slash_suggestions("/co", &reported)
-            .into_iter()
-            .map(|(n, _)| n)
-            .collect();
-        assert_eq!(c, vec!["compact", "context"]);
-        assert!(slash_suggestions("/compact now", &reported).is_empty());
-        assert!(slash_suggestions("hello", &reported).is_empty());
+        let all = slash_commands(&reported);
+        let names: Vec<&str> = all.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(&names[..3], &["standup", "clear", "model"]);
+        assert!(names.contains(&"review"));
+        assert_eq!(names.iter().filter(|n| **n == "compact").count(), 1);
+        let skill = all
+            .iter()
+            .find(|c| c.name == "engineering:standup")
+            .unwrap();
+        assert_eq!(skill.hint, "skill");
     }
 
     #[test]

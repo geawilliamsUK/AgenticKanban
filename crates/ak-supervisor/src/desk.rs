@@ -83,6 +83,11 @@ pub enum DeskNotice {
         project: ProjectId,
         session: DeskSession,
     },
+    /// The transcript changed under the view (an edit): reload it.
+    Reset {
+        project: ProjectId,
+        session: DeskSessionId,
+    },
 }
 
 enum Command {
@@ -173,6 +178,112 @@ impl DeskHost {
         commands
             .send(Command::User(text))
             .map_err(|_| SupervisorError::Other("the Desk session closed".into()))
+    }
+
+    /// Replaces the human's message at `seq` and everything after it with
+    /// `text`, shown as `shown` when that is set (as in `send_as`). The Claude Code session is branched from the last message
+    /// before it, or started afresh when it was the first; the old branch is
+    /// left as it was.
+    pub async fn edit(
+        self: &Arc<Self>,
+        project: Arc<OpenProject>,
+        id: DeskSessionId,
+        seq: i64,
+        text: String,
+        shown: Option<String>,
+    ) -> Result<(), SupervisorError> {
+        let store = project.store();
+        let entries = store.desk_entries(id).await?;
+        let Some(target) = entries.iter().find(|e| e.seq == seq) else {
+            return Err(SupervisorError::Other(
+                "that message is no longer in the session".into(),
+            ));
+        };
+        if target.kind != DeskEntryKind::User {
+            return Err(SupervisorError::Other(
+                "only your own messages can be edited".into(),
+            ));
+        }
+        let sent = target
+            .payload
+            .get("expanded")
+            .and_then(|t| t.as_str())
+            .unwrap_or(target.text("text"))
+            .to_string();
+        let session_now = store.desk_session(id).await?;
+        // The message before the edited one: from our own record, or, for
+        // entries recorded before message ids were kept, from Claude Code's
+        // transcript.
+        let anchor = entries
+            .iter()
+            .filter(|e| e.seq < seq)
+            .filter_map(|e| e.payload.get("uuid").and_then(|u| u.as_str()))
+            .next_back()
+            .map(str::to_string)
+            .or_else(|| {
+                claude_transcript(&session_now.claude_session_id).and_then(|t| parent_of(&t, &sent))
+            });
+        self.close(id);
+        self.wait_closed(id).await;
+        store.truncate_desk_entries(id, seq).await?;
+        let mut session = store.desk_session(id).await?;
+        match anchor {
+            Some(at) if session.started => session.resume_at = Some(at),
+            _ => {
+                session.claude_session_id = uuid::Uuid::new_v4().to_string();
+                session.started = false;
+                session.resume_at = None;
+            }
+        }
+        store.update_desk_session(&session).await?;
+        self.notify(DeskNotice::Reset {
+            project: project.id(),
+            session: id,
+        });
+        self.send_as(project, id, text, shown).await
+    }
+
+    /// Records a team update in the session's transcript. With `prompt`, the
+    /// update is also handed to Claude Code as a turn of its own, so the Desk
+    /// tells the human about it; the human sees the update card, not the
+    /// prompt.
+    pub async fn deliver_update(
+        self: &Arc<Self>,
+        project: Arc<OpenProject>,
+        id: DeskSessionId,
+        update: Value,
+        prompt: Option<String>,
+    ) -> Result<(), SupervisorError> {
+        let store = project.store();
+        let entry = store
+            .append_desk_entry(id, DeskEntryKind::TeamUpdate, update, Utc::now())
+            .await?;
+        self.notify(DeskNotice::Entry {
+            project: project.id(),
+            entry,
+        });
+        let Some(prompt) = prompt else {
+            return Ok(());
+        };
+        let session = store.desk_session(id).await?;
+        let commands = match self.live_commands(id) {
+            Some(c) => c,
+            None => self.spawn(&project, &session).await?,
+        };
+        commands
+            .send(Command::User(prompt))
+            .map_err(|_| SupervisorError::Other("the Desk session closed".into()))
+    }
+
+    /// Waits a little for a closing process to go, so a new one does not
+    /// start beside it.
+    async fn wait_closed(&self, id: DeskSessionId) {
+        for _ in 0..100 {
+            if !self.is_live(id) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     /// Asks Claude Code to stop the reply in progress. False when nothing runs.
@@ -293,12 +404,23 @@ impl DeskHost {
             "--permission-mode".into(),
             profile.mode.clone(),
         ];
-        if session.started {
-            args.push("--resume".into());
-        } else {
-            args.push("--session-id".into());
+        match (&session.resume_at, session.started) {
+            (Some(at), true) => {
+                args.push("--resume".into());
+                args.push(session.claude_session_id.clone());
+                args.push("--resume-session-at".into());
+                args.push(at.clone());
+                args.push("--fork-session".into());
+            }
+            (None, true) => {
+                args.push("--resume".into());
+                args.push(session.claude_session_id.clone());
+            }
+            (_, false) => {
+                args.push("--session-id".into());
+                args.push(session.claude_session_id.clone());
+            }
         }
-        args.push(session.claude_session_id.clone());
         if !policy.allow_project_mcp {
             args.push("--strict-mcp-config".into());
         }
@@ -527,6 +649,9 @@ impl DeskDriver {
             }
             "system" => match s("subtype") {
                 "init" => {
+                    if let Some(sid) = v.get("session_id").and_then(|x| x.as_str()) {
+                        self.adopt_session_id(sid).await;
+                    }
                     if let Some(m) = v.get("model").and_then(|m| m.as_str()) {
                         self.status.model = Some(m.to_string());
                     }
@@ -582,14 +707,17 @@ impl DeskDriver {
                         Some("text") => {
                             let text = b.get("text").and_then(|t| t.as_str()).unwrap_or("");
                             if !text.trim().is_empty() {
-                                self.entry(DeskEntryKind::Assistant, json!({"text": text}))
-                                    .await;
+                                self.entry(
+                                    DeskEntryKind::Assistant,
+                                    json!({"text": text, "uuid": v["uuid"]}),
+                                )
+                                .await;
                             }
                         }
                         Some("tool_use") => {
                             self.entry(
                                 DeskEntryKind::ToolCall,
-                                json!({"id": b["id"], "name": b["name"], "input": b["input"]}),
+                                json!({"id": b["id"], "name": b["name"], "input": b["input"], "uuid": v["uuid"]}),
                             )
                             .await;
                         }
@@ -621,7 +749,7 @@ impl DeskDriver {
                             };
                             self.entry(
                                 DeskEntryKind::ToolResult,
-                                json!({"tool_use_id": b["tool_use_id"],
+                                json!({"tool_use_id": b["tool_use_id"], "uuid": v["uuid"],
                                        "content": truncate(&content, RESULT_CHARS),
                                        "is_error": b.get("is_error").and_then(|e| e.as_bool()).unwrap_or(false)}),
                             )
@@ -643,6 +771,26 @@ impl DeskDriver {
             }
             "result" => self.turn_end(&v).await,
             _ => {}
+        }
+    }
+
+    /// Records the Claude Code session the process reports. After a fork it
+    /// is a new one, and the branch point has been used.
+    async fn adopt_session_id(&mut self, sid: &str) {
+        let store = self.project.store();
+        let Ok(mut session) = store.desk_session(self.session_id).await else {
+            return;
+        };
+        if session.claude_session_id == sid && session.resume_at.is_none() {
+            return;
+        }
+        session.claude_session_id = sid.to_string();
+        session.resume_at = None;
+        if store.update_desk_session(&session).await.is_ok() {
+            self.host.notify(DeskNotice::Session {
+                project: self.project.id(),
+                session,
+            });
         }
     }
 
@@ -756,6 +904,35 @@ impl DeskDriver {
     }
 }
 
+/// Claude Code's own transcript of a session, from its projects directory.
+fn claude_transcript(session_id: &str) -> Option<String> {
+    let base = std::env::var_os("CLAUDE_CONFIG_DIR")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .or_else(|| std::env::var_os("HOME"))
+                .map(|h| PathBuf::from(h).join(".claude"))
+        })?;
+    let file = format!("{session_id}.jsonl");
+    std::fs::read_dir(base.join("projects"))
+        .ok()?
+        .filter_map(|d| d.ok())
+        .map(|d| d.path().join(&file))
+        .find(|p| p.is_file())
+        .and_then(|p| std::fs::read_to_string(p).ok())
+}
+
+/// The id of the message before the human's last message reading `text`,
+/// from a Claude Code transcript (one JSON object per line).
+fn parent_of(transcript: &str, text: &str) -> Option<String> {
+    transcript
+        .lines()
+        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+        .filter(|v| v["type"] == "user" && v["message"]["content"].as_str() == Some(text))
+        .filter_map(|v| v["parentUuid"].as_str().map(str::to_string))
+        .next_back()
+}
+
 /// Writes one JSON line to the process. False when stdin is gone.
 async fn write_line(stdin: &mut Option<tokio::process::ChildStdin>, value: &Value) -> bool {
     let Some(pipe) = stdin.as_mut() else {
@@ -771,5 +948,35 @@ fn truncate(s: &str, max: usize) -> String {
         s.to_string()
     } else {
         format!("{}…", s.chars().take(max).collect::<String>())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_parent_of_the_edited_message_comes_from_the_transcript() {
+        let t = [
+            r#"{"type":"user","uuid":"u1","parentUuid":null,"message":{"role":"user","content":"hello"}}"#,
+            r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","message":{"role":"assistant","content":[]}}"#,
+            r#"{"type":"user","uuid":"u2","parentUuid":"a1","message":{"role":"user","content":"which key?"}}"#,
+            r#"{"type":"user","uuid":"t1","parentUuid":"a2","message":{"role":"user","content":[{"type":"tool_result"}]}}"#,
+            "not json",
+            r#"{"type":"user","uuid":"u3","parentUuid":"a9","message":{"role":"user","content":"which key?"}}"#,
+        ]
+        .join("
+");
+        assert_eq!(
+            parent_of(&t, "which key?").as_deref(),
+            Some("a9"),
+            "the last time it was said"
+        );
+        assert_eq!(
+            parent_of(&t, "hello"),
+            None,
+            "the first message has no parent"
+        );
+        assert_eq!(parent_of(&t, "never said"), None);
     }
 }

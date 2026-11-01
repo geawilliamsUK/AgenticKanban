@@ -333,10 +333,62 @@ pub fn route(event: &Event, ctx: &RoutingContext) -> Vec<NotificationDraft> {
     drafts
 }
 
+/// The marker `ask_human` opens a question with, so the human's inbox can
+/// tell a question from a status update.
+pub fn question_marker(human_handle: &str) -> String {
+    format!("**Question for @{human_handle}:**")
+}
+
+/// Whether an agent's comment or message that reached the human waits on
+/// them: a question asked with `ask_human`, or one asked in passing (a `?`
+/// in a line that names them, or anywhere in a message sent to them alone).
+pub fn needs_human(body: &str, human_handle: &str, direct: bool) -> bool {
+    if body.contains(&question_marker(human_handle)) {
+        return true;
+    }
+    if direct {
+        return body.contains('?');
+    }
+    let mention = format!("@{human_handle}");
+    body.lines()
+        .any(|line| line.contains(&mention) && line.contains('?'))
+        || (body.contains(&mention) && body.trim_end().ends_with('?'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::ids::{ChatId, ColumnId, CommentId, MessageId, ThreadId, TicketId};
+
+    #[test]
+    fn questions_for_the_human_are_told_apart_from_updates() {
+        let marked = format!(
+            "{} keep flags printed every line, or only on change?",
+            question_marker("me")
+        );
+        assert!(needs_human(&marked, "me", false));
+        assert!(needs_human("@me should ASS-9 wait for ASS-8?", "me", false));
+        assert!(needs_human(
+            "Status: ASS-6 merged.\nTwo options for flags.\n@me which do you prefer, A or B?",
+            "me",
+            false
+        ));
+        assert!(needs_human(
+            "@me heads up on the flags question.\nShall I go with A?",
+            "me",
+            false
+        ));
+        // Updates, and questions to someone else, are not for the human.
+        assert!(!needs_human("Status: ASS-5 is done. @me FYI.", "me", false));
+        assert!(!needs_human("@full-stack can you take ASS-8?", "me", false));
+        // In a direct message to the human, any question is theirs.
+        assert!(needs_human("Should I start on billing next?", "me", true));
+        assert!(!needs_human(
+            "Standup done: two tickets assigned.",
+            "me",
+            true
+        ));
+    }
     use chrono::Utc;
 
     fn ev(actor: ActorId, kind: EventKind) -> Event {

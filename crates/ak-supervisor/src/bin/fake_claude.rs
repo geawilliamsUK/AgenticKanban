@@ -139,12 +139,18 @@ fn conversation(args: &[String]) {
     {
         let _ = writeln!(f, "{}", serde_json::json!(args));
     }
-    let session_id = args
+    let named = args
         .iter()
         .position(|a| a == "--session-id" || a == "--resume")
         .and_then(|i| args.get(i + 1))
         .cloned()
         .unwrap_or_else(|| "fake-session".into());
+    // A fork gets a session of its own, as the real one does.
+    let session_id = if args.iter().any(|a| a == "--fork-session") {
+        format!("{named}-fork")
+    } else {
+        named
+    };
     let out = |v: serde_json::Value| {
         println!("{v}");
         let _ = std::io::stdout().flush();
@@ -227,7 +233,7 @@ fn conversation(args: &[String]) {
         }
         if turn == 1 {
             out(
-                serde_json::json!({"type": "assistant", "message": {"role": "assistant",
+                serde_json::json!({"type": "assistant", "uuid": format!("tool-{turn}"), "message": {"role": "assistant",
                 "content": [{"type": "tool_use", "id": "t1", "name": "Read", "input": {"file_path": "README.md"}}],
                 "usage": {"input_tokens": 10, "cache_read_input_tokens": 1000, "output_tokens": 5}}}),
             );
@@ -239,7 +245,7 @@ fn conversation(args: &[String]) {
         out(delta("Echo: "));
         out(delta(&text));
         out(
-            serde_json::json!({"type": "assistant", "message": {"role": "assistant",
+            serde_json::json!({"type": "assistant", "uuid": format!("reply-{turn}"), "message": {"role": "assistant",
             "content": [{"type": "text", "text": format!("Echo: {text}")}],
             "usage": {"input_tokens": 20, "cache_read_input_tokens": 1200, "output_tokens": 8}}}),
         );

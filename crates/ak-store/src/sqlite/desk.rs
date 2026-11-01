@@ -27,6 +27,7 @@ fn session_from_row(row: &SqliteRow) -> Result<DeskSession> {
         last_active_at: parse_ts(&row.try_get::<String, _>("last_active_at")?)?,
         cost_usd: row.try_get("cost_usd")?,
         archived: row.try_get::<i64, _>("archived")? != 0,
+        resume_at: row.try_get("resume_at")?,
     })
 }
 
@@ -47,7 +48,7 @@ impl SqliteStore {
     pub(super) async fn insert_desk_session_impl(&self, s: &DeskSession) -> Result<()> {
         sqlx::query(
             "INSERT INTO desk_sessions (id, title, claude_session_id, started, model, created_at, \
-             last_active_at, cost_usd, archived) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             last_active_at, cost_usd, archived, resume_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(s.id.to_string())
         .bind(&s.title)
@@ -58,6 +59,7 @@ impl SqliteStore {
         .bind(fmt_ts(&s.last_active_at))
         .bind(s.cost_usd)
         .bind(s.archived as i64)
+        .bind(&s.resume_at)
         .execute(&self.pool)
         .await?;
         Ok(())
@@ -66,7 +68,7 @@ impl SqliteStore {
     pub(super) async fn update_desk_session_impl(&self, s: &DeskSession) -> Result<()> {
         let result = sqlx::query(
             "UPDATE desk_sessions SET title = ?, claude_session_id = ?, started = ?, model = ?, \
-             last_active_at = ?, cost_usd = ?, archived = ? WHERE id = ?",
+             last_active_at = ?, cost_usd = ?, archived = ?, resume_at = ? WHERE id = ?",
         )
         .bind(&s.title)
         .bind(&s.claude_session_id)
@@ -75,6 +77,7 @@ impl SqliteStore {
         .bind(fmt_ts(&s.last_active_at))
         .bind(s.cost_usd)
         .bind(s.archived as i64)
+        .bind(&s.resume_at)
         .bind(s.id.to_string())
         .execute(&self.pool)
         .await?;
@@ -125,6 +128,19 @@ impl SqliteStore {
             kind,
             payload,
         })
+    }
+
+    pub(super) async fn truncate_desk_entries_impl(
+        &self,
+        session: DeskSessionId,
+        from_seq: i64,
+    ) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM desk_entries WHERE session_id = ? AND seq >= ?")
+            .bind(session.to_string())
+            .bind(from_seq)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 
     pub(super) async fn desk_entries_impl(&self, session: DeskSessionId) -> Result<Vec<DeskEntry>> {

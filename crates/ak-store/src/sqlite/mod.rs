@@ -1452,6 +1452,10 @@ impl Store for SqliteStore {
             .await
     }
 
+    async fn truncate_desk_entries(&self, session: DeskSessionId, from_seq: i64) -> Result<u64> {
+        self.truncate_desk_entries_impl(session, from_seq).await
+    }
+
     async fn desk_entries(&self, session: DeskSessionId) -> Result<Vec<DeskEntry>> {
         self.desk_entries_impl(session).await
     }

@@ -290,6 +290,8 @@ pub trait Store: Send + Sync {
         payload: serde_json::Value,
         at: Timestamp,
     ) -> Result<DeskEntry>;
+    /// Drops a session's entries from `from_seq` on, as an edit does.
+    async fn truncate_desk_entries(&self, session: DeskSessionId, from_seq: i64) -> Result<u64>;
     /// A session's transcript, oldest first.
     async fn desk_entries(&self, session: DeskSessionId) -> Result<Vec<DeskEntry>>;
 }

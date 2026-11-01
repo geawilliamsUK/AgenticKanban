@@ -28,7 +28,7 @@ Mention a teammate with @handle in a comment to notify them. Before you finish, 
 again, handle what is pending, then memory_update to record what you learned. Chats are for \
 conversation, not work: tickets carry work and decisions. A direct thread (chat_direct, then \
 thread_create) is for a short clarification with one teammate; a group thread is for a question to \
-the team. Keep messages short. The human sees every chat and may answer.";
+the team. Keep messages short. The human sees every chat and may answer. When you need the human to decide or tell you something, ask with ask_human rather than in a status comment.";
 
 pub struct Outcome {
     pub text: String,
@@ -151,6 +151,17 @@ pub struct TicketAssignInput {
     pub version: i64,
     /// Assignee handle without the @, or "unassigned".
     pub assignee: String,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AskHumanInput {
+    /// The question, complete enough to answer without reading anything else:
+    /// what you need decided, the options, and what you would do by default.
+    pub question: String,
+    /// The ticket it is about. Give this or thread_id.
+    pub key: Option<String>,
+    /// The thread it is about, when it is not about one ticket.
+    pub thread_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize, JsonSchema)]
@@ -284,6 +295,11 @@ const SPECS: &[ToolSpec] = &[
         name: "ticket_assign",
         description: "Assign a ticket to a teammate, or unassign it. Requires the version you read.",
         schema: schema::<TicketAssignInput>,
+    },
+    ToolSpec {
+        name: "ask_human",
+        description: "Ask the human a question you cannot go on without: a decision, an approval, missing information. It is posted on the ticket or thread it is about and pinned at the top of their inbox until they answer there. Use it instead of burying a question in a status comment; then carry on with other work or finish.",
+        schema: schema::<AskHumanInput>,
     },
     ToolSpec {
         name: "ticket_comment",
@@ -617,6 +633,41 @@ async fn run(
             let c = store.comment(t.id, input.body, None, me).await?;
             auto_handle(ctx, store.as_ref(), t.id).await?;
             Ok(format!("commented on {} (comment id {})", t.key, c.id))
+        }
+        "ask_human" => {
+            let input: AskHumanInput = parse_args(args)?;
+            let question = input.question.trim();
+            if question.is_empty() {
+                return Err(ToolError::Message("the question is empty".into()));
+            }
+            let body = format!(
+                "{} {question}",
+                ak_core::notification::question_marker(&ctx.project.human.handle)
+            );
+            match (input.key, input.thread_id) {
+                (Some(key), _) => {
+                    let t = find_ticket(store.as_ref(), &key).await?;
+                    let c = store.comment(t.id, body, None, me).await?;
+                    auto_handle(ctx, store.as_ref(), t.id).await?;
+                    Ok(format!(
+                        "asked @{} on {} (comment id {}); it is pinned in their inbox until they answer there",
+                        ctx.project.human.handle, t.key, c.id
+                    ))
+                }
+                (None, Some(thread)) => {
+                    let thread_id = parse_thread_id(&thread)?;
+                    let message = store.post_message(thread_id, body, me).await?;
+                    auto_handle_thread(ctx, store.as_ref(), thread_id).await?;
+                    Ok(format!(
+                        "asked @{} in thread {} (message id {}); it is pinned in their inbox until they answer there",
+                        ctx.project.human.handle, thread_id, message.id
+                    ))
+                }
+                (None, None) => Err(ToolError::Message(
+                    "say where the question belongs: the key of the ticket it is about, or a thread_id"
+                        .into(),
+                )),
+            }
         }
         "ticket_reply" => {
             let input: TicketReplyInput = parse_args(args)?;

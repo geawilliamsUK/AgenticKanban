@@ -382,6 +382,8 @@ Each project has a Desk: the human's own Claude Code conversations about the pro
 - Text streams from `stream_event` `text_delta`s. Output of local slash commands (`/context`, `/usage`) comes from the turn's `result.result` when `local_command` is set: the `assistant` messages carrying it are replayed after `/compact` and are skipped, as are `isReplay` and `isSynthetic` user messages. `compact_boundary` gives the tokens before and after.
 - The bridge registers the session as the human (`Agent::stand_in_for`), so its tickets, comments and messages are the human's and its approvals show as "Desk". It is never held at stop, is not policed for repeated calls, and keeps its memory in `projects/<id>/desk/memory.md`, outside the agents directory.
 - Each session's transcript is kept as entries in the project store (`desk_sessions`, `desk_entries`) so the app shows it after a restart. Its turns count as activity for the usage tracker, so agent runs alongside them are not taken as solo.
+- Editing an earlier message replaces it and everything after it: the next process runs `--resume <id> --resume-session-at <uuid of the message before it> --fork-session`, and the new session id from `init` replaces the old one. Editing the first message starts a fresh session. Assistant and tool-result entries keep Claude Code's message `uuid` for this.
+- A watcher per project posts the team's mentions, messages and replies to the human as update cards in the most recently active session (batched), and posts when the team goes idle with questions open. When a card holds a question, it is also handed to the session as a turn marked as coming from the app, so the Desk tells the human; otherwise no model call is made.
 - The app answers `/clear` (a new session) and `/model`; every other slash command, skills and custom commands included, goes to Claude Code as typed, completed from the list the process reports in `init`.
 
 ### Not used in v1
@@ -421,6 +423,7 @@ Exposed by the bridge over MCP. Every tool executes as the agent bound to the ru
 | `memory.read` | My memory markdown | Also injected at wake |
 | `memory.update` | Replace my memory markdown | Snapshotted per run |
 | `agent.activate` | Ask the scheduler to wake another agent with a reason | Exposed as `agent_activate`. The bridge raises an activation request; the target's project scheduler queues it, and the run starts under the usual wake rate, budgets, usage holds and slots, with the reason (prefixed by who asked) in the wake prompt. Refuses humans, the caller itself and retired agents |
+| `ask_human` | Ask the human a question the agent cannot go on without | Posts it on the ticket or thread it is about, opened with "Question for @human:". The human's inbox pins agents' questions (marked, or asked in passing) until the human answers there |
 
 Approvals are not a tool. They arrive through the PreToolUse hook described in section 8.
 

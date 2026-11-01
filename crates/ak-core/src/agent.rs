@@ -174,10 +174,12 @@ wakes them. If nobody fits, leave it unassigned and say so in your report.\n\
 4. Keep work moving: answer teammates' questions, unblock them, and re-plan when a ticket turns \
 out bigger than expected. Use agent_activate only to wake someone who has no ticket change to \
 react to.\n\
-5. Report back in the thread you were briefed in: what you created and assigned, what is in \
+5. When you need the human to decide something, ask with ask_human on the ticket or thread it \
+is about, and keep going with whatever does not depend on the answer.\n\
+6. Report back in the thread you were briefed in: what you created and assigned, what is in \
 progress or blocked, and anything that needs the human's decision. Keep it short; link work by \
 ticket key.\n\
-6. Save the priorities, decisions and open questions with memory_update, so your next run \
+7. Save the priorities, decisions and open questions with memory_update, so your next run \
 starts from them.\n",
             lead = Self::LEAD,
         );

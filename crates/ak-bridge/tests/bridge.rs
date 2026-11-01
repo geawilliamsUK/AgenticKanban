@@ -823,3 +823,37 @@ async fn agent_activate_asks_the_scheduler_and_refuses_people_and_self() {
     assert_eq!(event.2, human.id);
     assert_eq!(event.3, "@me asked: pick up the auth tickets");
 }
+
+#[tokio::test]
+async fn ask_human_posts_a_marked_question_on_the_ticket() {
+    let f = fixture(0, Duration::from_secs(5)).await;
+    let (err, _) = call(
+        &f,
+        "ticket_create",
+        json!({"title": "Flags output", "column": "To do"}),
+    )
+    .await;
+    assert!(!err);
+    let (err, text) = call(&f, "ask_human", json!({"question": "A or B?"})).await;
+    assert!(err && text.contains("ticket"), "{text}");
+    let (err, text) = call(
+        &f,
+        "ask_human",
+        json!({"key": "DEM-1", "question": "Print flags every line, or only on change?"}),
+    )
+    .await;
+    assert!(!err, "{text}");
+    let store = f.project.store();
+    let ticket = store.ticket_by_key("DEM-1").await.unwrap().unwrap();
+    let comments = store.comments(ticket.id).await.unwrap();
+    let body = &comments.last().unwrap().body;
+    assert!(body.starts_with("**Question for @me:**"), "{body}");
+    assert!(ak_core::notification::needs_human(body, "me", false));
+    // It reaches the human as a mention.
+    assert!(store
+        .notifications(f.project.human.id, true)
+        .await
+        .unwrap()
+        .iter()
+        .any(|n| n.kind == NotificationKind::Mentioned));
+}

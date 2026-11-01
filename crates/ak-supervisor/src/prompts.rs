@@ -79,6 +79,9 @@ Work for ticket KEY happens on branch `ticket/KEY` created from {from}. Commit e
 the ticket key in the message. {push} When you finish, leave the worktree on `agent/{handle}` \
 (`git checkout agent/{handle}`) with everything committed, so the ticket branch can be merged \
 and deleted. Never touch files outside this worktree, and never the human's own checkout.\n\
+- When you need the human (a decision, an approval, something only they know), ask with \
+ask_human on the ticket or thread it concerns, then carry on with other work or finish. It is \
+pinned in their inbox until they answer. Never leave a question for them inside a status comment.\n\
 - A frozen ticket rejects your changes. Only the human unfreezes it; comment if you need them to.\n\
 - A tool call you are not allowed to make may ask the human for approval, which can take time. \
 Prefer the tools you are allowed.\n\
@@ -169,8 +172,12 @@ assignee.\n\
 - A direct message from @{me} wakes the other member: chat_direct with an agent, then \
 thread_create or thread_post. Use it to brief, ask or redirect; keep the decision itself on a \
 ticket.\n\
-- Reports come back to @{me}'s inbox: when asked what has happened, start with inbox_list, \
-then read the tickets and threads it points at. Mark what you have dealt with with inbox_handle.\n\
+- Reports and questions come back to @{me}'s inbox, and the app also posts team updates into \
+this conversation as they happen. Questions the team asked with ask_human begin \"Question for \
+@{me}:\" and matter most: when asked what has happened or what is waiting, start with inbox_list, \
+put those questions first, and read the tickets and threads they point at. Help @{me} answer \
+them; the answer goes where the question was asked (ticket_comment or thread_post). Mark what \
+you have dealt with with inbox_handle.\n\
 - You are not on the team. Do not do the agents' implementation work yourself unless @{me} \
 asks you to. Your working directory is @{me}'s own checkout at `{repo}`; the agents work in \
 their own worktrees on their own branches, so read their work there or on the board.\n\

@@ -114,3 +114,43 @@ pub fn nav_item(ui: &mut egui::Ui, text: impl Into<String>, selected: bool) -> e
             .corner_radius(CONTROL_RADIUS),
     )
 }
+
+/// A slow breath from 0 to 1 and back, for things that wait on the human.
+/// Keeps the UI repainting while it is shown.
+pub fn breath(ui: &egui::Ui) -> f32 {
+    const PERIOD: f64 = 2.4;
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_millis(33));
+    let t = ui.input(|i| i.time) / PERIOD * std::f64::consts::TAU;
+    (0.5 - 0.5 * t.cos()) as f32
+}
+
+/// A card frame whose rim and glow breathe in `tone`, for items that wait
+/// on the human.
+pub fn breathing_card(ui: &egui::Ui, tone: Tone) -> egui::Frame {
+    let b = breath(ui);
+    let palette = theme::palette(ui.style());
+    let rim = palette.tone(tone).gamma_multiply(0.45 + 0.55 * b);
+    theme::tinted(ui.style(), tone)
+        .stroke(egui::Stroke::new(1.0 + 1.5 * b, rim))
+        .shadow(egui::epaint::Shadow {
+            offset: [0, 0],
+            blur: (6.0 + 14.0 * b) as u8,
+            spread: 0,
+            color: palette.tone(tone).gamma_multiply(0.25 * b),
+        })
+}
+
+/// A dot that breathes in `tone` at `center`, for a nav item with something
+/// waiting.
+pub fn breathing_dot(ui: &egui::Ui, center: egui::Pos2, tone: Tone) {
+    let b = breath(ui);
+    let color = theme::tone(ui.style(), tone);
+    ui.painter()
+        .circle_filled(center, 3.0 + 1.5 * b, color.gamma_multiply(0.6 + 0.4 * b));
+    ui.painter().circle_stroke(
+        center,
+        4.5 + 2.5 * b,
+        egui::Stroke::new(1.0_f32, color.gamma_multiply(0.5 * (1.0 - b))),
+    );
+}

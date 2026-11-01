@@ -105,6 +105,10 @@ pub struct TicketDetail {
 pub struct InboxItem {
     pub notification: Notification,
     pub event: Option<Event>,
+    /// The comment or message behind it, for the human's items from agents.
+    pub excerpt: Option<String>,
+    /// An open question for the human (see `attention`).
+    pub needs_you: bool,
 }
 
 /// A chat with its members, for the chat list.

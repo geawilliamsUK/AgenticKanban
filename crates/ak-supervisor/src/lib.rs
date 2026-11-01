@@ -7,6 +7,7 @@
 //! This sits above the bridge and the runtime because it needs both.
 
 pub mod desk;
+pub mod desk_updates;
 pub mod guardrails;
 pub mod prompts;
 pub mod scheduler;

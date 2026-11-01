@@ -5,6 +5,7 @@
 mod analyst_view;
 mod app;
 mod approvals_view;
+mod attention;
 mod backend;
 mod board_view;
 mod chats_view;

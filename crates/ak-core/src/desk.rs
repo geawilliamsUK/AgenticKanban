@@ -27,6 +27,10 @@ pub struct DeskSession {
     /// API-equivalent cost of every turn so far.
     pub cost_usd: f64,
     pub archived: bool,
+    /// Set after an edit: the next process branches the Claude Code session
+    /// from this message (`--resume-session-at`, `--fork-session`), so the
+    /// edited message and everything after it are left behind.
+    pub resume_at: Option<String>,
 }
 
 impl DeskSession {
@@ -43,6 +47,7 @@ impl DeskSession {
             last_active_at: now,
             cost_usd: 0.0,
             archived: false,
+            resume_at: None,
         }
     }
 
@@ -85,6 +90,9 @@ pub enum DeskEntryKind {
     Compacted,
     /// Something the app or Claude Code said about the session: `{"message"}`.
     Notice,
+    /// What the team did that the human should know: `{"items": [{"who",
+    /// "text", "subject", "needs_you"}], "idle": bool}`.
+    TeamUpdate,
 }
 
 impl DeskEntryKind {
@@ -97,6 +105,7 @@ impl DeskEntryKind {
             DeskEntryKind::TurnEnd => "turn_end",
             DeskEntryKind::Compacted => "compacted",
             DeskEntryKind::Notice => "notice",
+            DeskEntryKind::TeamUpdate => "team_update",
         }
     }
 
@@ -109,6 +118,7 @@ impl DeskEntryKind {
             "turn_end" => Some(DeskEntryKind::TurnEnd),
             "compacted" => Some(DeskEntryKind::Compacted),
             "notice" => Some(DeskEntryKind::Notice),
+            "team_update" => Some(DeskEntryKind::TeamUpdate),
             _ => None,
         }
     }
@@ -201,6 +211,7 @@ mod tests {
             DeskEntryKind::TurnEnd,
             DeskEntryKind::Compacted,
             DeskEntryKind::Notice,
+            DeskEntryKind::TeamUpdate,
         ] {
             assert_eq!(DeskEntryKind::parse(k.as_str()), Some(k));
         }

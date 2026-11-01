@@ -60,6 +60,24 @@ async fn sessions_and_transcripts_round_trip() {
     assert_eq!(loaded.claude_session_id, s.claude_session_id);
     assert!((loaded.cost_usd - 0.42).abs() < 1e-9);
 
+    // An edit drops the edited message and everything after it.
+    s.resume_at = Some("uuid-1".into());
+    store.update_desk_session(&s).await.unwrap();
+    assert_eq!(
+        store.desk_session(s.id).await.unwrap().resume_at.as_deref(),
+        Some("uuid-1")
+    );
+    assert_eq!(
+        store.truncate_desk_entries(s.id, second.seq).await.unwrap(),
+        1
+    );
+    assert_eq!(store.desk_entries(s.id).await.unwrap().len(), 1);
+    assert_eq!(
+        store.desk_entries(older.id).await.unwrap().len(),
+        1,
+        "other sessions untouched"
+    );
+
     older.archived = true;
     store.update_desk_session(&older).await.unwrap();
     let all = store.desk_sessions().await.unwrap();
