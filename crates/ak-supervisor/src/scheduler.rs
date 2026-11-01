@@ -29,7 +29,7 @@ use ak_core::run::{RunTrigger, SchedulerDecision, SkipReason};
 use ak_runtime::OpenProject;
 use ak_store::Store;
 
-use crate::supervisor::{RunHandle, RunNotice, RunSpec, StopReason, Supervisor};
+use crate::supervisor::{RunSpec, RunStopper, StopReason, Supervisor};
 use crate::workspace;
 use crate::SupervisorError;
 
@@ -37,7 +37,7 @@ use crate::SupervisorError;
 const SKIP_REPEAT: Duration = Duration::from_secs(15 * 60);
 
 struct ActiveRun {
-    handle: RunHandle,
+    handle: RunStopper,
     _permit: OwnedSemaphorePermit,
     /// The wake items the run was started for.
     trigger_ids: HashSet<NotificationId>,
@@ -534,6 +534,7 @@ impl Scheduler {
             };
             match self.inner.supervisor.start_run(spec).await {
                 Ok(handle) => {
+                    let (handle, done) = handle.split();
                     let mut state = self.inner.state.lock().expect("state");
                     state.activations.remove(&agent.actor_id);
                     state.last_skip.remove(&agent.actor_id);
@@ -551,7 +552,7 @@ impl Scheduler {
                         },
                     );
                     drop(state);
-                    self.watch_run(agent);
+                    self.watch_run(agent, done);
                 }
                 Err(e) => {
                     self.skip(&agent, SkipReason::StartFailed, e.to_string())
@@ -602,24 +603,14 @@ impl Scheduler {
     }
 
     /// Waits for the agent's run to end, then decides what happens next.
-    fn watch_run(&self, agent: Agent) {
+    /// Waits for the run to end, then frees the agent and applies the churn
+    /// guard. It waits on the run's own task rather than the notices, which
+    /// a fast run can finish before a subscription exists and a busy one can
+    /// push out of the channel.
+    fn watch_run(&self, agent: Agent, done: tokio::task::JoinHandle<ak_core::run::AgentRun>) {
         let this = self.clone();
-        let mut notices = self.inner.supervisor.subscribe();
-        let run_id = {
-            let state = this.inner.state.lock().expect("state");
-            state.active.get(&agent.actor_id).map(|a| a.handle.run_id)
-        };
-        let _ = run_id;
         tokio::spawn(async move {
-            // Wait for this agent's run to end.
-            loop {
-                match notices.recv().await {
-                    Ok(RunNotice::Ended { run, .. }) if run.agent_id == agent.actor_id => break,
-                    Ok(_) => {}
-                    Err(broadcast::error::RecvError::Lagged(_)) => {}
-                    Err(broadcast::error::RecvError::Closed) => return,
-                }
-            }
+            let _ = done.await;
             let removed = this
                 .inner
                 .state
@@ -666,10 +657,12 @@ impl Scheduler {
                 let minutes = guardrails.run_churn_cooldown_minutes;
                 let until = Utc::now() + chrono::Duration::minutes(minutes as i64);
                 tracing::warn!(handle = %agent.handle, "{strikes} runs handled nothing they were woken for; cooling down for {minutes} min");
+                // The end time goes first: a tick that saw Cooldown without
+                // one would take the cooldown for expired and wake the agent.
+                let _ = store.set_agent_cooldown(agent.actor_id, Some(until)).await;
                 let _ = store
                     .set_agent_state(agent.actor_id, AgentState::Cooldown, None)
                     .await;
-                let _ = store.set_agent_cooldown(agent.actor_id, Some(until)).await;
                 this.inner
                     .state
                     .lock()

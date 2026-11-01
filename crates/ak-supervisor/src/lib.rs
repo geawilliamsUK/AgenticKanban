@@ -20,7 +20,9 @@ use std::path::PathBuf;
 pub use desk::{DeskHost, DeskNotice, DeskStatus};
 pub use guardrails::GuardrailMonitor;
 pub use scheduler::Scheduler;
-pub use supervisor::{RunHandle, RunNotice, RunSpec, StopReason, Supervisor, SupervisorConfig};
+pub use supervisor::{
+    RunHandle, RunNotice, RunSpec, RunStopper, StopReason, Supervisor, SupervisorConfig,
+};
 pub use usage::UsageTracker;
 pub use workspace::Workspace;
 

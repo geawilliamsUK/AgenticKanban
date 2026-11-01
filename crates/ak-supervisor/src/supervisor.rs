@@ -84,11 +84,37 @@ impl RunHandle {
         }
     }
 
+    /// Splits the handle into the part that stops the run and the run's
+    /// end, so one task can hold the stop while another waits.
+    pub fn split(self) -> (RunStopper, JoinHandle<AgentRun>) {
+        (
+            RunStopper {
+                run_id: self.run_id,
+                stop: self.stop,
+            },
+            self.done,
+        )
+    }
+
     /// Waits for the run to finish.
     pub async fn wait(self) -> AgentRun {
         self.done
             .await
             .unwrap_or_else(|e| panic!("run task failed: {e}"))
+    }
+}
+
+/// Stops a run whose end someone else is waiting for.
+pub struct RunStopper {
+    pub run_id: RunId,
+    stop: Option<oneshot::Sender<StopReason>>,
+}
+
+impl RunStopper {
+    pub fn stop(&mut self, reason: StopReason) {
+        if let Some(tx) = self.stop.take() {
+            let _ = tx.send(reason);
+        }
     }
 }
 
